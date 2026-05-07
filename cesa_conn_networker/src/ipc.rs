@@ -25,10 +25,7 @@
 /// This list should be kept minimal and only include processes that have a
 /// legitimate need to communicate with the daemon. Adding untrusted processes
 /// could lead to security vulnerabilities.
-const TRUSTED_PROCESSES: &[&str] = &[
-    "cesa_conn_tui",
-    "cesa_conn_gui",
-];
+const TRUSTED_PROCESSES: &[&str] = &["cesa_conn_tui", "cesa_conn_gui"];
 
 use std::fmt;
 use std::{
@@ -48,6 +45,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::RwLock,
 };
+use tokio_util::future::FutureExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -169,6 +167,8 @@ pub enum IpcErrors {
     FailedToGetPeerName,
     /// Unauthorized peer tried to connect
     UnauthorizedPeer,
+    /// Size of data is wrong (fixed data size)
+    WrongDataSize,
 }
 
 impl fmt::Display for IpcErrors {
@@ -208,6 +208,7 @@ impl fmt::Display for IpcErrors {
             Self::FailedToGetProcessName => "failed to get process name",
             Self::FailedToGetPeerName => "failed to get peer name",
             Self::UnauthorizedPeer => "unauthorized peer tired to connect",
+            Self::WrongDataSize => "data size is not correct",
         };
         write!(f, "{}", msg)
     }
@@ -382,13 +383,12 @@ fn get_peer_name(connection: &tokio::net::UnixStream) -> Result<String, IpcError
         .peer_cred()
         .map_err(|_| IpcErrors::FailedToGetPeerCred)?;
 
-    let pid = ucreed
-        .pid()
-        .ok_or(IpcErrors::FailedToGetPid)?;
+    let pid = ucreed.pid().ok_or(IpcErrors::FailedToGetPid)?;
 
     debug!(peer_pid = pid, "looking up peer process name");
 
-    let peer_name = get_process_name(pid.to_string()).map_err(|_| IpcErrors::FailedToGetProcessName)?;
+    let peer_name =
+        get_process_name(pid.to_string()).map_err(|_| IpcErrors::FailedToGetProcessName)?;
 
     debug!(peer_pid = pid, peer_name = %peer_name, "peer name retrieved");
 
@@ -411,6 +411,7 @@ fn get_peer_name(connection: &tokio::net::UnixStream) -> Result<String, IpcError
 /// * `Err(IpcErrors)` - If socket creation fails or daemon is already running
 #[cfg(unix)]
 use tokio::net::UnixListener;
+use zeroize::Zeroize;
 pub fn create_secure_pipe() -> Result<UnixListener, IpcErrors> {
     let path = socket_path().map_err(|_| IpcErrors::FailedToFetchSocketPath)?;
 
@@ -466,6 +467,8 @@ pub async fn ipc_recv(
     d_key: Arc<RwLock<[u8; 32]>>,
     trusted_addrs: Arc<RwLock<Vec<std::net::SocketAddr>>>,
     incoming_connection: (tokio::net::UnixStream, tokio::net::unix::SocketAddr),
+    a_salt: Arc<RwLock<[u8; 32]>>,
+    d_salt: Arc<RwLock<[u8; 32]>>,
 ) -> Result<(), IpcErrors> {
     let (mut stream, _addr) = incoming_connection;
 
@@ -520,9 +523,16 @@ pub async fn ipc_recv(
 
     debug!(data_len = buffer.len(), "message data received, processing");
 
-    handle_data(buffer, trusted_addrs)
-        .await
-        .map_err(|_| IpcErrors::FailedToHandleData)?;
+    handle_data_server(
+        buffer,
+        trusted_addrs,
+        a_key.clone(),
+        d_key.clone(),
+        a_salt.clone(),
+        d_salt.clone(),
+    )
+    .await
+    .map_err(|_| IpcErrors::FailedToHandleData)?;
 
     Ok(())
 }
@@ -553,6 +563,8 @@ pub async fn ipc_daemon(
     d_key: Arc<RwLock<[u8; 32]>>,
     trusted_addrs: Arc<RwLock<Vec<std::net::SocketAddr>>>,
     cancellation_token: CancellationToken,
+    a_salt: Arc<RwLock<[u8; 32]>>,
+    d_salt: Arc<RwLock<[u8; 32]>>,
 ) -> Result<(), IpcErrors> {
     let socket = create_secure_pipe().map_err(|_| IpcErrors::FailedToCreateSecurePipe)?;
     info!("IPC daemon started, listening for connections");
@@ -560,6 +572,7 @@ pub async fn ipc_daemon(
     loop {
         let cancellation_token_clone = cancellation_token.clone();
         let (a_key_clone, d_key_clone) = (a_key.clone(), d_key.clone());
+        let (a_salt_clone, d_salt_clone) = (a_salt.clone(), d_salt.clone());
         let trusted_addrs_clone = trusted_addrs.clone();
 
         debug!("waiting for incoming IPC connection or cancellation signal");
@@ -581,7 +594,7 @@ pub async fn ipc_daemon(
                 _ = cancellation_token_clone.cancelled() => {
                     info!("cancellation token fired mid-handler, dropping ipc_recv task");
                 }
-                result = ipc_recv(a_key_clone, d_key_clone, trusted_addrs_clone, incoming_connection) => {
+                result = ipc_recv(a_key_clone, d_key_clone, trusted_addrs_clone, incoming_connection, a_salt_clone, d_salt_clone) => {
                     match result {
                         Ok(()) => debug!("ipc_recv completed successfully"),
                         Err(e) => error!(error = %e, "ipc_recv returned an error"),
@@ -694,9 +707,13 @@ pub fn create_secure_pipe() -> Result<(), IpcErrors> {
 /// - `UpdateDataPassword` (0x02): Updates data encryption password (not yet implemented)
 /// - `Default` (0x00): No operation performed
 /// - Unknown values: Ignored with warning
-pub async fn handle_data(
-    data: Vec<u8>,
+pub async fn handle_data_server(
+    mut data: Vec<u8>,
     trusted_addrs: Arc<RwLock<Vec<std::net::SocketAddr>>>,
+    a_key: Arc<RwLock<[u8; 32]>>,
+    d_key: Arc<RwLock<[u8; 32]>>,
+    a_salt: Arc<RwLock<[u8; 32]>>,
+    d_salt: Arc<RwLock<[u8; 32]>>,
 ) -> Result<(), IpcErrors> {
     // TODO : HANDLE KEYS CHANGES, DATA SYNCING WITH UI, DATA PASSING TO CONTROLLER IN cesa_conn_system if ac tion type doesnt match
     match ActionType::from_u8(data[0]) {
@@ -720,22 +737,80 @@ pub async fn handle_data(
         Some(ActionType::SyncData) => {
             debug!("Processing SyncData action (not yet implemented)");
             // TODO: Implement data synchronization
+
+            let fixed_sizes = 128;
+
+            if data.len() < fixed_sizes + 1 {
+                return Err(IpcErrors::WrongDataSize);
+            }
+
+            let mut sk_data = [0u8; 128];
+            sk_data.copy_from_slice(&data[1..fixed_sizes + 1]);
+
+            let mut new_a_key = [0u8; 32];
+            let mut new_a_salt = [0u8; 32];
+            let mut new_d_key = [0u8; 32];
+            let mut new_d_salt = [0u8; 32];
+
+            new_a_key.copy_from_slice(&sk_data[..32]);
+            new_a_salt.copy_from_slice(&sk_data[32..64]);
+            new_d_key.copy_from_slice(&sk_data[64..96]);
+            new_d_salt.copy_from_slice(&sk_data[96..128]);
+
+            sk_data.zeroize();
+
+            let mut a_key_write_lock = a_key.write();
+            let mut a_salt_write_lock = a_salt.write();
+
+            let mut d_key_write_lock = d_key.write();
+            a_key_write_lock.copy_from_slice(&new_a_key);
+            a_salt_write_lock.copy_from_slice(&new_a_salt);
+            d_key_write_lock.copy_from_slice(&new_d_key);
+            d_salt_write_lock.copy_from_slice(&new_d_salt);
+
+            new_a_key.zeroize();
+            new_a_salt.zeroize();
+            new_d_key.zeroize();
+            new_d_salt.zeroize();
         }
         Some(ActionType::UpdateAuthPassword) => {
             debug!("Processing UpdateAuthPassword action (not yet implemented)");
             // TODO: Implement auth password update
+
+            if data.len() != 65 {
+                return Err(IpcErrors::WrongDataSize);
+            }
+            let mut a_key_lock = a_key.write().await;
+            a_key_lock.clone_from_slice(&data[1..33]);
+
+            let mut a_salt_lock = a_salt.write().await;
+            a_salt_lock.copy_from_slice(&data[33..65]);
         }
         Some(ActionType::UpdateDataPassword) => {
             debug!("Processing UpdateDataPassword action (not yet implemented)");
             // TODO: Implement data password update
+
+            if data.len() != 65 {
+                return Err(IpcErrors::WrongDataSize);
+            }
+            let mut d_key_lock = d_key.write().await;
+            d_key_lock.clone_from_slice(&data[1..33]);
+
+            let mut d_salt_lock = d_salt.write().await;
+            d_salt_lock.copy_from_slice(&data[33..65]);
         }
         Some(ActionType::Default) => {
             debug!("Received Default action (no operation)");
         }
         None => {
-            warn!(action_byte = data[0], "Received unknown action type, ignoring");
+            warn!(
+                action_byte = data[0],
+                "Received unknown action type, ignoring"
+            );
         }
     }
+
+    data.zeroize();
     Ok(())
 }
 
@@ -982,7 +1057,10 @@ mod tests {
     /// Test that new action types (AddTrustedDevice, SyncData) work correctly
     #[test]
     fn test_new_action_types() {
-        assert_eq!(ActionType::from_u8(0x03), Some(ActionType::AddTrustedDevice));
+        assert_eq!(
+            ActionType::from_u8(0x03),
+            Some(ActionType::AddTrustedDevice)
+        );
         assert_eq!(ActionType::from_u8(0x04), Some(ActionType::SyncData));
         assert_eq!(ActionType::AddTrustedDevice as u8, 0x03);
         assert_eq!(ActionType::SyncData as u8, 0x04);
@@ -1096,7 +1174,11 @@ mod tests {
         for (i, error1) in all_errors.iter().enumerate() {
             for (j, error2) in all_errors.iter().enumerate() {
                 if i != j {
-                    assert_ne!(error1, error2, "Errors at indices {} and {} are equal", i, j);
+                    assert_ne!(
+                        error1, error2,
+                        "Errors at indices {} and {} are equal",
+                        i, j
+                    );
                 }
             }
         }
