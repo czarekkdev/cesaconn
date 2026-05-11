@@ -759,10 +759,12 @@ pub async fn handle_data_server(
 
             sk_data.zeroize();
 
-            let mut a_key_write_lock = a_key.write();
-            let mut a_salt_write_lock = a_salt.write();
+            let mut a_key_write_lock = a_key.write().await;
+            let mut a_salt_write_lock = a_salt.write().await;
 
-            let mut d_key_write_lock = d_key.write();
+            let mut d_key_write_lock = d_key.write().await;
+            let mut d_salt_write_lock = d_salt.write().await;
+
             a_key_write_lock.copy_from_slice(&new_a_key);
             a_salt_write_lock.copy_from_slice(&new_a_salt);
             d_key_write_lock.copy_from_slice(&new_d_key);

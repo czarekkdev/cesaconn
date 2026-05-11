@@ -8,7 +8,8 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::{io::AsyncReadExt, net::TcpStream, sync::RwLock};
 use tracing::{debug, error, info, warn};
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// All errors that can occur during authentication.
 #[derive(Debug, PartialEq)]
@@ -21,6 +22,7 @@ pub enum AuthErrors {
     FailedToWriteToStream,
     /// Failed to encrypt the authentication key.
     FailedToEncrypt,
+    FailedToConvertData,
 }
 
 impl fmt::Display for AuthErrors {
@@ -32,7 +34,77 @@ impl fmt::Display for AuthErrors {
             AuthErrors::FailedToDecrypt => write!(f, "failed to decrypt authentication key"),
             AuthErrors::FailedToWriteToStream => write!(f, "failed to write to stream"),
             AuthErrors::FailedToEncrypt => write!(f, "failed to encrypt authentication key"),
+            AuthErrors::FailedToConvertData => write!(f, "failed to convert data"),
         }
+    }
+}
+
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct Key {
+    key: Zeroizing<[u8; 32]>,
+    salt: Zeroizing<[u8; 32]>,
+}
+
+impl Key {
+    pub fn from_ref(data: &[u8; 64]) -> Self {
+        let mut key_bytes = Zeroizing::new([0u8; 32]);
+        let mut salt_bytes = Zeroizing::new([0u8; 32]);
+
+        key_bytes.copy_from_slice(&data[..32]);
+        salt_bytes.copy_from_slice(&data[32..]);
+
+        Self {
+            key: key_bytes,
+            salt: salt_bytes,
+        }
+    }
+
+    pub fn to_ref(&self, data: &mut [u8; 64]) {
+        data[..32].copy_from_slice(&*self.key);
+        data[32..].copy_from_slice(&*self.salt);
+    }
+
+    pub fn new(key: [u8; 32], salt: [u8; 32]) -> Self {
+        Self {
+            key: Zeroizing::new(key),
+            salt: Zeroizing::new(salt),
+        }
+    }
+}
+
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct Keys {
+    a_key: Key,
+    d_key: Key,
+}
+
+impl Keys {
+    pub fn from_ref(data: &[u8; 128]) -> Self {
+        let mut a_key_data = Zeroizing::new([0u8; 64]);
+        let mut d_key_data = Zeroizing::new([0u8; 64]);
+
+        a_key_data.copy_from_slice(&data[..64]);
+        d_key_data.copy_from_slice(&data[64..]);
+
+        Self {
+            a_key: Key::from_ref(&a_key_data),
+            d_key: Key::from_ref(&d_key_data),
+        }
+    }
+
+    pub fn to_ref(&self, data: &mut [u8; 128]) {
+        let mut a_key = Zeroizing::new([0u8; 64]);
+        let mut d_key = Zeroizing::new([0u8; 64]);
+
+        self.a_key.to_ref(&mut a_key);
+        self.d_key.to_ref(&mut d_key);
+
+        data[..64].clone_from_slice(&*a_key);
+        data[64..].clone_from_slice(&*d_key);
+    }
+
+    pub fn new(a_key: Key, d_key: Key) -> Self {
+        Self { a_key, d_key }
     }
 }
 
