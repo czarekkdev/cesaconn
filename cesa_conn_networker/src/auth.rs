@@ -8,8 +8,8 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::{io::AsyncReadExt, net::TcpStream, sync::RwLock};
 use tracing::{debug, error, info, warn};
+use zeroize::Zeroize;
 use zeroize::Zeroizing;
-use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// All errors that can occur during authentication.
 #[derive(Debug, PartialEq)]
@@ -22,7 +22,6 @@ pub enum AuthErrors {
     FailedToWriteToStream,
     /// Failed to encrypt the authentication key.
     FailedToEncrypt,
-    FailedToConvertData,
 }
 
 impl fmt::Display for AuthErrors {
@@ -34,77 +33,48 @@ impl fmt::Display for AuthErrors {
             AuthErrors::FailedToDecrypt => write!(f, "failed to decrypt authentication key"),
             AuthErrors::FailedToWriteToStream => write!(f, "failed to write to stream"),
             AuthErrors::FailedToEncrypt => write!(f, "failed to encrypt authentication key"),
-            AuthErrors::FailedToConvertData => write!(f, "failed to convert data"),
         }
     }
 }
 
-#[derive(Zeroize, ZeroizeOnDrop)]
-pub struct Key {
-    key: Zeroizing<[u8; 32]>,
-    salt: Zeroizing<[u8; 32]>,
-}
-
-impl Key {
-    pub fn from_ref(data: &[u8; 64]) -> Self {
-        let mut key_bytes = Zeroizing::new([0u8; 32]);
-        let mut salt_bytes = Zeroizing::new([0u8; 32]);
-
-        key_bytes.copy_from_slice(&data[..32]);
-        salt_bytes.copy_from_slice(&data[32..]);
-
-        Self {
-            key: key_bytes,
-            salt: salt_bytes,
-        }
-    }
-
-    pub fn to_ref(&self, data: &mut [u8; 64]) {
-        data[..32].copy_from_slice(&*self.key);
-        data[32..].copy_from_slice(&*self.salt);
-    }
-
-    pub fn new(key: [u8; 32], salt: [u8; 32]) -> Self {
-        Self {
-            key: Zeroizing::new(key),
-            salt: Zeroizing::new(salt),
-        }
-    }
-}
-
-#[derive(Zeroize, ZeroizeOnDrop)]
+/// Holds the two pre-shared 32-byte keys used by the networker.
+///
+/// * `a_key` — authentication key, verified during the ECDH handshake.
+/// * `d_key` — data key, used for the inner encryption layer on actual payloads.
+///
+/// Both fields are wrapped in `Zeroizing` so they are wiped from memory on drop.
 pub struct Keys {
-    a_key: Key,
-    d_key: Key,
+    pub a_key: Zeroizing<[u8; 32]>,
+    pub d_key: Zeroizing<[u8; 32]>,
 }
 
 impl Keys {
-    pub fn from_ref(data: &[u8; 128]) -> Self {
-        let mut a_key_data = Zeroizing::new([0u8; 64]);
-        let mut d_key_data = Zeroizing::new([0u8; 64]);
+    // /// Splits a packed 64-byte buffer into the two keys (`a_key` = bytes 0–31, `d_key` = bytes 32–63).
+    // pub fn from_ref(data: &[u8; 64]) -> Self {
+    //     let mut a_key_bytes = Zeroizing::new([0u8; 32]);
+    //     let mut d_key_bytes = Zeroizing::new([0u8; 32]);
 
-        a_key_data.copy_from_slice(&data[..64]);
-        d_key_data.copy_from_slice(&data[64..]);
+    //     a_key_bytes.copy_from_slice(&data[..32]);
+    //     d_key_bytes.copy_from_slice(&data[32..]);
 
+    //     Self {
+    //         a_key: a_key_bytes,
+    //         d_key: d_key_bytes,
+    //     }
+    // }
+
+    // /// Packs both keys into `data` (`a_key` in bytes 0–31, `d_key` in bytes 32–63). Inverse of `from_ref`.
+    // pub fn to_ref(&self, data: &mut [u8; 64]) {
+    //     data[..32].copy_from_slice(&*self.a_key);
+    //     data[32..].copy_from_slice(&*self.d_key);
+    // }
+
+    /// Wraps two raw 32-byte arrays in `Zeroizing` so they are wiped from memory on drop.
+    pub fn new(a_key: [u8; 32], d_key: [u8; 32]) -> Self {
         Self {
-            a_key: Key::from_ref(&a_key_data),
-            d_key: Key::from_ref(&d_key_data),
+            a_key: Zeroizing::new(a_key),
+            d_key: Zeroizing::new(d_key),
         }
-    }
-
-    pub fn to_ref(&self, data: &mut [u8; 128]) {
-        let mut a_key = Zeroizing::new([0u8; 64]);
-        let mut d_key = Zeroizing::new([0u8; 64]);
-
-        self.a_key.to_ref(&mut a_key);
-        self.d_key.to_ref(&mut d_key);
-
-        data[..64].clone_from_slice(&*a_key);
-        data[64..].clone_from_slice(&*d_key);
-    }
-
-    pub fn new(a_key: Key, d_key: Key) -> Self {
-        Self { a_key, d_key }
     }
 }
 
@@ -149,7 +119,7 @@ pub fn encrypt_tunnel(shared_key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>
 /// Returns (authenticated, shared_key_hash).
 /// The caller should use shared_key_hash as the session encryption key for all further communication.
 pub async fn auth_incoming(
-    key: Arc<RwLock<[u8; 32]>>,
+    keys: Arc<RwLock<Keys>>,
     trusted_addrs: Arc<RwLock<Vec<SocketAddr>>>,
     incoming_connection: (&mut TcpStream, SocketAddr),
 ) -> Result<(bool, [u8; 32]), AuthErrors> {
@@ -244,7 +214,7 @@ pub async fn auth_incoming(
     e_key_buf.zeroize();
 
     // Step 6: Compare decrypted key against the expected pre-shared key
-    if key_buf != key.read().await.as_ref() {
+    if key_buf != keys.read().await.a_key.as_ref() {
         warn!(%peer_addr, "pre-shared key mismatch — client sent wrong key, rejecting connection");
         key_buf.zeroize();
         return Ok((false, [0u8; 32]));
@@ -257,8 +227,8 @@ pub async fn auth_incoming(
     // Step 7: Encrypt our pre-shared key and send it back — mutual authentication,
     // client will verify we know the same key
     debug!(%peer_addr, "encrypting server pre-shared key echo (60 bytes)");
-    let send_buf =
-        &mut encrypt_tunnel(&shared_key_hash, key.read().await.as_ref()).map_err(|e| {
+    let send_buf = &mut encrypt_tunnel(&shared_key_hash, keys.read().await.a_key.as_ref())
+        .map_err(|e| {
             error!(%peer_addr, error = %e, "failed to encrypt server's pre-shared key echo");
             AuthErrors::FailedToEncrypt
         })?;
@@ -331,7 +301,7 @@ pub async fn auth_incoming(
 /// Returns (authenticated, shared_key_hash).
 /// The caller should use shared_key_hash as the session encryption key for all further communication.
 pub async fn auth_outgoing(
-    key: Arc<RwLock<[u8; 32]>>,
+    keys: Arc<RwLock<Keys>>,
     trusted_addrs: Arc<RwLock<Vec<SocketAddr>>>,
     outgoing_connection: (&mut TcpStream, SocketAddr),
 ) -> Result<(bool, [u8; 32]), AuthErrors> {
@@ -393,8 +363,8 @@ pub async fn auth_outgoing(
 
     // Step 5: Encrypt and send our pre-shared key to the server for verification
     debug!(%peer_addr, "encrypting client pre-shared key for server verification");
-    let e_key_buf =
-        &mut encrypt_tunnel(&shared_key_hash, key.read().await.as_ref()).map_err(|e| {
+    let e_key_buf = &mut encrypt_tunnel(&shared_key_hash, keys.read().await.a_key.as_ref())
+        .map_err(|e| {
             error!(%peer_addr, error = %e, "failed to encrypt client's pre-shared key");
             AuthErrors::FailedToEncrypt
         })?;
@@ -438,7 +408,7 @@ pub async fn auth_outgoing(
     let confirmation_byte = &mut [1u8];
 
     // Step 8: Compare the server's key against our expected pre-shared key
-    if recv_key_buf != key.read().await.as_ref() {
+    if recv_key_buf != keys.read().await.a_key.as_ref() {
         warn!(%peer_addr, "server returned wrong pre-shared key during outgoing handshake, sending rejection (0x00)");
         confirmation_byte.fill(0u8); // prepare to send rejection byte
     }
@@ -502,11 +472,82 @@ mod tests {
         (server, client, peer_addr)
     }
 
+    /// Wraps `key` in a `Keys` struct (with `d_key` zeroed) and `trusted` in `Arc<RwLock<_>>`
+    /// to match the signatures of `auth_incoming` and `auth_outgoing`.
     fn make_shared_state(
         key: [u8; 32],
         trusted: Vec<SocketAddr>,
-    ) -> (Arc<RwLock<[u8; 32]>>, Arc<RwLock<Vec<SocketAddr>>>) {
-        (Arc::new(RwLock::new(key)), Arc::new(RwLock::new(trusted)))
+    ) -> (Arc<RwLock<Keys>>, Arc<RwLock<Vec<SocketAddr>>>) {
+        (
+            Arc::new(RwLock::new(Keys::new(key, [0u8; 32]))),
+            Arc::new(RwLock::new(trusted)),
+        )
+    }
+
+    // -------------------------------------------------------------------------
+    // Keys struct unit tests
+    // -------------------------------------------------------------------------
+
+    /// Keys::new must store both raw arrays verbatim inside Zeroizing wrappers.
+    #[test]
+    fn test_keys_new() {
+        let a = [0xAAu8; 32];
+        let d = [0xDDu8; 32];
+        let keys = Keys::new(a, d);
+        assert_eq!(*keys.a_key, a);
+        assert_eq!(*keys.d_key, d);
+    }
+
+    // /// Keys::from_ref must split the 64-byte buffer: bytes 0–31 → a_key, bytes 32–63 → d_key.
+    // #[test]
+    // fn test_keys_from_ref() {
+    //     let mut buf = [0u8; 64];
+    //     buf[..32].fill(0xAA);
+    //     buf[32..].fill(0xDD);
+    //     let keys = Keys::from_ref(&buf);
+    //     assert_eq!(*keys.a_key, [0xAAu8; 32]);
+    //     assert_eq!(*keys.d_key, [0xDDu8; 32]);
+    // }
+
+    // /// Keys::to_ref must write a_key into bytes 0–31 and d_key into bytes 32–63.
+    // #[test]
+    // fn test_keys_to_ref() {
+    //     let keys = Keys::new([0xAAu8; 32], [0xDDu8; 32]);
+    //     let mut out = [0u8; 64];
+    //     keys.to_ref(&mut out);
+    //     assert_eq!(&out[..32], &[0xAAu8; 32]);
+    //     assert_eq!(&out[32..], &[0xDDu8; 32]);
+    // }
+
+    // /// from_ref then to_ref must reproduce the original 64-byte buffer exactly (round-trip).
+    // #[test]
+    // fn test_keys_roundtrip() {
+    //     let mut original = [0u8; 64];
+    //     for (i, b) in original.iter_mut().enumerate() {
+    //         *b = i as u8;
+    //     }
+    //     let keys = Keys::from_ref(&original);
+    //     let mut out = [0u8; 64];
+    //     keys.to_ref(&mut out);
+    //     assert_eq!(out, original);
+    // }
+
+    // /// Keys::from_ref with all-zero input must produce two zero keys, not panic.
+    // #[test]
+    // fn test_keys_from_ref_all_zeros() {
+    //     let buf = [0u8; 64];
+    //     let keys = Keys::from_ref(&buf);
+    //     assert_eq!(*keys.a_key, [0u8; 32]);
+    //     assert_eq!(*keys.d_key, [0u8; 32]);
+    // }
+
+    /// a_key and d_key may be identical — Keys::new must not deduplicate them.
+    #[test]
+    fn test_keys_new_same_values() {
+        let k = [0x42u8; 32];
+        let keys = Keys::new(k, k);
+        assert_eq!(*keys.a_key, k);
+        assert_eq!(*keys.d_key, k);
     }
 
     /// Connection from an address not in the trusted list must be rejected immediately.

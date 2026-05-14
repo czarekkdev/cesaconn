@@ -32,6 +32,7 @@ use tokio::{net::TcpListener, sync::RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    auth::Keys,
     tcp_networker::{ActionType, connect, recv},
     udp_networker::{
         BROADCAST_NAME, UdpNetworkerErrors, udp_broadcast_presence, udp_find_broadcaster,
@@ -76,12 +77,13 @@ async fn main() {
                 let mut salt = [0u8; 32];
                 let len = test_psw.len().min(32);
                 salt[0..len].copy_from_slice(&test_psw[..len]);
-                let a_key = Arc::new(RwLock::new(derive_key(test_psw, salt).unwrap()));
+                let raw_key: [u8; 32] = derive_key(test_psw, salt).unwrap();
+                let keys = Arc::new(RwLock::new(Keys::new(raw_key, raw_key)));
 
                 let listener = TcpListener::bind("0.0.0.0:3232").await.unwrap();
                 let trusted_addrs: Arc<RwLock<Vec<SocketAddr>>> = Arc::new(RwLock::new(Vec::new()));
                 let cancellation_token = CancellationToken::new();
-                let a_key_clone = a_key.clone();
+                let keys_clone = keys.clone();
 
                 // Background task: UDP peer discovery loop.
                 // Alternates between broadcasting presence and listening for responses
@@ -90,13 +92,13 @@ async fn main() {
                     // Inner loop retries until a valid peer is found, skipping timeouts
                     // and wrong-key peers without propagating those as fatal errors.
                     loop {
-                        udp_broadcast_presence(BROADCAST_NAME.as_bytes(), 1, a_key_clone.clone())
+                        udp_broadcast_presence(BROADCAST_NAME.as_bytes(), 1, keys_clone.clone())
                             .await
                             .unwrap();
                         break match udp_find_broadcaster(
                             3,
                             BROADCAST_NAME.as_bytes(),
-                            a_key_clone.clone(),
+                            keys_clone.clone(),
                         )
                         .await
                         {
@@ -114,8 +116,7 @@ async fn main() {
 
                 recv(
                     &listener,
-                    a_key.clone(),
-                    a_key.clone(),
+                    keys,
                     trusted_addrs.clone(),
                     cancellation_token.clone(),
                 )
@@ -137,9 +138,8 @@ async fn main() {
                 let len = test_psw.len().min(32);
                 salt[0..len].copy_from_slice(&test_psw[..len]);
 
-                let a_key = Arc::new(RwLock::new(derive_key(test_psw, salt).unwrap()));
-
-                let a_key_clone = a_key.clone();
+                let raw_key: [u8; 32] = derive_key(test_psw, salt).unwrap();
+                let keys = Arc::new(RwLock::new(Keys::new(raw_key, raw_key)));
 
                 let trusted_addrs = Arc::new(RwLock::new(Vec::new()));
 
@@ -147,7 +147,7 @@ async fn main() {
                 // so the server adds us to its trusted list before we attempt TCP.
                 let incoming_addr = loop {
                     let incoming_addr =
-                        match udp_find_broadcaster(1, BROADCAST_NAME.as_bytes(), a_key.clone())
+                        match udp_find_broadcaster(1, BROADCAST_NAME.as_bytes(), keys.clone())
                             .await
                         {
                             Ok(addr) => Ok(addr),
@@ -160,7 +160,7 @@ async fn main() {
                         }
                         .unwrap();
 
-                    udp_broadcast_presence(BROADCAST_NAME.as_bytes(), 3, a_key_clone)
+                    udp_broadcast_presence(BROADCAST_NAME.as_bytes(), 3, keys.clone())
                         .await
                         .unwrap();
 
@@ -180,8 +180,7 @@ async fn main() {
                 let action_type = ActionType::Debug;
 
                 connect(
-                    a_key.clone(),
-                    a_key.clone(),
+                    keys,
                     trusted_addrs,
                     cancellation_token,
                     connect_addr,

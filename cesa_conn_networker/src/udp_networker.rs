@@ -9,7 +9,7 @@ use tokio::time::{Duration, sleep, timeout};
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroize;
 
-use crate::auth::{decrypt_tunnel, encrypt_tunnel};
+use crate::auth::{Keys, decrypt_tunnel, encrypt_tunnel};
 
 /// Errors that can occur during UDP networking operations
 #[derive(Debug, PartialEq)]
@@ -71,7 +71,7 @@ pub static BROADCAST_NAME: &str = "CesaConn Broadcast";
 pub async fn udp_broadcast_presence(
     message: &[u8],
     duration: u64,
-    a_key: Arc<RwLock<[u8; 32]>>,
+    keys: Arc<RwLock<Keys>>,
 ) -> Result<(), UdpNetworkerErrors> {
     // Cap duration to the allowed maximum to prevent indefinite broadcasting
     let duration = if duration > MAX_BROADCAST_DURATION {
@@ -106,13 +106,10 @@ pub async fn udp_broadcast_presence(
     );
 
     for tick in 0..duration {
-        let auth_key = &mut a_key.read().await.clone();
-
-        let e_msg = encrypt_tunnel(&auth_key, message).map_err(|e| {
+        let e_msg = encrypt_tunnel(&keys.read().await.a_key, message).map_err(|e| {
             error!(error = %e, tick, "failed to encrypt broadcast message");
             UdpNetworkerErrors::FailedToEncryptTunnel
         })?;
-        auth_key.zeroize();
 
         // Send presence packet to the entire local network
         let bytes_sent = socket
@@ -161,7 +158,7 @@ pub async fn udp_broadcast_presence(
 pub async fn udp_find_broadcaster(
     duration: u64,
     message: &[u8],
-    a_key: Arc<RwLock<[u8; 32]>>,
+    keys: Arc<RwLock<Keys>>,
 ) -> Result<SocketAddr, UdpNetworkerErrors> {
     // Cap duration to the allowed maximum
     let duration = if duration > MAX_BROADCAST_DURATION {
@@ -227,17 +224,14 @@ pub async fn udp_find_broadcaster(
     }
 
     // Convert received bytes to string for device name comparison
-    let auth_key = &mut a_key.read().await.clone();
     debug!(%addr, "decrypting received UDP packet");
-    let name = decrypt_tunnel(auth_key, &buf[..len])
+    let name = decrypt_tunnel(&keys.read().await.a_key, &buf[..len])
         .map_err(|e| {
             warn!(%addr, error = %e, "failed to decrypt received UDP packet — wrong key or tampered data");
             UdpNetworkerErrors::FailedToDecryptTunnel
         })?;
 
     buf.zeroize();
-
-    auth_key.zeroize();
 
     // Verify the packet comes from a recognized CesaConn device
     if *name == *message {
@@ -261,9 +255,18 @@ mod tests {
     /// Pre-shared key used across all tests.
     const TEST_KEY: [u8; 32] = [0xAB; 32];
 
-    /// Wraps a fixed-size key in `Arc<RwLock>` for passing to `udp_find_broadcaster`.
-    fn make_test_key(key: [u8; 32]) -> Arc<RwLock<[u8; 32]>> {
-        Arc::new(RwLock::new(key))
+    // udp_find_broadcaster always binds to port 3636. Tests that call it must not
+    // run concurrently or they race to bind the same port and get FailedToBindSocket.
+    // This lock serializes all tests that use port 3636.
+    static PORT_3636_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    fn port_3636_lock() -> &'static tokio::sync::Mutex<()> {
+        PORT_3636_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    /// Wraps a raw 32-byte key in `Keys` (d_key zeroed — UDP only uses a_key) and returns it
+    /// behind `Arc<RwLock>` to match the signatures of `udp_broadcast_presence` / `udp_find_broadcaster`.
+    fn make_test_key(key: [u8; 32]) -> Arc<RwLock<Keys>> {
+        Arc::new(RwLock::new(Keys::new(key, [0u8; 32])))
     }
 
     /// `UdpSocket::bind` must succeed on any available port.
@@ -289,6 +292,7 @@ mod tests {
     /// rejected with `UnknownDevice`.
     #[tokio::test]
     async fn test_unknown_device_rejected() {
+        let _guard = port_3636_lock().lock().await;
         let key = make_test_key(TEST_KEY);
         let key_clone = Arc::clone(&key);
 
@@ -302,7 +306,7 @@ mod tests {
         // Bind to an ephemeral port — receiver only cares about the destination port (3636)
         let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
         // Encrypt with the correct key so decryption succeeds, but use a wrong device name
-        let raw_key = key.read().await.clone();
+        let raw_key: [u8; 32] = *key.read().await.a_key;
         let encrypted = encrypt_tunnel(&raw_key, b"UnknownDevice").unwrap();
         socket.send_to(&encrypted, "127.0.0.1:3636").await.unwrap();
 
@@ -314,6 +318,7 @@ mod tests {
     /// and return `FailedToDecryptTunnel`.
     #[tokio::test]
     async fn test_wrong_key_fails_decryption() {
+        let _guard = port_3636_lock().lock().await;
         let handle = tokio::spawn(async {
             udp_find_broadcaster(2, BROADCAST_NAME.as_bytes(), make_test_key(TEST_KEY)).await
         });
@@ -335,6 +340,7 @@ mod tests {
     /// accepted — the function returns the sender's `SocketAddr`.
     #[tokio::test]
     async fn test_correct_broadcast_found() {
+        let _guard = port_3636_lock().lock().await;
         let key = make_test_key(TEST_KEY);
         let key_clone = Arc::clone(&key);
 
@@ -346,7 +352,7 @@ mod tests {
 
         // Bind to an ephemeral port — receiver only cares about the destination port (3636)
         let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
-        let raw_key = key.read().await.clone();
+        let raw_key: [u8; 32] = *key.read().await.a_key;
         let encrypted = encrypt_tunnel(&raw_key, BROADCAST_NAME.as_bytes()).unwrap();
         socket.send_to(&encrypted, "127.0.0.1:3636").await.unwrap();
 
@@ -357,6 +363,7 @@ mod tests {
     /// A UDP packet larger than the 1024-byte receive buffer must be rejected as `DataTooBig`.
     #[tokio::test]
     async fn test_oversized_packet_rejected() {
+        let _guard = port_3636_lock().lock().await;
         let handle = tokio::spawn(async {
             udp_find_broadcaster(2, BROADCAST_NAME.as_bytes(), make_test_key(TEST_KEY)).await
         });
@@ -408,12 +415,13 @@ mod tests {
     /// The encryption key must not be mutated by `udp_find_broadcaster` on timeout.
     #[tokio::test]
     async fn test_key_not_mutated_on_timeout() {
+        let _guard = port_3636_lock().lock().await;
         let key = make_test_key(TEST_KEY);
 
         let _ = udp_find_broadcaster(1, BROADCAST_NAME.as_bytes(), Arc::clone(&key)).await;
 
         let k = key.read().await;
-        assert_eq!(*k, TEST_KEY);
+        assert_eq!(*k.a_key, TEST_KEY);
     }
 
     /// All `UdpNetworkerErrors` variants must produce a non-empty `Display` string.
