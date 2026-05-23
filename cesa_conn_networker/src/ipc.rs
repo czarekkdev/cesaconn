@@ -31,6 +31,7 @@ const TRUSTED_PROCESSES: &[&str] = &["cesa_conn_tui", "cesa_conn_gui"];
 use crate::auth::Keys;
 use crate::auth::Salts;
 use std::fmt;
+use std::net::IpAddr;
 use std::os::unix::net::UnixStream;
 use std::{
     fs::{Permissions, read_dir, read_to_string, remove_file, set_permissions},
@@ -446,13 +447,36 @@ pub fn create_secure_pipe() -> Result<UnixListener, IpcErrors> {
     Ok(socket)
 }
 
+/// Converts a 4-byte slice into a `SocketAddr` with port 0.
+///
+/// # Arguments
+/// * `data` - A 4-byte slice containing an IPv4 address in network byte order
+///
+/// # Returns
+/// A `SocketAddr` wrapping the parsed IPv4 address with port set to 0
 pub fn get_ip_from_bytes(data: &[u8]) -> std::net::SocketAddr {
-    // Extract IPv4 address from data (bytes 1-5)
     let mut addr_bytes = [0u8; size_of::<Ipv4Addr>()];
     addr_bytes.copy_from_slice(&data);
 
     let addr = Ipv4Addr::from_octets(addr_bytes);
     std::net::SocketAddr::new(std::net::IpAddr::V4(addr), 0000)
+}
+
+/// Converts a `SocketAddr` to a 4-byte IPv4 address array.
+///
+/// IPv4-mapped IPv6 addresses are canonicalized to their V4 form first.
+/// Returns `[0u8; 4]` for any non-IPv4 address.
+///
+/// # Arguments
+/// * `socket_addr` - The socket address to convert
+///
+/// # Returns
+/// A 4-byte array of IPv4 address octets
+pub fn get_bytes_from_ip(socket_addr: &std::net::SocketAddr) -> [u8; size_of::<Ipv4Addr>()] {
+    match socket_addr.ip().to_canonical() {
+        IpAddr::V4(v4) => v4.octets(),
+        _ => [0u8; 4],
+    }
 }
 
 /// Receives and processes an IPC message from a client
@@ -466,10 +490,10 @@ pub fn get_ip_from_bytes(data: &[u8]) -> std::net::SocketAddr {
 /// 5. Process based on action type
 ///
 /// # Arguments
-/// * `a_key` - Arc<RwLock<[u8; 32]>> - Authentication key (shared reference)
-/// * `d_key` - Arc<RwLock<[u8; 32]>> - Data encryption key (shared reference)
+/// * `keys` - Arc<RwLock<Keys>> - Authentication and data encryption keys (shared reference)
 /// * `trusted_addrs` - Arc<RwLock<Vec<std::net::SocketAddr>>> - Trusted socket addresses
 /// * `incoming_connection` - Tuple of (UnixStream, SocketAddr) for the connection
+/// * `salts` - Arc<RwLock<Salts>> - Authentication and data encryption salts (shared reference)
 ///
 /// # Returns
 /// * `Ok(())` - Message processed successfully
@@ -534,9 +558,15 @@ pub async fn ipc_recv(
 
     debug!(data_len = buffer.len(), "message data received, processing");
 
-    handle_data_server(buffer, trusted_addrs, keys.clone(), salts.clone())
-        .await
-        .map_err(|_| IpcErrors::FailedToHandleData)?;
+    handle_data_server(
+        buffer,
+        trusted_addrs,
+        keys.clone(),
+        salts.clone(),
+        (stream, _addr),
+    )
+    .await
+    .map_err(|_| IpcErrors::FailedToHandleData)?;
 
     Ok(())
 }
@@ -553,10 +583,10 @@ pub async fn ipc_recv(
 /// - Peer verification is performed before accepting connections
 ///
 /// # Arguments
-/// * `a_key` - Arc<RwLock<[u8; 32]>> - Authentication key (shared reference)
-/// * `d_key` - Arc<RwLock<[u8; 32]>> - Data encryption key (shared reference)
+/// * `keys` - Arc<RwLock<Keys>> - Authentication and data encryption keys (shared reference)
 /// * `trusted_addrs` - Arc<RwLock<Vec<std::net::SocketAddr>>> - Trusted socket addresses
 /// * `cancellation_token` - CancellationToken for graceful shutdown
+/// * `salts` - Arc<RwLock<Salts>> - Authentication and data encryption salts (shared reference)
 ///
 /// # Returns
 /// * `Ok(())` - Daemon shut down gracefully
@@ -635,8 +665,8 @@ pub fn create_secure_pipe() -> Result<(), IpcErrors> {
 /// # Supported Actions
 /// - `AddTrustedDevice` (0x03): Adds a new trusted device address from bytes 1-5
 /// - `SyncData` (0x04): Synchronizes data with other devices (not yet implemented)
-/// - `UpdateAuthPassword` (0x01): Updates authentication password (not yet implemented)
-/// - `UpdateDataPassword` (0x02): Updates data encryption password (not yet implemented)
+/// - `UpdateAuthPassword` (0x01): Updates auth key and salt (bytes 1-32: key, 33-64: salt; total payload must be 65 bytes)
+/// - `UpdateDataPassword` (0x02): Updates data encryption key and salt (bytes 1-32: key, 33-64: salt; total payload must be 65 bytes)
 /// - `Default` (0x00): No operation performed
 /// - Unknown values: Ignored with warning
 pub async fn handle_data_server(
@@ -644,8 +674,12 @@ pub async fn handle_data_server(
     trusted_addrs: Arc<RwLock<Vec<std::net::SocketAddr>>>,
     keys: Arc<RwLock<Keys>>,
     salts: Arc<RwLock<Salts>>,
+    incoming_connection: (tokio::net::UnixStream, tokio::net::unix::SocketAddr),
 ) -> Result<(), IpcErrors> {
-    // TODO : HANDLE KEYS CHANGES, DATA SYNCING WITH UI, DATA PASSING TO CONTROLLER IN cesa_conn_system if ac tion type doesnt match
+    // TODO: handle key changes, data syncing with UI, and forwarding to cesa_conn_system controller when action type doesn't match
+
+    let (mut stream, _addr) = incoming_connection;
+
     match ActionType::from_u8(data[0]) {
         Some(ActionType::AddTrustedDevice) => {
             debug!("Processing AddTrustedDevice action");
@@ -660,7 +694,27 @@ pub async fn handle_data_server(
             info!(%addr, "Successfully added trusted device");
         }
         Some(ActionType::SyncData) => {
-            
+            let mut addrs_bytes_vec: Vec<[u8; 4]> = trusted_addrs
+                .read()
+                .await
+                .iter()
+                .map(|addr| get_bytes_from_ip(addr))
+                .collect();
+
+            let addrs_bytes = Zeroizing::new(addrs_bytes_vec.concat());
+            let size_bytes = (addrs_bytes.len() + 8).to_le_bytes();
+
+            addrs_bytes_vec.zeroize();
+
+            stream
+                .write_all(&size_bytes)
+                .await
+                .map_err(|_| IpcErrors::FailedToWriteToStream)?;
+
+            stream
+                .write_all(&addrs_bytes)
+                .await
+                .map_err(|_| IpcErrors::FailedToWriteToStream)?;
         }
         Some(ActionType::UpdateAuthPassword) => {
             debug!("Processing UpdateAuthPassword action (not yet implemented)");
@@ -701,6 +755,29 @@ pub async fn handle_data_server(
     Ok(())
 }
 
+/// Client-side handler that applies an IPC action to local shared state.
+///
+/// This is the client-side counterpart to `handle_data_server`. It parses the raw
+/// payload and updates `keys`, `salts`, and `trusted_addrs` in place based on the
+/// action type.
+///
+/// # Arguments
+/// * `action_type` - The action to perform
+/// * `data` - Raw message payload; byte 0 is NOT the action byte here — the caller
+///   already separated the action. Layout varies by action type (see below).
+/// * `trusted_addrs` - Shared list of trusted peer addresses
+/// * `keys` - Shared authentication and data encryption keys
+/// * `salts` - Shared authentication and data encryption salts
+///
+/// # Returns
+/// * `Ok(())` - Action applied successfully
+/// * `Err(IpcErrors)` - If the payload is malformed
+///
+/// # Payload layouts
+/// - `AddTrustedDevice`: bytes 1-4 contain the IPv4 address (4 bytes). TODO: incomplete.
+/// - `SyncData`: bytes 1-128 are key+salt material (64 bytes keys, 64 bytes salts);
+///   bytes 129+ are a packed list of 4-byte IPv4 addresses.
+/// - `UpdateAuthPassword`, `UpdateDataPassword`, `Default`: not yet handled here.
 pub async fn ipc_action(
     action_type: ActionType,
     data: &[u8],
@@ -710,24 +787,24 @@ pub async fn ipc_action(
 ) -> Result<(), IpcErrors> {
     match action_type {
         ActionType::AddTrustedDevice => {
-            // Extract IPv4 address from data (bytes 1-5)
+            // bytes 1..=4 hold the IPv4 address octets
             let mut addr_bytes = [0u8; size_of::<Ipv4Addr>()];
             addr_bytes.copy_from_slice(&data[1..size_of::<Ipv4Addr>() + 1]);
 
             let addr = Ipv4Addr::from_octets(addr_bytes);
             let socket_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(addr), 0000);
+            // TODO: push socket_addr into trusted_addrs
         }
 
         ActionType::SyncData => {
-            debug!("Processing SyncData action (not yet implemented)");
-            // TODO: Implement data synchronization
-
+            // 64 bytes keys (a_key || d_key) + 64 bytes salts (a_salt || d_salt) = 128 bytes
             let fixed_sizes = 128;
 
             if data.len() < fixed_sizes + 1 {
                 return Err(IpcErrors::WrongDataSize);
             }
 
+            // remaining bytes after the fixed block must be a whole number of IPv4 addresses
             let dynamic_size = data.len() - 129;
 
             if dynamic_size % size_of::<Ipv4Addr>() != 0 {
@@ -750,14 +827,19 @@ pub async fn ipc_action(
 
             keys.write().await.update(Keys::from_ref(&keys_new_bytes));
 
+            // bytes 129+ are packed 4-byte IPv4 addresses
             let addresses: Vec<std::net::SocketAddr> = data[129..]
                 .chunks_exact(size_of::<Ipv4Addr>())
                 .map(|addr_bytes| get_ip_from_bytes(addr_bytes))
                 .collect();
 
-            let trusted_addrs_lock =  trusted_addrs.write().await;
+            let trusted_addrs_lock = trusted_addrs.write().await;
 
-            trusted_addrs_lock.extend(addresses.into_iter().filter(|addr| !trusted_addrs_lock.contains(addr)));
+            trusted_addrs_lock.extend(
+                addresses
+                    .into_iter()
+                    .filter(|addr| !trusted_addrs_lock.contains(addr)),
+            );
         }
     }
 
