@@ -12,6 +12,7 @@
 // - Add IPC client functionality
 // - Add IPC daemon functionality
 // - Add Windows support (named pipes)
+// - Migitate normal networking in ipc client to async one with tokio
 // TODO LATER:
 // - Add SELinux / AppArmor policy support for better security
 // - add change SocketAddr trusted addrs to just Ipv4 since its lighter (4 bytes)
@@ -205,14 +206,14 @@ impl fmt::Display for IpcErrors {
             Self::ConfirmationByteNotReceived => "confirmation byte not received",
             Self::FailedToRecvData => "failed to get data from client",
             Self::FailedToHandleData => "failed to handle data from ipc client",
-            Self::DataTooLarge => "data from cllient is too large",
+            Self::DataTooLarge => "data from client is too large",
             Self::NoData => "there's no data",
             Self::DaemonIsNotRunning => "daemon is not running yet",
             Self::FailedToGetPeerCred => "failed to get peer cred",
             Self::FailedToGetPid => "failed to get process pid",
             Self::FailedToGetProcessName => "failed to get process name",
             Self::FailedToGetPeerName => "failed to get peer name",
-            Self::UnauthorizedPeer => "unauthorized peer tired to connect",
+            Self::UnauthorizedPeer => "unauthorized peer tried to connect",
             Self::WrongDataSize => "data size is not correct",
         };
         write!(f, "{}", msg)
@@ -454,9 +455,9 @@ pub fn create_secure_pipe() -> Result<UnixListener, IpcErrors> {
 ///
 /// # Returns
 /// A `SocketAddr` wrapping the parsed IPv4 address with port set to 0
-pub fn get_ip_from_bytes(data: &[u8]) -> std::net::SocketAddr {
+pub fn get_ip_from_bytes(data: &[u8; 4]) -> std::net::SocketAddr {
     let mut addr_bytes = [0u8; size_of::<Ipv4Addr>()];
-    addr_bytes.copy_from_slice(&data);
+    addr_bytes.copy_from_slice(data);
 
     let addr = Ipv4Addr::from_octets(addr_bytes);
     std::net::SocketAddr::new(std::net::IpAddr::V4(addr), 0000)
@@ -663,12 +664,15 @@ pub fn create_secure_pipe() -> Result<(), IpcErrors> {
 /// * `Err(IpcErrors)` - If handling fails
 ///
 /// # Supported Actions
-/// - `AddTrustedDevice` (0x03): Adds a new trusted device address from bytes 1-5
-/// - `SyncData` (0x04): Synchronizes data with other devices (not yet implemented)
-/// - `UpdateAuthPassword` (0x01): Updates auth key and salt (bytes 1-32: key, 33-64: salt; total payload must be 65 bytes)
-/// - `UpdateDataPassword` (0x02): Updates data encryption key and salt (bytes 1-32: key, 33-64: salt; total payload must be 65 bytes)
+/// - `AddTrustedDevice` (0x03): Adds a new trusted device address from bytes 1–4 (packed IPv4)
+/// - `SyncData` (0x04): Sends keys+salts (128 bytes) then a confirmed address-list exchange:
+///   server writes size, reads client confirmation, then writes the packed IPv4 list
+/// - `UpdateAuthPassword` (0x01): Replaces `a_key` (bytes 1–32) and `a_salt` (bytes 33–64);
+///   total payload must be exactly 65 bytes
+/// - `UpdateDataPassword` (0x02): Replaces `d_key` (bytes 1–32) and `d_salt` (bytes 33–64);
+///   total payload must be exactly 65 bytes
 /// - `Default` (0x00): No operation performed
-/// - Unknown values: Ignored with warning
+/// - Unknown values: Logged as warning and ignored
 pub async fn handle_data_server(
     mut data: Vec<u8>,
     trusted_addrs: Arc<RwLock<Vec<std::net::SocketAddr>>>,
@@ -684,7 +688,11 @@ pub async fn handle_data_server(
         Some(ActionType::AddTrustedDevice) => {
             debug!("Processing AddTrustedDevice action");
 
-            let socket_addr = get_ip_from_bytes(&data[1..size_of::<Ipv4Addr>() + 1]);
+            let mut ip_bytes = [0u8; 4];
+
+            ip_bytes.copy_from_slice(&data[1..size_of::<Ipv4Addr>() + 1]);
+
+            let socket_addr = get_ip_from_bytes(&ip_bytes);
             let addr = socket_addr.ip();
 
             debug!(%addr, "Adding new trusted device address");
@@ -694,6 +702,25 @@ pub async fn handle_data_server(
             info!(%addr, "Successfully added trusted device");
         }
         Some(ActionType::SyncData) => {
+            // Step 1: Pack keys and salts into fixed-size 64-byte arrays, then concatenate
+            // them into a single 128-byte credential buffer and send it to the client.
+            let mut keys_bytes = Zeroizing::new([0u8; size_of::<Keys>()]);
+            let mut salts_bytes = Zeroizing::new([0u8; size_of::<Salts>()]);
+
+            keys.read().await.to_ref(&mut keys_bytes);
+            salts.read().await.to_ref(&mut salts_bytes);
+
+            // cred_buffer layout: [a_key(32) | d_key(32) | a_salt(32) | d_salt(32)]
+            let cred_buffer =
+                Zeroizing::new([keys_bytes.as_slice(), salts_bytes.as_slice()].concat());
+
+            stream
+                .write_all(&cred_buffer)
+                .await
+                .map_err(|_| IpcErrors::FailedToWriteToStream)?;
+
+            // Step 2: Pack each trusted address as 4 raw IPv4 octets. The intermediate
+            // Vec<[u8;4]> is zeroized separately because concat() copies into a new buffer.
             let mut addrs_bytes_vec: Vec<[u8; 4]> = trusted_addrs
                 .read()
                 .await
@@ -702,42 +729,57 @@ pub async fn handle_data_server(
                 .collect();
 
             let addrs_bytes = Zeroizing::new(addrs_bytes_vec.concat());
-            let size_bytes = (addrs_bytes.len() + 8).to_le_bytes();
+            // NOTE: size_bytes encodes addrs_bytes.len() + 8; see known size-mismatch issue.
+            let size_bytes = (addrs_bytes.len() as u64).to_le_bytes();
+            let mut confirm_byte = [0u8];
 
             addrs_bytes_vec.zeroize();
 
+            // Step 3: Send the size of the address payload so the client can validate it
+            // before committing to reading the full buffer.
             stream
                 .write_all(&size_bytes)
                 .await
                 .map_err(|_| IpcErrors::FailedToWriteToStream)?;
 
+            // Step 4: Wait for client confirmation (0x01 = accept, 0x00 = reject/wrong size).
+            stream
+                .read_exact(&mut confirm_byte)
+                .await
+                .map_err(|_| IpcErrors::FailedToReadDataFromStream)?;
+
+            if confirm_byte[0] == 0x00 {
+                return Err(IpcErrors::WrongDataSize);
+            }
+
+            // Step 5: Send the packed address list only after the client has confirmed.
             stream
                 .write_all(&addrs_bytes)
                 .await
                 .map_err(|_| IpcErrors::FailedToWriteToStream)?;
         }
         Some(ActionType::UpdateAuthPassword) => {
-            debug!("Processing UpdateAuthPassword action (not yet implemented)");
-            // TODO: Implement auth password update
+            debug!("Processing UpdateAuthPassword action");
 
+            // Payload must be exactly 65 bytes: 1 action byte + 32 key + 32 salt.
             if data.len() != 65 {
                 return Err(IpcErrors::WrongDataSize);
             }
 
+            // bytes 1–32 → a_key, bytes 33–64 → a_salt
             keys.write().await.a_key.clone_from_slice(&data[1..33]);
-
             salts.write().await.a_salt.clone_from_slice(&data[33..65]);
         }
         Some(ActionType::UpdateDataPassword) => {
-            debug!("Processing UpdateDataPassword action (not yet implemented)");
-            // TODO: Implement data password update
+            debug!("Processing UpdateDataPassword action");
 
+            // Payload must be exactly 65 bytes: 1 action byte + 32 key + 32 salt.
             if data.len() != 65 {
                 return Err(IpcErrors::WrongDataSize);
             }
 
+            // bytes 1–32 → d_key, bytes 33–64 → d_salt
             keys.write().await.d_key.clone_from_slice(&data[1..33]);
-
             salts.write().await.d_salt.clone_from_slice(&data[33..65]);
         }
         Some(ActionType::Default) => {
@@ -755,92 +797,111 @@ pub async fn handle_data_server(
     Ok(())
 }
 
-/// Client-side handler that applies an IPC action to local shared state.
+/// Client-side handler that processes the daemon's response for a given IPC action.
 ///
-/// This is the client-side counterpart to `handle_data_server`. It parses the raw
-/// payload and updates `keys`, `salts`, and `trusted_addrs` in place based on the
-/// action type.
+/// Called after `ipc_send` has transmitted the request. Reads any response data from
+/// `stream` and updates `keys`, `salts`, and `trusted_addrs` in place according to
+/// `action_type`.
 ///
 /// # Arguments
-/// * `action_type` - The action to perform
-/// * `data` - Raw message payload; byte 0 is NOT the action byte here — the caller
-///   already separated the action. Layout varies by action type (see below).
-/// * `trusted_addrs` - Shared list of trusted peer addresses
-/// * `keys` - Shared authentication and data encryption keys
-/// * `salts` - Shared authentication and data encryption salts
+/// * `action_type` - The action whose response is being processed
+/// * `data` - Outbound payload that was sent (currently unused; reserved for future arms)
+/// * `trusted_addrs` - Shared list of trusted peer addresses (extended on `SyncData`)
+/// * `keys` - Shared keys (replaced with daemon values on `SyncData`)
+/// * `salts` - Shared salts (replaced with daemon values on `SyncData`)
+/// * `stream` - Connected blocking `UnixStream` to the daemon, used to receive response data
 ///
 /// # Returns
-/// * `Ok(())` - Action applied successfully
-/// * `Err(IpcErrors)` - If the payload is malformed
+/// * `Ok(())` - Response processed successfully (or action has no response)
+/// * `Err(IpcErrors)` - If reading from the stream fails or the daemon signals an error
 ///
-/// # Payload layouts
-/// - `AddTrustedDevice`: bytes 1-4 contain the IPv4 address (4 bytes). TODO: incomplete.
-/// - `SyncData`: bytes 1-128 are key+salt material (64 bytes keys, 64 bytes salts);
-///   bytes 129+ are a packed list of 4-byte IPv4 addresses.
-/// - `UpdateAuthPassword`, `UpdateDataPassword`, `Default`: not yet handled here.
+/// # Implemented actions
+/// - `SyncData`: receives 128-byte credential buffer, then a confirmed address-list exchange
+///
+/// # TODO
+/// - `AddTrustedDevice`: parse bytes 0–3 as IPv4 and push to `trusted_addrs`
+/// - `UpdateAuthPassword`: apply new a_key / a_salt received from the daemon
+/// - `UpdateDataPassword`: apply new d_key / d_salt received from the daemon
+/// - `Default`: intentional no-op; currently handled by the `_ => {}` catch-all
 pub async fn ipc_action(
     action_type: ActionType,
     data: &[u8],
     trusted_addrs: Arc<RwLock<Vec<std::net::SocketAddr>>>,
     keys: Arc<RwLock<Keys>>,
     salts: Arc<RwLock<Salts>>,
+    stream: &mut UnixStream,
 ) -> Result<(), IpcErrors> {
     match action_type {
-        ActionType::AddTrustedDevice => {
-            // bytes 1..=4 hold the IPv4 address octets
-            let mut addr_bytes = [0u8; size_of::<Ipv4Addr>()];
-            addr_bytes.copy_from_slice(&data[1..size_of::<Ipv4Addr>() + 1]);
-
-            let addr = Ipv4Addr::from_octets(addr_bytes);
-            let socket_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(addr), 0000);
-            // TODO: push socket_addr into trusted_addrs
-        }
-
         ActionType::SyncData => {
-            // 64 bytes keys (a_key || d_key) + 64 bytes salts (a_salt || d_salt) = 128 bytes
-            let fixed_sizes = 128;
+            // Step 1: Read the 128-byte credential buffer sent by the daemon.
+            // Layout: [a_key(32) | d_key(32) | a_salt(32) | d_salt(32)]
+            let mut cred_buffer = Zeroizing::new([0u8; size_of::<Keys>() + size_of::<Salts>()]);
 
-            if data.len() < fixed_sizes + 1 {
+            stream
+                .read_exact(cred_buffer.as_mut_slice())
+                .map_err(|_| IpcErrors::FailedToReadDataFromStream)?;
+
+            // Step 2: Split and apply: first 64 bytes → keys, last 64 bytes → salts.
+            let mut keys_bytes = Zeroizing::new([0u8; size_of::<Keys>()]);
+            let mut salts_bytes = Zeroizing::new([0u8; size_of::<Salts>()]);
+
+            keys_bytes.copy_from_slice(&cred_buffer[..64]);
+            salts_bytes.copy_from_slice(&cred_buffer[64..]);
+
+            keys.write().await.update(Keys::from_ref(&keys_bytes));
+            salts.write().await.update(Salts::from_ref(&salts_bytes));
+
+            // Step 3: Read the 8-byte size of the upcoming address payload.
+            let mut size_buffer = [0u8; 8];
+
+            stream
+                .read_exact(&mut size_buffer)
+                .map_err(|_| IpcErrors::FailedToReadDataFromStream)?;
+
+            let size = u64::from_le_bytes(size_buffer) as usize;
+
+            // Validate that size is a clean multiple of 4 (each IPv4 address is 4 bytes).
+            // Send 0x00 to reject or 0x01 to accept before the daemon sends the list.
+            if size % size_of::<Ipv4Addr>() != 0 {
+                stream
+                    .write_all(&[0u8])
+                    .map_err(|_| IpcErrors::FailedToWriteToStream)?;
                 return Err(IpcErrors::WrongDataSize);
+            } else {
+                stream
+                    .write_all(&[1u8])
+                    .map_err(|_| IpcErrors::FailedToWriteToStream)?;
             }
 
-            // remaining bytes after the fixed block must be a whole number of IPv4 addresses
-            let dynamic_size = data.len() - 129;
+            // Step 4: Read the packed address list and parse into SocketAddrs.
+            let mut addrs_buffer = vec![0u8; size];
 
-            if dynamic_size % size_of::<Ipv4Addr>() != 0 {
-                return Err(IpcErrors::WrongDataSize);
-            }
+            stream
+                .read_exact(&mut addrs_buffer)
+                .map_err(|_| IpcErrors::FailedToReadDataFromStream)?;
 
-            let mut sk_data = Zeroizing::new([0u8; 128]);
-            sk_data.copy_from_slice(&data[1..fixed_sizes + 1]);
-
-            let mut keys_new_bytes = Zeroizing::new([0u8; 64]);
-            let mut salts_new_bytes = Zeroizing::new([0u8; 64]);
-
-            keys_new_bytes.copy_from_slice(&sk_data[..64]);
-            salts_new_bytes.copy_from_slice(&sk_data[64..]);
-
-            salts
-                .write()
-                .await
-                .update(Salts::from_ref(&salts_new_bytes));
-
-            keys.write().await.update(Keys::from_ref(&keys_new_bytes));
-
-            // bytes 129+ are packed 4-byte IPv4 addresses
-            let addresses: Vec<std::net::SocketAddr> = data[129..]
+            let addresses: Vec<std::net::SocketAddr> = addrs_buffer
                 .chunks_exact(size_of::<Ipv4Addr>())
-                .map(|addr_bytes| get_ip_from_bytes(addr_bytes))
+                .map(|addr_bytes| {
+                    let mut fixed_byte = [0u8; 4];
+                    fixed_byte.clone_from_slice(&addr_bytes);
+
+                    get_ip_from_bytes(&fixed_byte)
+                })
                 .collect();
 
-            let trusted_addrs_lock = trusted_addrs.write().await;
+            // Merge: only add addresses not already present in the local list.
+            let trusted_addrs_clone = trusted_addrs.read().await.clone();
 
-            trusted_addrs_lock.extend(
+            trusted_addrs.write().await.extend(
                 addresses
                     .into_iter()
-                    .filter(|addr| !trusted_addrs_lock.contains(addr)),
+                    .filter(|addr| !trusted_addrs_clone.contains(addr)),
             );
         }
+
+        // TODO: implement AddTrustedDevice, UpdateAuthPassword, UpdateDataPassword, Default
+        _ => {}
     }
 
     Ok(())
@@ -848,23 +909,39 @@ pub async fn ipc_action(
 
 /// Sends an IPC message to the daemon
 ///
-/// This function sends a message to the IPC daemon using the following protocol:
+/// Send protocol (all action types):
 /// 1. Check if daemon is running
 /// 2. Connect to the socket
-/// 3. Send message size (8 bytes)
-/// 4. Wait for confirmation byte
-/// 5. Send the actual message data
+/// 3. Prepend action byte and send 8-byte little-endian message size
+/// 4. Wait for daemon confirmation byte (0x01 = accepted, 0x00 = rejected)
+/// 5. Send the full message (action byte + payload)
+///
+/// Response handling (action-specific) is performed by `ipc_action` after this
+/// function returns — call it with the same `stream` to complete the exchange.
+///
+/// NOTE: uses blocking `std::os::unix::net::UnixStream` despite being `async`.
+/// This blocks the tokio worker thread for the duration of the handshake.
 ///
 /// # Arguments
-/// * `action_type` - ActionType - The type of action being requested
-/// * `data` - &[u8] - The payload data to send
+/// * `action_type` - The type of action being requested
+/// * `data` - Payload bytes (action byte is prepended internally; do not include it)
+/// * `trusted_addrs` - Reserved for future use; currently unused
+/// * `keys` - Reserved for future use; currently unused
+/// * `salts` - Reserved for future use; currently unused
 ///
 /// # Returns
-/// * `Ok(())` - Message sent successfully
-/// * `Err(IpcErrors)` - If sending fails or daemon not available
+/// * `Ok(())` - Message delivered successfully
+/// * `Err(IpcErrors)` - If sending fails or daemon is not available
 
 #[cfg(unix)]
-pub fn ipc_send(action_type: ActionType, data: &[u8]) -> Result<(), IpcErrors> {
+pub async fn ipc_send(
+    action_type: ActionType,
+    data: &[u8],
+    // TODO: pass these through to ipc_action once the caller wires them together
+    trusted_addrs: Arc<RwLock<Vec<std::net::SocketAddr>>>,
+    keys: Arc<RwLock<Keys>>,
+    salts: Arc<RwLock<Salts>>,
+) -> Result<(), IpcErrors> {
     let path = socket_path().map_err(|_| IpcErrors::FailedToFetchSocketPath)?;
 
     debug!("Checking if IPC daemon is running");
@@ -989,6 +1066,7 @@ mod tests {
             IpcErrors::FailedToGetProcessName,
             IpcErrors::FailedToGetPeerName,
             IpcErrors::UnauthorizedPeer,
+            IpcErrors::WrongDataSize,
         ];
 
         for error in errors {
@@ -1220,6 +1298,142 @@ mod tests {
         }
     }
 
+    /// Test that WrongDataSize Display string is non-empty and meaningful
+    #[test]
+    fn test_wrong_data_size_display() {
+        let error = IpcErrors::WrongDataSize;
+        let s = error.to_string();
+        assert!(!s.is_empty());
+        assert!(s.contains("size") || s.contains("data") || s.contains("correct"));
+    }
+
+    /// Test get_ip_from_bytes with a known IPv4 address
+    #[test]
+    fn test_get_ip_from_bytes_known_address() {
+        let bytes = [192u8, 168, 1, 100];
+        let addr = get_ip_from_bytes(&bytes);
+        assert_eq!(
+            addr.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 100))
+        );
+        assert_eq!(addr.port(), 0);
+    }
+
+    /// Test get_ip_from_bytes with all-zero bytes (0.0.0.0)
+    #[test]
+    fn test_get_ip_from_bytes_zero() {
+        let bytes = [0u8; 4];
+        let addr = get_ip_from_bytes(&bytes);
+        assert_eq!(
+            addr.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))
+        );
+    }
+
+    /// Test get_ip_from_bytes with all-ones bytes (255.255.255.255)
+    #[test]
+    fn test_get_ip_from_bytes_broadcast() {
+        let bytes = [255u8; 4];
+        let addr = get_ip_from_bytes(&bytes);
+        assert_eq!(
+            addr.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(255, 255, 255, 255))
+        );
+    }
+
+    /// Test get_bytes_from_ip extracts correct octets from an IPv4 SocketAddr
+    #[test]
+    fn test_get_bytes_from_ip_v4() {
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
+        let addr = std::net::SocketAddr::new(ip, 8080);
+        assert_eq!(get_bytes_from_ip(&addr), [10u8, 0, 0, 1]);
+    }
+
+    /// Test get_bytes_from_ip returns [0;4] for a non-IPv4 address
+    #[test]
+    fn test_get_bytes_from_ip_nonv4_returns_zero() {
+        // Pure IPv6 address that is not an IPv4-mapped address
+        let ip = std::net::IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1));
+        let addr = std::net::SocketAddr::new(ip, 0);
+        assert_eq!(get_bytes_from_ip(&addr), [0u8; 4]);
+    }
+
+    /// Test bytes → SocketAddr → bytes roundtrip is lossless
+    #[test]
+    fn test_ip_bytes_roundtrip() {
+        let original = [172u8, 16, 254, 1];
+        let addr = get_ip_from_bytes(&original);
+        let back = get_bytes_from_ip(&addr);
+        assert_eq!(back, original);
+    }
+
+    /// Test that port is always 0 in addresses produced by get_ip_from_bytes
+    #[test]
+    fn test_get_ip_from_bytes_port_is_zero() {
+        let bytes = [1u8, 2, 3, 4];
+        let addr = get_ip_from_bytes(&bytes);
+        assert_eq!(addr.port(), 0);
+    }
+
+    /// Unimplemented ipc_action arms fall into `_ => {}` and must return Ok(()) cleanly.
+    /// These tests guard against accidental panics as arms are added one by one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_ipc_action_default_is_noop() {
+        use crate::auth::{Keys, Salts};
+        use std::os::unix::net::UnixStream as StdUnixStream;
+        let (mut client, _server) = StdUnixStream::pair().unwrap();
+        let keys = Arc::new(RwLock::new(Keys::new([0u8; 32], [0u8; 32])));
+        let salts = Arc::new(RwLock::new(Salts::new([0u8; 32], [0u8; 32])));
+        let trusted_addrs = Arc::new(RwLock::new(Vec::<std::net::SocketAddr>::new()));
+        let result = ipc_action(ActionType::Default, &[], trusted_addrs, keys, salts, &mut client).await;
+        assert!(result.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_ipc_action_add_trusted_device_is_noop() {
+        use crate::auth::{Keys, Salts};
+        use std::os::unix::net::UnixStream as StdUnixStream;
+        let (mut client, _server) = StdUnixStream::pair().unwrap();
+        let keys = Arc::new(RwLock::new(Keys::new([0u8; 32], [0u8; 32])));
+        let salts = Arc::new(RwLock::new(Salts::new([0u8; 32], [0u8; 32])));
+        let trusted_addrs = Arc::new(RwLock::new(Vec::<std::net::SocketAddr>::new()));
+        // payload: 4 bytes for IPv4 (action byte already stripped by caller)
+        let payload = [192u8, 168, 1, 1];
+        let result = ipc_action(ActionType::AddTrustedDevice, &payload, trusted_addrs, keys, salts, &mut client).await;
+        assert!(result.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_ipc_action_update_auth_password_is_noop() {
+        use crate::auth::{Keys, Salts};
+        use std::os::unix::net::UnixStream as StdUnixStream;
+        let (mut client, _server) = StdUnixStream::pair().unwrap();
+        let keys = Arc::new(RwLock::new(Keys::new([0u8; 32], [0u8; 32])));
+        let salts = Arc::new(RwLock::new(Salts::new([0u8; 32], [0u8; 32])));
+        let trusted_addrs = Arc::new(RwLock::new(Vec::<std::net::SocketAddr>::new()));
+        // payload: 32 key bytes + 32 salt bytes
+        let payload = [0u8; 64];
+        let result = ipc_action(ActionType::UpdateAuthPassword, &payload, trusted_addrs, keys, salts, &mut client).await;
+        assert!(result.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_ipc_action_update_data_password_is_noop() {
+        use crate::auth::{Keys, Salts};
+        use std::os::unix::net::UnixStream as StdUnixStream;
+        let (mut client, _server) = StdUnixStream::pair().unwrap();
+        let keys = Arc::new(RwLock::new(Keys::new([0u8; 32], [0u8; 32])));
+        let salts = Arc::new(RwLock::new(Salts::new([0u8; 32], [0u8; 32])));
+        let trusted_addrs = Arc::new(RwLock::new(Vec::<std::net::SocketAddr>::new()));
+        let payload = [0u8; 64];
+        let result = ipc_action(ActionType::UpdateDataPassword, &payload, trusted_addrs, keys, salts, &mut client).await;
+        assert!(result.is_ok());
+    }
+
     /// Test that ActionType variants are not equal to each other (including new types)
     #[test]
     fn test_action_type_inequality_extended() {
@@ -1270,6 +1484,7 @@ mod tests {
             IpcErrors::FailedToGetProcessName,
             IpcErrors::FailedToGetPeerName,
             IpcErrors::UnauthorizedPeer,
+            IpcErrors::WrongDataSize,
         ];
 
         // Verify all errors are unique by checking that no two are equal
