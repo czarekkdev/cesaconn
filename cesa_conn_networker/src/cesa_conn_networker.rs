@@ -20,7 +20,7 @@ GET RID OF STORING KEYS IN RAM
  */
 
 mod auth;
-mod ipc;
+mod ipc_unix;
 mod tcp_networker;
 mod udp_networker;
 use std::{env, net::SocketAddr, sync::Arc};

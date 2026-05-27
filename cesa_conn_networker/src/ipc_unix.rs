@@ -638,18 +638,6 @@ pub async fn ipc_daemon(
     }
 }
 
-/// Windows placeholder for secure pipe creation
-///
-/// This is a placeholder for Windows support. On Windows, named pipes
-/// should be used instead of Unix domain sockets.
-///
-/// # Returns
-/// * `Ok(())` - Always succeeds (placeholder)
-#[cfg(target_os = "windows")]
-pub fn create_secure_pipe() -> Result<(), IpcErrors> {
-    Ok(())
-}
-
 /// Handles incoming IPC data based on the action type
 ///
 /// This function processes received IPC messages and performs the appropriate
