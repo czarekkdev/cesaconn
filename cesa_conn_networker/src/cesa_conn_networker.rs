@@ -23,6 +23,7 @@ mod auth;
 mod ipc_unix;
 mod tcp_networker;
 mod udp_networker;
+mod auth_snow;
 use std::{env, net::SocketAddr, sync::Arc};
 use tracing::{error, warn};
 use tracing_subscriber::EnvFilter;

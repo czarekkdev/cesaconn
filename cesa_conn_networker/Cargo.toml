@@ -15,4 +15,6 @@ tokio-util = "0.7.18"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize = "1.8.2"
+snow = "0.10.0"
+ml-kem = "0.3.2"
 
