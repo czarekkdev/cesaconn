@@ -50,6 +50,6 @@ pub async fn auth_incoming(
     ml_key_pair: MlKem1024KeyPair,
 ) -> Result<bool, AuthSnowErrors> {
     let builder = Builder::new(SNOW_CONNECTION_PARAMS.clone());
-    // let mut noise = builder.local_private_key(keys.read().await.a_key.as_ref()).map_err(|_| AuthSnowErrors::FailedToBindPrivateKey)?.psk(2, key)
+    let mut noise = builder.local_private_key(keys.read().await.a_key.as_ref()).map_err(|_| AuthSnowErrors::FailedToBindPrivateKey)?.psk(2, key)
     Ok(true)
 }
