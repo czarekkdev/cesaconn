@@ -1,5 +1,8 @@
 use crate::auth::Keys;
-use cesa_conn_crypto::crand::random_array;
+use cesa_conn_crypto::{
+    crand::random_array,
+    x25519_cesa::{self, generate_new_key_pair},
+};
 use core::fmt;
 use libcrux_ml_kem::mlkem1024::{self, MlKem1024KeyPair};
 use rand::{make_rng, rngs::StdRng};
@@ -9,6 +12,7 @@ use std::{
     sync::{Arc, LazyLock},
 };
 use tokio::{net::TcpStream, sync::RwLock};
+use zeroize::Zeroizing;
 
 static SNOW_CONNECTION_PARAMS: LazyLock<NoiseParams> =
     LazyLock::new(|| "Noise_XXpsk2_25519_AESGCM_BLAKE2b".parse().unwrap());
@@ -25,6 +29,8 @@ pub enum AuthSnowErrors {
     /// Failed to encrypt the authentication key.
     FailedToEncrypt,
     FailedToBindPrivateKey,
+    FailedToInitSnowBuilder,
+    FailedToGenerateRandomData,
 }
 
 impl fmt::Display for AuthSnowErrors {
@@ -39,6 +45,12 @@ impl fmt::Display for AuthSnowErrors {
             AuthSnowErrors::FailedToBindPrivateKey => {
                 write!(f, "failed to bind private key to noise")
             }
+            AuthSnowErrors::FailedToInitSnowBuilder => {
+                write!(f, "failed to initialize snow builder")
+            }
+            AuthSnowErrors::FailedToGenerateRandomData => {
+                write!(f, "failed to generate array of random data")
+            }
         }
     }
 }
@@ -47,9 +59,15 @@ pub async fn auth_incoming(
     keys: Arc<RwLock<Keys>>,
     tusted_addrs: Arc<RwLock<Vec<SocketAddr>>>,
     incoming_connection: (&mut TcpStream, SocketAddr),
-    ml_key_pair: MlKem1024KeyPair,
 ) -> Result<bool, AuthSnowErrors> {
-    let builder = Builder::new(SNOW_CONNECTION_PARAMS.clone());
-    let mut noise = builder.local_private_key(keys.read().await.a_key.as_ref()).map_err(|_| AuthSnowErrors::FailedToBindPrivateKey)?.psk(2, key)
+    let ml_key_pair = mlkem1024::generate_key_pair(
+        *random_array::<64>().map_err(|_| AuthSnowErrors::FailedToGenerateRandomData)?,
+    );
+    let x25519_pair = x25519_cesa::generate_new_key_pair(
+        *random_array::<32>().map_err(|_| AuthSnowErrors::FailedToGenerateRandomData)?,
+    );
+
+    
+
     Ok(true)
 }

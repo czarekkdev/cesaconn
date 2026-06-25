@@ -515,7 +515,7 @@ pub async fn connect(
 mod tests {
     use super::*;
     use crate::auth::{decrypt_tunnel, encrypt_tunnel};
-    use cesa_conn_crypto::ecdh::{
+    use cesa_conn_crypto::x25519_cesa::{
         calculate_public_key, calculate_shared_key, generate_private_key, hash_key,
     };
     use tokio::io::AsyncWriteExt;

@@ -1,14 +1,22 @@
-use aes_gcm::aead::OsRng;
 use sha2::{Digest, Sha256};
 use tracing::trace;
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroizing;
 
-/// Generates a cryptographically secure random private key using OS entropy
-pub fn generate_private_key() -> [u8; 32] {
-    trace!("generating X25519 private key from OS entropy");
-    let private_key = StaticSecret::random_from_rng(OsRng);
-    *private_key.as_bytes()
+pub struct X25519KeyPair {
+    pub public: Zeroizing<[u8; 32]>,
+    pub private: Zeroizing<[u8; 32]>,
 }
+
+impl X25519KeyPair {
+    pub fn new(pub_key: [u8; 32], priv_key: [u8; 32]) -> Self {
+        Self {
+            public: Zeroizing::new(pub_key),
+            private: Zeroizing::new(priv_key),
+        }
+    }
+}
+
 
 /// Derives the X25519 public key from a private key
 pub fn calculate_public_key(private_key: &[u8; 32]) -> [u8; 32] {
@@ -18,12 +26,14 @@ pub fn calculate_public_key(private_key: &[u8; 32]) -> [u8; 32] {
     *public_key.as_bytes()
 }
 
+// TODO: add check if was_contributory
 /// Computes ECDH shared secret from private key and the other party's public key
 /// The result should be hashed with SHA-256 before use as an AES-256 key
 pub fn calculate_shared_key(private_key: &[u8; 32], their_public: &[u8; 32]) -> [u8; 32] {
     trace!("computing X25519 ECDH shared secret");
     let private_key = StaticSecret::from(*private_key);
     let their_public = PublicKey::from(*their_public);
+
     *private_key.diffie_hellman(&their_public).as_bytes()
 }
 
@@ -32,6 +42,12 @@ pub fn calculate_shared_key(private_key: &[u8; 32], their_public: &[u8; 32]) -> 
 pub fn hash_key(shared_key: &[u8; 32]) -> [u8; 32] {
     trace!("hashing ECDH shared secret with SHA-256");
     Sha256::digest(*shared_key).into()
+}
+
+pub fn generate_new_key_pair(random_data: [u8; 32]) -> X25519KeyPair {
+    let pub_key = Zeroizing::new(calculate_public_key(&random_data));
+
+    X25519KeyPair::new(*pub_key, *&random_data)
 }
 
 #[cfg(test)]

@@ -17,11 +17,11 @@ impl fmt::Display for CRandErrors {
     }
 }
 
-/// Returns 64 cryptographically secure random bytes sourced directly from the OS.
+/// Returns cryptographically secure random bytes sourced directly from the OS.
 ///
 /// The output is wrapped in [`Zeroizing`] so the buffer is scrubbed from memory on drop.
-pub fn random_array() -> Result<Zeroizing<[u8; 64]>, CRandErrors> {
-    let mut output = Zeroizing::new([0u8; 64]);
+pub fn random_array<const SIZE: usize>() -> Result<Zeroizing<[u8; SIZE]>, CRandErrors> {
+    let mut output = Zeroizing::new([0u8; SIZE]);
 
     SysRng
         .try_fill_bytes(output.as_mut_slice())
