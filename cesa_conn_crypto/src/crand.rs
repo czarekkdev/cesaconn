@@ -34,22 +34,34 @@ pub fn random_array<const SIZE: usize>() -> Result<Zeroizing<[u8; SIZE]>, CRandE
 mod tests {
     use super::*;
 
+    /// OS RNG must succeed and fill the buffer with at least some non-zero bytes.
     #[test]
-    fn output_is_not_all_zeros() {
-        let out = random_array().expect("OS RNG should succeed");
-        assert_ne!(*out, [0u8; 64]);
+    fn test_output_is_not_all_zeros() {
+        let out = random_array::<32>().expect("OS RNG should succeed");
+        assert_ne!(*out, [0u8; 32]);
     }
 
+    /// Two consecutive calls must produce different output — collisions are cryptographically impossible.
     #[test]
-    fn consecutive_calls_differ() {
-        let a = random_array().expect("OS RNG should succeed");
-        let b = random_array().expect("OS RNG should succeed");
+    fn test_consecutive_calls_differ() {
+        let a = random_array::<32>().expect("OS RNG should succeed");
+        let b = random_array::<32>().expect("OS RNG should succeed");
         assert_ne!(*a, *b);
     }
 
+    /// The const-generic SIZE parameter is respected — a 64-byte request must yield 64 bytes.
     #[test]
-    fn output_is_64_bytes() {
-        let out = random_array().expect("OS RNG should succeed");
-        assert_eq!(out.len(), 64);
+    fn test_size_64_succeeds() {
+        let out = random_array::<64>().expect("OS RNG should succeed");
+        assert_ne!(*out, [0u8; 64]);
+    }
+
+    /// `CRandErrors::FailedToFillBuffer` must produce a human-readable message.
+    #[test]
+    fn test_error_display() {
+        assert_eq!(
+            CRandErrors::FailedToFillBuffer.to_string(),
+            "failed to fill buffer with random data"
+        );
     }
 }
