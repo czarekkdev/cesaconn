@@ -50,6 +50,10 @@ impl ActionType {
     }
 }
 
+pub struct TrustedPeer {
+    peer_id: 
+}
+
 /// All errors that can occur in the TCP networker layer.
 /// Each variant maps to a specific failure point in the connection lifecycle.
 #[derive(Debug, PartialEq)]

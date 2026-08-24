@@ -1,17 +1,25 @@
 use crate::auth::Keys;
+use blake2::{Blake2s256, Blake2sMac256};
 use cesa_conn_crypto::{
     crand::random_array,
     x25519_cesa::{self, generate_new_key_pair},
 };
 use core::fmt;
+use hkdf::SimpleHkdf;
 use libcrux_ml_kem::mlkem1024::{self, MlKem1024KeyPair};
 use rand::{make_rng, rngs::StdRng};
 use snow::{Builder, params::NoiseParams};
+use spake2::{Ed25519Group, Identity, Password, Spake2};
 use std::{
     net::SocketAddr,
     sync::{Arc, LazyLock},
 };
-use tokio::{net::TcpStream, sync::RwLock};
+use subtle::ConstantTimeEq;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+    sync::RwLock,
+};
 use zeroize::Zeroizing;
 
 static SNOW_CONNECTION_PARAMS: LazyLock<NoiseParams> =
@@ -31,6 +39,8 @@ pub enum AuthSnowErrors {
     FailedToBindPrivateKey,
     FailedToInitSnowBuilder,
     FailedToGenerateRandomData,
+    FailedToFinishSpake2Exchange,
+    FaledToExpandHkdf,
 }
 
 impl fmt::Display for AuthSnowErrors {
@@ -42,6 +52,10 @@ impl fmt::Display for AuthSnowErrors {
             AuthSnowErrors::FailedToDecrypt => write!(f, "failed to decrypt authentication key"),
             AuthSnowErrors::FailedToWriteToStream => write!(f, "failed to write to stream"),
             AuthSnowErrors::FailedToEncrypt => write!(f, "failed to encrypt authentication key"),
+            AuthSnowErrors::FaledToExpandHkdf => write!(f, "failed to expand hkdf"),
+            AuthSnowErrors::FailedToFinishSpake2Exchange => {
+                write!(f, "failed to finish spake2 exchange")
+            }
             AuthSnowErrors::FailedToBindPrivateKey => {
                 write!(f, "failed to bind private key to noise")
             }
@@ -60,14 +74,56 @@ pub async fn auth_incoming(
     tusted_addrs: Arc<RwLock<Vec<SocketAddr>>>,
     incoming_connection: (&mut TcpStream, SocketAddr),
 ) -> Result<bool, AuthSnowErrors> {
+    let (s1, outbound_msg) = Spake2::<Ed25519Group>::start_b(
+        &Password::new(keys.read().await.a_key.to_vec()),
+        &Identity::new(b"client"),
+        &Identity::new(b"server"),
+    );
+
+    let mut inbound_msg = Zeroizing::new(vec![0u8; outbound_msg.len()]);
+
+    incoming_connection
+        .0
+        .write_all(&outbound_msg)
+        .await
+        .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
+
+    incoming_connection
+        .0
+        .read_exact(&mut inbound_msg)
+        .await
+        .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
+
+    let key1 = Zeroizing::new(
+        s1.finish(&inbound_msg)
+            .map_err(|_| AuthSnowErrors::FailedToFinishSpake2Exchange)?,
+    );
+
+    let hk = SimpleHkdf::<Blake2s256>::new(None, &key1);
+
+    let mut confirm_expect = Zeroizing::new(vec![0u8; 32]);
+
+    hk.expand(b"CPQHA-confirm-client-to-server", &mut confirm_expect)
+        .map_err(|_| AuthSnowErrors::FaledToExpandHkdf)?;
+
+    let mut confirm_recieved = Zeroizing::new(vec![0u8; 32]);
+
+    incoming_connection
+        .0
+        .read_exact(&mut confirm_recieved)
+        .await
+        .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
+
+    if confirm_expect.ct_eq(&confirm_recieved).unwrap_u8() != 1 {
+        return Ok(false);
+    }
+
     let ml_key_pair = mlkem1024::generate_key_pair(
         *random_array::<64>().map_err(|_| AuthSnowErrors::FailedToGenerateRandomData)?,
     );
     let x25519_pair = x25519_cesa::generate_new_key_pair(
         *random_array::<32>().map_err(|_| AuthSnowErrors::FailedToGenerateRandomData)?,
     );
-
-    
 
     Ok(true)
 }
