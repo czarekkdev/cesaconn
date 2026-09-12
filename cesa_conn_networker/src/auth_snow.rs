@@ -1,12 +1,17 @@
+/*
+TODO:
+tag packets
+ */
+
 use crate::auth::Keys;
 use blake2::{Blake2s256, Blake2sMac256};
 use cesa_conn_crypto::{
     crand::random_array,
-    x25519_cesa::{self, generate_new_key_pair},
+    x25519_cesa::{self, calculate_shared_key, generate_new_key_pair},
 };
 use core::fmt;
 use hkdf::SimpleHkdf;
-use libcrux_ml_kem::mlkem1024::{self, MlKem1024KeyPair};
+use libcrux_ml_kem::mlkem1024::{self, MlKem1024KeyPair, MlKem1024PublicKey, avx2::encapsulate};
 use rand::{make_rng, rngs::StdRng};
 use snow::{Builder, params::NoiseParams};
 use spake2::{Ed25519Group, Identity, Password, Spake2};
@@ -41,6 +46,7 @@ pub enum AuthSnowErrors {
     FailedToGenerateRandomData,
     FailedToFinishSpake2Exchange,
     FaledToExpandHkdf,
+    FailedToConvertToArray,
 }
 
 impl fmt::Display for AuthSnowErrors {
@@ -64,6 +70,9 @@ impl fmt::Display for AuthSnowErrors {
             }
             AuthSnowErrors::FailedToGenerateRandomData => {
                 write!(f, "failed to generate array of random data")
+            }
+            AuthSnowErrors::FailedToConvertToArray => {
+                write!(f, "failed to convert vector to array")
             }
         }
     }
@@ -118,12 +127,61 @@ pub async fn auth_incoming(
         return Ok(false);
     }
 
-    let ml_key_pair = mlkem1024::generate_key_pair(
-        *random_array::<64>().map_err(|_| AuthSnowErrors::FailedToGenerateRandomData)?,
-    );
+    let mut confirm_send = Zeroizing::new(vec![0u8; 32]);
+
+    hk.expand(b"CPQHA-confirm-server-to-client", &mut confirm_send)
+        .map_err(|_| AuthSnowErrors::FaledToExpandHkdf)?;
+
+    incoming_connection
+        .0
+        .write_all(&confirm_send)
+        .await
+        .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
+
     let x25519_pair = x25519_cesa::generate_new_key_pair(
         *random_array::<32>().map_err(|_| AuthSnowErrors::FailedToGenerateRandomData)?,
     );
+
+    let x25519_pub = Zeroizing::new(x25519_pair.public.to_vec());
+
+    let mut x25519_recv = Zeroizing::new(vec![0u8; 32]);
+    let mut ml_key_recv = Zeroizing::new(vec![0u8; 1568]);
+
+    incoming_connection
+        .0
+        .read_exact(&mut x25519_recv)
+        .await
+        .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
+
+    incoming_connection
+        .0
+        .read_exact(&mut ml_key_recv)
+        .await
+        .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
+
+    let x25519_ss = Zeroizing::new(calculate_shared_key(
+        &x25519_pair.private,
+        &x25519_recv.as_array().unwrap(),
+    ));
+
+    let (ciphertext, ml_key_ss) = encapsulate(
+        &MlKem1024PublicKey::from(ml_key_recv.as_array().unwrap()),
+        *random_array::<32>().map_err(|_| AuthSnowErrors::FailedToGenerateRandomData)?,
+    );
+
+    let ml_key_ss = Zeroizing::new(ml_key_ss);
+
+    incoming_connection
+        .0
+        .write_all(&x25519_pub)
+        .await
+        .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
+
+    incoming_connection
+        .0
+        .write_all(ciphertext.as_slice())
+        .await
+        .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
 
     Ok(true)
 }

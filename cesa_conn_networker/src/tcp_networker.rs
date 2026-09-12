@@ -1,6 +1,7 @@
 //TODO: add streaming option for large files
 //TODO: add function arg to handle any further actions determined by ActionType in recv_handler
 //TODO: remove arc and rwlock for listener and CancellationToken
+//TODO: tag packets
 
 use core::net::SocketAddr;
 use std::fmt;
