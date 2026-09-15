@@ -83,8 +83,10 @@ pub async fn auth_incoming(
     tusted_addrs: Arc<RwLock<Vec<SocketAddr>>>,
     incoming_connection: (&mut TcpStream, SocketAddr),
 ) -> Result<bool, AuthSnowErrors> {
+    let a_key = keys.read().await.a_key.clone();
+
     let (s1, outbound_msg) = Spake2::<Ed25519Group>::start_b(
-        &Password::new(keys.read().await.a_key.as_slice()),
+        &Password::new(a_key),
         &Identity::new(b"client"),
         &Identity::new(b"server"),
     );
@@ -184,11 +186,20 @@ pub async fn auth_incoming(
         .await
         .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
 
+    let d_key = keys.read().await.d_key.clone();
     let mut psk = Zeroizing::new(Vec::new());
 
     psk.extend_from_slice(x25519_ss.as_slice());
     psk.extend_from_slice(ml_key_ss_secure.as_slice());
-    psk.extend_from_slice(keys.read().await.d_key.as_slice());
+    psk.extend_from_slice(d_key.as_slice());
+
+    let psk_hk = SimpleHkdf::<Blake2s256>::new(None, &psk);
+
+    let mut secure_psk = Zeroizing::new(Vec::new());
+
+    psk_hk
+        .expand(b"CPQHA-psk", &mut secure_psk)
+        .map_err(|_| AuthSnowErrors::FaledToExpandHkdf)?;
 
     Ok(true)
 }
