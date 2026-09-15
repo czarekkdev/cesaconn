@@ -25,7 +25,7 @@ use tokio::{
     net::TcpStream,
     sync::RwLock,
 };
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 static SNOW_CONNECTION_PARAMS: LazyLock<NoiseParams> =
     LazyLock::new(|| "Noise_XXpsk2_25519_AESGCM_BLAKE2b".parse().unwrap());
@@ -164,12 +164,13 @@ pub async fn auth_incoming(
         &x25519_recv.as_array().unwrap(),
     ));
 
-    let (ciphertext, ml_key_ss) = encapsulate(
+    let (ciphertext, mut ml_key_ss) = encapsulate(
         &MlKem1024PublicKey::from(ml_key_recv.as_array().unwrap()),
         *random_array::<32>().map_err(|_| AuthSnowErrors::FailedToGenerateRandomData)?,
     );
 
-    let ml_key_ss = Zeroizing::new(ml_key_ss);
+    let ml_key_ss_secure = Zeroizing::new(ml_key_ss);
+    ml_key_ss.zeroize();
 
     incoming_connection
         .0
