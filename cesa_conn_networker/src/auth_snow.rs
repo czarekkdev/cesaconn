@@ -47,6 +47,9 @@ pub enum AuthSnowErrors {
     FailedToFinishSpake2Exchange,
     FaledToExpandHkdf,
     FailedToConvertToArray,
+    FailedToParseText,
+    FailedToSetLocalPrivateKey,
+    FailedToSetPsk,
 }
 
 impl fmt::Display for AuthSnowErrors {
@@ -73,6 +76,15 @@ impl fmt::Display for AuthSnowErrors {
             }
             AuthSnowErrors::FailedToConvertToArray => {
                 write!(f, "failed to convert vector to array")
+            }
+            AuthSnowErrors::FailedToParseText => {
+                write!(f, "failed to parse text")
+            }
+            AuthSnowErrors::FailedToSetLocalPrivateKey => {
+                write!(f, "failed to set local private key")
+            }
+            AuthSnowErrors::FailedToSetPsk => {
+                write!(f, "failed to set psk")
             }
         }
     }
@@ -186,20 +198,30 @@ pub async fn auth_incoming(
         .await
         .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
 
-    let d_key = keys.read().await.d_key.clone();
     let mut psk = Zeroizing::new(Vec::new());
 
     psk.extend_from_slice(x25519_ss.as_slice());
     psk.extend_from_slice(ml_key_ss_secure.as_slice());
-    psk.extend_from_slice(d_key.as_slice());
 
     let psk_hk = SimpleHkdf::<Blake2s256>::new(None, &psk);
 
-    let mut secure_psk = Zeroizing::new(Vec::new());
+    let mut secure_psk = Zeroizing::new([0u8; 32]);
 
     psk_hk
-        .expand(b"CPQHA-psk", &mut secure_psk)
+        .expand(b"CPQHA-psk", secure_psk.as_mut_slice())
         .map_err(|_| AuthSnowErrors::FaledToExpandHkdf)?;
+
+    let d_key = keys.read().await.d_key.clone();
+
+    let builder = Builder::new(
+        "Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s"
+            .parse()
+            .map_err(|_| AuthSnowErrors::FailedToParseText)?,
+    )
+    .local_private_key(d_key.as_slice())
+    .map_err(|_| AuthSnowErrors::FailedToSetLocalPrivateKey)?
+    .psk(3, &secure_psk)
+    .map_err(|_| AuthSnowErrors::FailedToSetPsk)?;
 
     Ok(true)
 }
