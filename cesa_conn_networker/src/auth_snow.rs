@@ -10,7 +10,7 @@ use cesa_conn_crypto::{
     x25519_cesa::{self, calculate_shared_key, generate_new_key_pair},
 };
 use core::fmt;
-use hkdf::SimpleHkdf;
+use hkdf::{Hkdf, SimpleHkdf};
 use libcrux_ml_kem::mlkem1024::{self, MlKem1024KeyPair, MlKem1024PublicKey, avx2::encapsulate};
 use rand::{make_rng, rngs::StdRng};
 use snow::{Builder, params::NoiseParams};
@@ -84,7 +84,7 @@ pub async fn auth_incoming(
     incoming_connection: (&mut TcpStream, SocketAddr),
 ) -> Result<bool, AuthSnowErrors> {
     let (s1, outbound_msg) = Spake2::<Ed25519Group>::start_b(
-        &Password::new(keys.read().await.a_key.to_vec()),
+        &Password::new(keys.read().await.a_key.as_slice()),
         &Identity::new(b"client"),
         &Identity::new(b"server"),
     );
@@ -183,6 +183,12 @@ pub async fn auth_incoming(
         .write_all(ciphertext.as_slice())
         .await
         .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
+
+    let mut psk = Zeroizing::new(Vec::new());
+
+    psk.extend_from_slice(x25519_ss.as_slice());
+    psk.extend_from_slice(ml_key_ss_secure.as_slice());
+    psk.extend_from_slice(keys.read().await.d_key.as_slice());
 
     Ok(true)
 }
