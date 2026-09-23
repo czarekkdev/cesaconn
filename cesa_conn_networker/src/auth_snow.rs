@@ -1,7 +1,13 @@
 /*
 TODO:
 tag packets
+wrap read_messages in timeout
  */
+
+const SNOW_MSG1_LEN: usize = 32;
+const SNOW_MSG2_LEN: usize = 80;
+const SNOW_MSG3_LEN: usize = 48;
+const SNOW_MSG_MAX_LEN: usize = 65535;
 
 use crate::auth::Keys;
 use blake2::{Blake2s256, Blake2sMac256};
@@ -11,13 +17,13 @@ use cesa_conn_crypto::{
 };
 use core::fmt;
 use hkdf::{Hkdf, SimpleHkdf};
-use libcrux_ml_kem::mlkem1024::{self, MlKem1024KeyPair, MlKem1024PublicKey};
 #[cfg(target_arch = "x86_64")]
-use libcrux_ml_kem::mlkem1024::avx2::{encapsulate, decapsulate};
+use libcrux_ml_kem::mlkem1024::avx2::{decapsulate, encapsulate};
 #[cfg(target_arch = "aarch64")]
-use libcrux_ml_kem::mlkem1024::neon::{encapsulate, decapsulate};
+use libcrux_ml_kem::mlkem1024::neon::{decapsulate, encapsulate};
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-use libcrux_ml_kem::mlkem1024::portable::{encapsulate, decapsulate};
+use libcrux_ml_kem::mlkem1024::portable::{decapsulate, encapsulate};
+use libcrux_ml_kem::mlkem1024::{self, MlKem1024KeyPair, MlKem1024PublicKey};
 use rand::{make_rng, rngs::StdRng};
 use snow::{Builder, params::NoiseParams};
 use spake2::{Ed25519Group, Identity, Password, Spake2};
@@ -57,6 +63,9 @@ pub enum AuthSnowErrors {
     FailedToSetLocalPrivateKey,
     FailedToSetPsk,
     FailedToBuildSnowResponder,
+    FailedToReadSnowMessage,
+    FailedToWriteSnowMessage,
+    FailedToEnterTansportMode,
 }
 
 impl fmt::Display for AuthSnowErrors {
@@ -95,6 +104,15 @@ impl fmt::Display for AuthSnowErrors {
             }
             AuthSnowErrors::FailedToBuildSnowResponder => {
                 write!(f, "failed to build snow responder")
+            }
+            AuthSnowErrors::FailedToReadSnowMessage => {
+                write!(f, "failed to read snow message")
+            }
+            AuthSnowErrors::FailedToWriteSnowMessage => {
+                write!(f, "failed to write snow message")
+            }
+            AuthSnowErrors::FailedToEnterTansportMode => {
+                write!(f, "failed to enter transport mode")
             }
         }
     }
@@ -223,7 +241,7 @@ pub async fn auth_incoming(
 
     let d_key = keys.read().await.d_key.clone();
 
-    let builder = Builder::new(
+    let mut builder = Builder::new(
         "Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s"
             .parse()
             .map_err(|_| AuthSnowErrors::FailedToParseText)?,
@@ -234,6 +252,43 @@ pub async fn auth_incoming(
     .map_err(|_| AuthSnowErrors::FailedToSetPsk)?
     .build_responder()
     .map_err(|_| AuthSnowErrors::FailedToBuildSnowResponder)?;
+
+    let mut buffer = Zeroizing::new([0u8; SNOW_MSG2_LEN]);
+    let mut read_buffer = Zeroizing::new([0u8; SNOW_MSG_MAX_LEN]);
+
+    incoming_connection
+        .0
+        .read_exact(&mut read_buffer[..SNOW_MSG1_LEN])
+        .await
+        .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
+
+    builder
+        .read_message(&read_buffer[..SNOW_MSG1_LEN], buffer.as_mut_slice())
+        .map_err(|_| AuthSnowErrors::FailedToReadSnowMessage)?;
+
+    builder
+        .write_message(&[], &mut buffer[..SNOW_MSG2_LEN])
+        .map_err(|_| AuthSnowErrors::FailedToWriteSnowMessage)?;
+
+    incoming_connection
+        .0
+        .write_all(&buffer[..SNOW_MSG2_LEN])
+        .await
+        .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
+
+    incoming_connection
+        .0
+        .read_exact(&mut read_buffer[..SNOW_MSG3_LEN])
+        .await
+        .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
+
+    builder
+        .read_message(&read_buffer[..SNOW_MSG3_LEN], buffer.as_mut_slice())
+        .map_err(|_| AuthSnowErrors::FailedToReadSnowMessage)?;
+
+    let mut transport = builder
+        .into_transport_mode()
+        .map_err(|_| AuthSnowErrors::FailedToEnterTansportMode)?;
 
     Ok(true)
 }
