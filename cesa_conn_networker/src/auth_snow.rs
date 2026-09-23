@@ -56,6 +56,7 @@ pub enum AuthSnowErrors {
     FailedToParseText,
     FailedToSetLocalPrivateKey,
     FailedToSetPsk,
+    FailedToBuildSnowResponder,
 }
 
 impl fmt::Display for AuthSnowErrors {
@@ -91,6 +92,9 @@ impl fmt::Display for AuthSnowErrors {
             }
             AuthSnowErrors::FailedToSetPsk => {
                 write!(f, "failed to set psk")
+            }
+            AuthSnowErrors::FailedToBuildSnowResponder => {
+                write!(f, "failed to build snow responder")
             }
         }
     }
@@ -227,7 +231,9 @@ pub async fn auth_incoming(
     .local_private_key(d_key.as_slice())
     .map_err(|_| AuthSnowErrors::FailedToSetLocalPrivateKey)?
     .psk(3, &secure_psk)
-    .map_err(|_| AuthSnowErrors::FailedToSetPsk)?;
+    .map_err(|_| AuthSnowErrors::FailedToSetPsk)?
+    .build_responder()
+    .map_err(|_| AuthSnowErrors::FailedToBuildSnowResponder)?;
 
     Ok(true)
 }
