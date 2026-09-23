@@ -11,7 +11,13 @@ use cesa_conn_crypto::{
 };
 use core::fmt;
 use hkdf::{Hkdf, SimpleHkdf};
-use libcrux_ml_kem::mlkem1024::{self, MlKem1024KeyPair, MlKem1024PublicKey, avx2::encapsulate};
+use libcrux_ml_kem::mlkem1024::{self, MlKem1024KeyPair, MlKem1024PublicKey};
+#[cfg(target_arch = "x86_64")]
+use libcrux_ml_kem::mlkem1024::avx2::{encapsulate, decapsulate};
+#[cfg(target_arch = "aarch64")]
+use libcrux_ml_kem::mlkem1024::neon::{encapsulate, decapsulate};
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+use libcrux_ml_kem::mlkem1024::portable::{encapsulate, decapsulate};
 use rand::{make_rng, rngs::StdRng};
 use snow::{Builder, params::NoiseParams};
 use spake2::{Ed25519Group, Identity, Password, Spake2};
