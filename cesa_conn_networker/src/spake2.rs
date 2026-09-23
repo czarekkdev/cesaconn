@@ -1,0 +1,72 @@
+use zeroize::Zeroizing;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
+use crate::auth_snow::AuthSnowErrors;
+use hkdf::SimpleHkdf;
+use spake2::{Ed25519Group, Identity, Password, Spake2};
+use blake2::Blake2s256;
+use subtle::ConstantTimeEq;
+
+pub async fn spake2_exchange_server(
+    stream: &mut TcpStream,
+    a_key: &Zeroizing<[u8; 32]>,
+) -> Result<Zeroizing<Vec<u8>>, AuthSnowErrors> {
+    let (s1, outbound_msg) = Spake2::<Ed25519Group>::start_b(
+        &Password::new(a_key),
+        &Identity::new(b"client"),
+        &Identity::new(b"server"),
+    );
+
+    let mut inbound_msg = Zeroizing::new(vec![0u8; outbound_msg.len()]);
+
+    stream
+        .write_all(&outbound_msg)
+        .await
+        .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
+
+    stream
+        .read_exact(&mut inbound_msg)
+        .await
+        .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
+
+    Ok(Zeroizing::new(s1.finish(&inbound_msg).map_err(|_| {
+        AuthSnowErrors::FailedToFinishSpake2Exchange
+    })?))
+}
+
+pub async fn spake2_confirm_mutual_auth_server(
+    stream: &mut TcpStream,
+    key1: &Zeroizing<Vec<u8>>,
+) -> Result<bool, AuthSnowErrors> {
+    let hk = SimpleHkdf::<Blake2s256>::new(None, key1);
+
+    let mut confirm_expect = Zeroizing::new(vec![0u8; 32]);
+
+    hk.expand(b"CPQHA-confirm-client-to-server", &mut confirm_expect)
+        .map_err(|_| AuthSnowErrors::FaledToExpandHkdf)?;
+
+    let mut confirm_recieved = Zeroizing::new(vec![0u8; 32]);
+
+    stream
+        .read_exact(&mut confirm_recieved)
+        .await
+        .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
+
+    if confirm_expect.ct_eq(&confirm_recieved).unwrap_u8() != 1 {
+        return Ok(false);
+    }
+
+    let mut confirm_send = Zeroizing::new(vec![0u8; 32]);
+
+    hk.expand(b"CPQHA-confirm-server-to-client", &mut confirm_send)
+        .map_err(|_| AuthSnowErrors::FaledToExpandHkdf)?;
+
+    stream
+        .write_all(&confirm_send)
+        .await
+        .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
+
+    Ok(true)
+}

@@ -9,14 +9,14 @@ const SNOW_MSG2_LEN: usize = 80;
 const SNOW_MSG3_LEN: usize = 48;
 const SNOW_MSG_MAX_LEN: usize = 65535;
 
-use crate::auth::Keys;
-use blake2::{Blake2s256, Blake2sMac256};
+use crate::{auth::Keys, spake2::{spake2_confirm_mutual_auth_server, spake2_exchange_server}};
+use blake2::Blake2s256;
 use cesa_conn_crypto::{
     crand::random_array,
-    x25519_cesa::{self, calculate_shared_key, generate_new_key_pair},
+    x25519_cesa::{self, calculate_shared_key},
 };
 use core::fmt;
-use hkdf::{Hkdf, SimpleHkdf};
+use hkdf::SimpleHkdf;
 #[cfg(target_arch = "x86_64")]
 use libcrux_ml_kem::mlkem1024::avx2::{decapsulate, encapsulate};
 #[cfg(target_arch = "aarch64")]
@@ -24,14 +24,11 @@ use libcrux_ml_kem::mlkem1024::neon::{decapsulate, encapsulate};
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 use libcrux_ml_kem::mlkem1024::portable::{decapsulate, encapsulate};
 use libcrux_ml_kem::mlkem1024::{self, MlKem1024KeyPair, MlKem1024PublicKey};
-use rand::{make_rng, rngs::StdRng};
 use snow::{Builder, params::NoiseParams};
-use spake2::{Ed25519Group, Identity, Password, Spake2};
 use std::{
     net::SocketAddr,
     sync::{Arc, LazyLock},
 };
-use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -66,6 +63,8 @@ pub enum AuthSnowErrors {
     FailedToReadSnowMessage,
     FailedToWriteSnowMessage,
     FailedToEnterTansportMode,
+    FailedToExchangeSpake2,
+    FailedToConfirmMutualAuthSpake2,
 }
 
 impl fmt::Display for AuthSnowErrors {
@@ -114,6 +113,12 @@ impl fmt::Display for AuthSnowErrors {
             AuthSnowErrors::FailedToEnterTansportMode => {
                 write!(f, "failed to enter transport mode")
             }
+            AuthSnowErrors::FailedToExchangeSpake2 => {
+                write!(f, "failed to make exchange for spake2")
+            }
+            AuthSnowErrors::FailedToConfirmMutualAuthSpake2 => {
+                write!(f, "failed to confirm mutual auth in spake2")
+            }
         }
     }
 }
@@ -125,60 +130,17 @@ pub async fn auth_incoming(
 ) -> Result<bool, AuthSnowErrors> {
     let a_key = keys.read().await.a_key.clone();
 
-    let (s1, outbound_msg) = Spake2::<Ed25519Group>::start_b(
-        &Password::new(a_key),
-        &Identity::new(b"client"),
-        &Identity::new(b"server"),
-    );
-
-    let mut inbound_msg = Zeroizing::new(vec![0u8; outbound_msg.len()]);
-
-    incoming_connection
-        .0
-        .write_all(&outbound_msg)
+    let key1 = spake2_exchange_server(incoming_connection.0, &a_key)
         .await
-        .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
+        .map_err(|_| AuthSnowErrors::FailedToExchangeSpake2)?;
 
-    incoming_connection
-        .0
-        .read_exact(&mut inbound_msg)
+    if (spake2_confirm_mutual_auth_server(incoming_connection.0, &key1)
         .await
-        .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
-
-    let key1 = Zeroizing::new(
-        s1.finish(&inbound_msg)
-            .map_err(|_| AuthSnowErrors::FailedToFinishSpake2Exchange)?,
-    );
-
-    let hk = SimpleHkdf::<Blake2s256>::new(None, &key1);
-
-    let mut confirm_expect = Zeroizing::new(vec![0u8; 32]);
-
-    hk.expand(b"CPQHA-confirm-client-to-server", &mut confirm_expect)
-        .map_err(|_| AuthSnowErrors::FaledToExpandHkdf)?;
-
-    let mut confirm_recieved = Zeroizing::new(vec![0u8; 32]);
-
-    incoming_connection
-        .0
-        .read_exact(&mut confirm_recieved)
-        .await
-        .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
-
-    if confirm_expect.ct_eq(&confirm_recieved).unwrap_u8() != 1 {
+        .map_err(|_| AuthSnowErrors::FailedToConfirmMutualAuthSpake2)?)
+        != true
+    {
         return Ok(false);
     }
-
-    let mut confirm_send = Zeroizing::new(vec![0u8; 32]);
-
-    hk.expand(b"CPQHA-confirm-server-to-client", &mut confirm_send)
-        .map_err(|_| AuthSnowErrors::FaledToExpandHkdf)?;
-
-    incoming_connection
-        .0
-        .write_all(&confirm_send)
-        .await
-        .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
 
     let x25519_pair = x25519_cesa::generate_new_key_pair(
         *random_array::<32>().map_err(|_| AuthSnowErrors::FailedToGenerateRandomData)?,
