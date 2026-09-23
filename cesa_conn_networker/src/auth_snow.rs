@@ -203,11 +203,17 @@ pub async fn auth_incoming(
 
     let x25519_ss = Zeroizing::new(calculate_shared_key(
         &x25519_pair.private,
-        &x25519_recv.as_array().unwrap(),
+        x25519_recv
+            .as_array()
+            .ok_or(AuthSnowErrors::FailedToConvertToArray)?,
     ));
 
     let (ciphertext, mut ml_key_ss) = encapsulate(
-        &MlKem1024PublicKey::from(ml_key_recv.as_array().unwrap()),
+        &MlKem1024PublicKey::from(
+            ml_key_recv
+                .as_array()
+                .ok_or(AuthSnowErrors::FailedToConvertToArray)?,
+        ),
         *random_array::<32>().map_err(|_| AuthSnowErrors::FailedToGenerateRandomData)?,
     );
 
