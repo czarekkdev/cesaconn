@@ -25,6 +25,7 @@ mod tcp_networker;
 mod udp_networker;
 mod auth_snow;
 mod spake2;
+mod hybrid_kex;
 use std::{env, net::SocketAddr, sync::Arc};
 use tracing::{error, warn};
 use tracing_subscriber::EnvFilter;

@@ -9,7 +9,11 @@ const SNOW_MSG2_LEN: usize = 80;
 const SNOW_MSG3_LEN: usize = 48;
 const SNOW_MSG_MAX_LEN: usize = 65535;
 
-use crate::{auth::Keys, spake2::{spake2_confirm_mutual_auth_server, spake2_exchange_server}};
+use crate::{
+    auth::Keys,
+    hybrid_kex::{HybridKep, SsKey, hybrid_kex_server},
+    spake2::{spake2_confirm_mutual_auth_server, spake2_exchange_server},
+};
 use blake2::Blake2s256;
 use cesa_conn_crypto::{
     crand::random_array,
@@ -65,6 +69,8 @@ pub enum AuthSnowErrors {
     FailedToEnterTansportMode,
     FailedToExchangeSpake2,
     FailedToConfirmMutualAuthSpake2,
+    FailedToConfirmKex,
+    KexFailed,
 }
 
 impl fmt::Display for AuthSnowErrors {
@@ -119,6 +125,12 @@ impl fmt::Display for AuthSnowErrors {
             AuthSnowErrors::FailedToConfirmMutualAuthSpake2 => {
                 write!(f, "failed to confirm mutual auth in spake2")
             }
+            AuthSnowErrors::FailedToConfirmKex => {
+                write!(f, "failed to cofirm key exchange")
+            }
+            AuthSnowErrors::KexFailed => {
+                write!(f, "key exchange failed")
+            }
         }
     }
 }
@@ -142,62 +154,14 @@ pub async fn auth_incoming(
         return Ok(false);
     }
 
-    let x25519_pair = x25519_cesa::generate_new_key_pair(
-        *random_array::<32>().map_err(|_| AuthSnowErrors::FailedToGenerateRandomData)?,
-    );
-
-    let x25519_pub = Zeroizing::new(x25519_pair.public.to_vec());
-
-    let mut x25519_recv = Zeroizing::new(vec![0u8; 32]);
-    let mut ml_key_recv = Zeroizing::new(vec![0u8; 1568]);
-
-    incoming_connection
-        .0
-        .read_exact(&mut x25519_recv)
+    let hybrid_kep = hybrid_kex_server(incoming_connection.0)
         .await
-        .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
-
-    incoming_connection
-        .0
-        .read_exact(&mut ml_key_recv)
-        .await
-        .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
-
-    let x25519_ss = Zeroizing::new(calculate_shared_key(
-        &x25519_pair.private,
-        x25519_recv
-            .as_array()
-            .ok_or(AuthSnowErrors::FailedToConvertToArray)?,
-    ));
-
-    let (ciphertext, mut ml_key_ss) = encapsulate(
-        &MlKem1024PublicKey::from(
-            ml_key_recv
-                .as_array()
-                .ok_or(AuthSnowErrors::FailedToConvertToArray)?,
-        ),
-        *random_array::<32>().map_err(|_| AuthSnowErrors::FailedToGenerateRandomData)?,
-    );
-
-    let ml_key_ss_secure = Zeroizing::new(ml_key_ss);
-    ml_key_ss.zeroize();
-
-    incoming_connection
-        .0
-        .write_all(&x25519_pub)
-        .await
-        .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
-
-    incoming_connection
-        .0
-        .write_all(ciphertext.as_slice())
-        .await
-        .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
+        .map_err(|_| AuthSnowErrors::KexFailed)?;
 
     let mut psk = Zeroizing::new(Vec::new());
 
-    psk.extend_from_slice(x25519_ss.as_slice());
-    psk.extend_from_slice(ml_key_ss_secure.as_slice());
+    psk.extend_from_slice(hybrid_kep.x25519_ss.as_slice());
+    psk.extend_from_slice(hybrid_kep.mlkem_ss.as_slice());
 
     let psk_hk = SimpleHkdf::<Blake2s256>::new(None, &psk);
 
