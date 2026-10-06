@@ -146,10 +146,12 @@ impl SecureConnection {
 }
 
 async fn snow_handshake_server(
-    stream: &mut TcpStream,
+    stream: TcpStream,
     secure_psk: Zeroizing<[u8; 32]>,
     d_key: Zeroizing<[u8; 32]>,
 ) -> Result<SecureConnection, AuthSnowErrors> {
+    let mut stream = stream;
+
     let mut builder = Builder::new(
         "Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s"
             .parse()
@@ -205,15 +207,16 @@ async fn snow_handshake_server(
 pub async fn auth_incoming(
     keys: Arc<RwLock<Keys>>,
     tusted_addrs: Arc<RwLock<Vec<SocketAddr>>>,
-    incoming_connection: (&mut TcpStream, SocketAddr),
+    incoming_connection: (TcpStream, SocketAddr),
 ) -> Result<Option<SecureConnection>, AuthSnowErrors> {
+    let mut stream = incoming_connection.0;
     let a_key = keys.read().await.a_key.clone();
 
-    let key1 = spake2_exchange_server(incoming_connection.0, &a_key)
+    let key1 = spake2_exchange_server(&mut stream, &a_key)
         .await
         .map_err(|_| AuthSnowErrors::FailedToExchangeSpake2)?;
 
-    if (spake2_confirm_mutual_auth_server(incoming_connection.0, &key1)
+    if (spake2_confirm_mutual_auth_server(&mut stream, &key1)
         .await
         .map_err(|_| AuthSnowErrors::FailedToConfirmMutualAuthSpake2)?)
         != true
@@ -221,7 +224,7 @@ pub async fn auth_incoming(
         return Ok(None);
     }
 
-    let hybrid_kep = hybrid_kex_server(incoming_connection.0)
+    let hybrid_kep = hybrid_kex_server(&mut stream)
         .await
         .map_err(|_| AuthSnowErrors::KexFailed)?;
 
@@ -240,7 +243,7 @@ pub async fn auth_incoming(
 
     Ok(Some(
         snow_handshake_server(
-            incoming_connection.0,
+            stream,
             secure_psk,
             keys.read().await.d_key.clone(),
         )
