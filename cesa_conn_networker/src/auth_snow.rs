@@ -16,8 +16,11 @@ use crate::{
 };
 use blake2::Blake2s256;
 use core::fmt;
-use hkdf::SimpleHkdf;
-use snow::{Builder, params::NoiseParams};
+use hkdf::{GenericHkdf, SimpleHkdf, hmac::SimpleHmac};
+use snow::{
+    Builder, TransportState,
+    params::{HandshakeChoice, NoiseParams},
+};
 use std::{
     net::SocketAddr,
     sync::{Arc, LazyLock},
@@ -60,6 +63,7 @@ pub enum AuthSnowErrors {
     FailedToConfirmMutualAuthSpake2,
     FailedToConfirmKex,
     KexFailed,
+    FailedToCompleteSnowHandshake,
 }
 
 impl fmt::Display for AuthSnowErrors {
@@ -120,15 +124,89 @@ impl fmt::Display for AuthSnowErrors {
             AuthSnowErrors::KexFailed => {
                 write!(f, "key exchange failed")
             }
+            AuthSnowErrors::FailedToCompleteSnowHandshake => {
+                write!(f, "failed to complete snow handshake")
+            }
         }
     }
+}
+
+pub struct SecureConnection {
+    pub stream: TcpStream,
+    pub ts: TransportState,
+}
+
+impl SecureConnection {
+    pub fn new(stream: TcpStream, ts: TransportState) -> Self {
+        Self {
+            stream: stream,
+            ts: ts,
+        }
+    }
+}
+
+async fn snow_handshake_server(
+    stream: &mut TcpStream,
+    secure_psk: Zeroizing<[u8; 32]>,
+    d_key: Zeroizing<[u8; 32]>,
+) -> Result<SecureConnection, AuthSnowErrors> {
+    let mut builder = Builder::new(
+        "Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s"
+            .parse()
+            .map_err(|_| AuthSnowErrors::FailedToParseText)?,
+    )
+    .local_private_key(d_key.as_slice())
+    .map_err(|_| AuthSnowErrors::FailedToSetLocalPrivateKey)?
+    .psk(3, &secure_psk)
+    .map_err(|_| AuthSnowErrors::FailedToSetPsk)?
+    .build_responder()
+    .map_err(|_| AuthSnowErrors::FailedToBuildSnowResponder)?;
+
+    let mut buffer = Zeroizing::new([0u8; SNOW_MSG2_LEN]);
+    let mut read_buffer = Zeroizing::new([0u8; SNOW_MSG_MAX_LEN]);
+
+    stream
+        .read_exact(&mut read_buffer[..SNOW_MSG1_LEN])
+        .await
+        .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
+
+    builder
+        .read_message(&read_buffer[..SNOW_MSG1_LEN], buffer.as_mut_slice())
+        .map_err(|_| AuthSnowErrors::FailedToReadSnowMessage)?;
+
+    builder
+        .write_message(&[], &mut buffer[..SNOW_MSG2_LEN])
+        .map_err(|_| AuthSnowErrors::FailedToWriteSnowMessage)?;
+
+    stream
+        .write_all(&buffer[..SNOW_MSG2_LEN])
+        .await
+        .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
+
+    stream
+        .read_exact(&mut read_buffer[..SNOW_MSG3_LEN])
+        .await
+        .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
+
+    builder
+        .read_message(&read_buffer[..SNOW_MSG3_LEN], buffer.as_mut_slice())
+        .map_err(|_| AuthSnowErrors::FailedToReadSnowMessage)?;
+
+    let mut transport = builder
+        .into_transport_mode()
+        .map_err(|_| AuthSnowErrors::FailedToEnterTansportMode)?;
+
+    Ok(SecureConnection {
+        stream: stream,
+        ts: transport,
+    })
 }
 
 pub async fn auth_incoming(
     keys: Arc<RwLock<Keys>>,
     tusted_addrs: Arc<RwLock<Vec<SocketAddr>>>,
     incoming_connection: (&mut TcpStream, SocketAddr),
-) -> Result<bool, AuthSnowErrors> {
+) -> Result<Option<SecureConnection>, AuthSnowErrors> {
     let a_key = keys.read().await.a_key.clone();
 
     let key1 = spake2_exchange_server(incoming_connection.0, &a_key)
@@ -140,7 +218,7 @@ pub async fn auth_incoming(
         .map_err(|_| AuthSnowErrors::FailedToConfirmMutualAuthSpake2)?)
         != true
     {
-        return Ok(false);
+        return Ok(None);
     }
 
     let hybrid_kep = hybrid_kex_server(incoming_connection.0)
@@ -160,56 +238,13 @@ pub async fn auth_incoming(
         .expand(b"CPQHA-psk", secure_psk.as_mut_slice())
         .map_err(|_| AuthSnowErrors::FaledToExpandHkdf)?;
 
-    let d_key = keys.read().await.d_key.clone();
-
-    let mut builder = Builder::new(
-        "Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s"
-            .parse()
-            .map_err(|_| AuthSnowErrors::FailedToParseText)?,
-    )
-    .local_private_key(d_key.as_slice())
-    .map_err(|_| AuthSnowErrors::FailedToSetLocalPrivateKey)?
-    .psk(3, &secure_psk)
-    .map_err(|_| AuthSnowErrors::FailedToSetPsk)?
-    .build_responder()
-    .map_err(|_| AuthSnowErrors::FailedToBuildSnowResponder)?;
-
-    let mut buffer = Zeroizing::new([0u8; SNOW_MSG2_LEN]);
-    let mut read_buffer = Zeroizing::new([0u8; SNOW_MSG_MAX_LEN]);
-
-    incoming_connection
-        .0
-        .read_exact(&mut read_buffer[..SNOW_MSG1_LEN])
+    Ok(Some(
+        snow_handshake_server(
+            incoming_connection.0,
+            secure_psk,
+            keys.read().await.d_key.clone(),
+        )
         .await
-        .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
-
-    builder
-        .read_message(&read_buffer[..SNOW_MSG1_LEN], buffer.as_mut_slice())
-        .map_err(|_| AuthSnowErrors::FailedToReadSnowMessage)?;
-
-    builder
-        .write_message(&[], &mut buffer[..SNOW_MSG2_LEN])
-        .map_err(|_| AuthSnowErrors::FailedToWriteSnowMessage)?;
-
-    incoming_connection
-        .0
-        .write_all(&buffer[..SNOW_MSG2_LEN])
-        .await
-        .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
-
-    incoming_connection
-        .0
-        .read_exact(&mut read_buffer[..SNOW_MSG3_LEN])
-        .await
-        .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
-
-    builder
-        .read_message(&read_buffer[..SNOW_MSG3_LEN], buffer.as_mut_slice())
-        .map_err(|_| AuthSnowErrors::FailedToReadSnowMessage)?;
-
-    let mut transport = builder
-        .into_transport_mode()
-        .map_err(|_| AuthSnowErrors::FailedToEnterTansportMode)?;
-
-    Ok(true)
+        .map_err(|_| AuthSnowErrors::FailedToCompleteSnowHandshake)?,
+    ))
 }
