@@ -22,8 +22,6 @@
 //     /// Failed to encrypt the authentication key.
 //     FailedToEncrypt,
 // }
-
-use libcrux_ml_kem::mlkem1024::{self, MlKem1024KeyPair};
 // impl fmt::Display for AuthErrors {
 //     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 //         match self {

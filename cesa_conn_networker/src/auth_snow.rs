@@ -2,6 +2,9 @@
 TODO:
 tag packets
 wrap read_messages in timeout
+add visual comparison if peer is not saved in trusted_addrs
+add tests
+add comments
  */
 
 const SNOW_MSG1_LEN: usize = 32;
@@ -17,14 +20,10 @@ use crate::{
 };
 use blake2::Blake2s256;
 use core::fmt;
-use hkdf::{GenericHkdf, SimpleHkdf, hmac::SimpleHmac};
-use snow::{
-    Builder, TransportState,
-    params::{HandshakeChoice, NoiseParams},
-};
+use hkdf::SimpleHkdf;
+use snow::{Builder, TransportState, params::NoiseParams};
 use std::{
     net::SocketAddr,
-    ops::RemAssign,
     sync::{Arc, LazyLock},
 };
 use tokio::{
@@ -66,6 +65,7 @@ pub enum AuthSnowErrors {
     FailedToConfirmKex,
     KexFailed,
     FailedToCompleteSnowHandshake,
+    WrongTag,
 }
 
 impl fmt::Display for AuthSnowErrors {
@@ -129,6 +129,9 @@ impl fmt::Display for AuthSnowErrors {
             AuthSnowErrors::FailedToCompleteSnowHandshake => {
                 write!(f, "failed to complete snow handshake")
             }
+            AuthSnowErrors::WrongTag => {
+                write!(f, "packet has a wrong tag")
+            }
         }
     }
 }
@@ -169,9 +172,37 @@ impl SecureConnection {
             .await
             .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
 
-        Ok(self.ts
+        Ok(self
+            .ts
             .read_message(&message, buffer)
             .map_err(|_| AuthSnowErrors::FailedToReadSnowMessage)?)
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy)]
+pub enum Tags {
+    X25519Pub = 0x01,
+    ConfirmByte = 0x02,
+    MlKeyPub = 0x03,
+}
+
+impl Tags {
+    pub fn tag(self, packet: &mut Vec<u8>) {
+        packet.push(self as u8);
+    }
+
+    pub fn check_tag(self, packet: &Vec<u8>) -> bool {
+        packet.ends_with(&[self as u8])
+    }
+
+    pub fn untag(self, packet: &mut Vec<u8>) -> bool {
+        if packet.last().eq(&Some(&(self as u8))) {
+            packet.pop();
+            true
+        } else {
+            false
+        }
     }
 }
 

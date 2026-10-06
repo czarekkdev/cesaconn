@@ -1,23 +1,57 @@
-use zeroize::Zeroizing;
+/*
+TODO:
+
+add tests
+add comments
+*/
+
+use crate::{auth_snow::AuthSnowErrors, spake2::Tags::OutboundMsg};
+use blake2::Blake2s256;
+use hkdf::SimpleHkdf;
+use spake2::{Ed25519Group, Identity, Password, Spake2};
+use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
 };
-use crate::auth_snow::AuthSnowErrors;
-use hkdf::SimpleHkdf;
-use spake2::{Ed25519Group, Identity, Password, Spake2};
-use blake2::Blake2s256;
-use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
+
+#[repr(u8)]
+#[derive(Clone, Copy)]
+pub enum Tags {
+    OutboundMsg = 0x01,
+}
+
+impl Tags {
+    pub fn tag(self, packet: &mut Vec<u8>) {
+        packet.push(self as u8);
+    }
+
+    pub fn check_tag(self, packet: &Vec<u8>) -> bool {
+        packet.ends_with(&[self as u8])
+    }
+
+    pub fn untag(self, packet: &mut Vec<u8>) -> bool {
+        if packet.ends_with(&[self as u8]) {
+            packet.pop();
+            true
+        } else {
+            false
+        }
+    }
+}
 
 pub async fn spake2_exchange_server(
     stream: &mut TcpStream,
     a_key: &Zeroizing<[u8; 32]>,
 ) -> Result<Zeroizing<Vec<u8>>, AuthSnowErrors> {
-    let (s1, outbound_msg) = Spake2::<Ed25519Group>::start_b(
+    let (s1, mut outbound_msg) = Spake2::<Ed25519Group>::start_b(
         &Password::new(a_key),
         &Identity::new(b"client"),
         &Identity::new(b"server"),
     );
+
+    OutboundMsg.tag(&mut outbound_msg);
 
     let mut inbound_msg = Zeroizing::new(vec![0u8; outbound_msg.len()]);
 
@@ -30,6 +64,10 @@ pub async fn spake2_exchange_server(
         .read_exact(&mut inbound_msg)
         .await
         .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
+
+    if !OutboundMsg.untag(&mut inbound_msg) {
+        return Err(AuthSnowErrors::WrongTag);
+    }
 
     Ok(Zeroizing::new(s1.finish(&inbound_msg).map_err(|_| {
         AuthSnowErrors::FailedToFinishSpake2Exchange
