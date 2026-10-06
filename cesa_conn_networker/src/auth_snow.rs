@@ -11,23 +11,12 @@ const SNOW_MSG_MAX_LEN: usize = 65535;
 
 use crate::{
     auth::Keys,
-    hybrid_kex::{HybridKep, SsKey, hybrid_kex_server},
+    hybrid_kex::hybrid_kex_server,
     spake2::{spake2_confirm_mutual_auth_server, spake2_exchange_server},
 };
 use blake2::Blake2s256;
-use cesa_conn_crypto::{
-    crand::random_array,
-    x25519_cesa::{self, calculate_shared_key},
-};
 use core::fmt;
 use hkdf::SimpleHkdf;
-#[cfg(target_arch = "x86_64")]
-use libcrux_ml_kem::mlkem1024::avx2::{decapsulate, encapsulate};
-#[cfg(target_arch = "aarch64")]
-use libcrux_ml_kem::mlkem1024::neon::{decapsulate, encapsulate};
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-use libcrux_ml_kem::mlkem1024::portable::{decapsulate, encapsulate};
-use libcrux_ml_kem::mlkem1024::{self, MlKem1024KeyPair, MlKem1024PublicKey};
 use snow::{Builder, params::NoiseParams};
 use std::{
     net::SocketAddr,
@@ -38,7 +27,7 @@ use tokio::{
     net::TcpStream,
     sync::RwLock,
 };
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 static SNOW_CONNECTION_PARAMS: LazyLock<NoiseParams> =
     LazyLock::new(|| "Noise_XXpsk2_25519_AESGCM_BLAKE2b".parse().unwrap());
