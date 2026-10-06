@@ -8,6 +8,7 @@ const SNOW_MSG1_LEN: usize = 32;
 const SNOW_MSG2_LEN: usize = 80;
 const SNOW_MSG3_LEN: usize = 48;
 const SNOW_MSG_MAX_LEN: usize = 65535;
+const SNOW_TAG_LEN: usize = 16;
 
 use crate::{
     auth::Keys,
@@ -23,6 +24,7 @@ use snow::{
 };
 use std::{
     net::SocketAddr,
+    ops::RemAssign,
     sync::{Arc, LazyLock},
 };
 use tokio::{
@@ -143,6 +145,34 @@ impl SecureConnection {
             ts: ts,
         }
     }
+
+    pub async fn write(mut self, src: &[u8]) -> Result<(), AuthSnowErrors> {
+        let mut buffer = Zeroizing::new(vec![0u8; src.len() + SNOW_TAG_LEN]);
+
+        self.ts
+            .write_message(src, &mut buffer)
+            .map_err(|_| AuthSnowErrors::FailedToWriteSnowMessage)?;
+
+        self.stream
+            .write_all(&buffer)
+            .await
+            .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
+
+        Ok(())
+    }
+
+    pub async fn read(mut self, buffer: &mut [u8]) -> Result<usize, AuthSnowErrors> {
+        let mut message = Zeroizing::new(vec![0u8; buffer.len() + SNOW_TAG_LEN]);
+
+        self.stream
+            .read_exact(&mut message)
+            .await
+            .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
+
+        Ok(self.ts
+            .read_message(&message, buffer)
+            .map_err(|_| AuthSnowErrors::FailedToReadSnowMessage)?)
+    }
 }
 
 async fn snow_handshake_server(
@@ -194,7 +224,7 @@ async fn snow_handshake_server(
         .read_message(&read_buffer[..SNOW_MSG3_LEN], buffer.as_mut_slice())
         .map_err(|_| AuthSnowErrors::FailedToReadSnowMessage)?;
 
-    let mut transport = builder
+    let transport = builder
         .into_transport_mode()
         .map_err(|_| AuthSnowErrors::FailedToEnterTansportMode)?;
 
@@ -242,12 +272,8 @@ pub async fn auth_incoming(
         .map_err(|_| AuthSnowErrors::FaledToExpandHkdf)?;
 
     Ok(Some(
-        snow_handshake_server(
-            stream,
-            secure_psk,
-            keys.read().await.d_key.clone(),
-        )
-        .await
-        .map_err(|_| AuthSnowErrors::FailedToCompleteSnowHandshake)?,
+        snow_handshake_server(stream, secure_psk, keys.read().await.d_key.clone())
+            .await
+            .map_err(|_| AuthSnowErrors::FailedToCompleteSnowHandshake)?,
     ))
 }
