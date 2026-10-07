@@ -5,7 +5,12 @@ add tests
 add comments
 */
 
-use crate::{auth_snow::AuthSnowErrors, spake2::Tags::OutboundMsg};
+use std::time::Duration;
+
+use crate::{
+    auth_snow::{AuthSnowErrors, TIMEOUT},
+    spake2::Tags::OutboundMsg,
+};
 use blake2::Blake2s256;
 use hkdf::SimpleHkdf;
 use spake2::{Ed25519Group, Identity, Password, Spake2};
@@ -13,7 +18,9 @@ use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
+    time::timeout,
 };
+use tracing_subscriber::fmt::time;
 use zeroize::Zeroizing;
 
 #[repr(u8)]
@@ -55,14 +62,18 @@ pub async fn spake2_exchange_server(
 
     let mut inbound_msg = Zeroizing::new(vec![0u8; outbound_msg.len()]);
 
-    stream
-        .write_all(&outbound_msg)
+    let write = stream.write_all(&outbound_msg);
+
+    timeout(Duration::from_secs(TIMEOUT), write)
         .await
+        .map_err(|_| AuthSnowErrors::WriteTimeout)?
         .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
 
-    stream
-        .read_exact(&mut inbound_msg)
+    let read = stream.read_exact(&mut inbound_msg);
+
+    timeout(Duration::from_secs(TIMEOUT), read)
         .await
+        .map_err(|_| AuthSnowErrors::ReadTimeout)?
         .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
 
     if !OutboundMsg.untag(&mut inbound_msg) {
@@ -87,9 +98,11 @@ pub async fn spake2_confirm_mutual_auth_server(
 
     let mut confirm_recieved = Zeroizing::new(vec![0u8; 32]);
 
-    stream
-        .read_exact(&mut confirm_recieved)
+    let read = stream.read_exact(&mut confirm_recieved);
+
+    timeout(Duration::from_secs(TIMEOUT), read)
         .await
+        .map_err(|_| AuthSnowErrors::ReadTimeout)?
         .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
 
     if confirm_expect.ct_eq(&confirm_recieved).unwrap_u8() != 1 {
@@ -101,9 +114,11 @@ pub async fn spake2_confirm_mutual_auth_server(
     hk.expand(b"CPQHA-confirm-server-to-client", &mut confirm_send)
         .map_err(|_| AuthSnowErrors::FaledToExpandHkdf)?;
 
-    stream
-        .write_all(&confirm_send)
+    let write = stream.write_all(&confirm_send);
+
+    timeout(Duration::from_secs(TIMEOUT), write)
         .await
+        .map_err(|_| AuthSnowErrors::WriteTimeout)?
         .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
 
     Ok(true)

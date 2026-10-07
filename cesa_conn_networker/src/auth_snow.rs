@@ -1,6 +1,5 @@
 /*
 TODO:
-tag packets
 wrap read_messages in timeout
 add visual comparison if peer is not saved in trusted_addrs
 add tests
@@ -12,6 +11,7 @@ const SNOW_MSG2_LEN: usize = 80;
 const SNOW_MSG3_LEN: usize = 48;
 const SNOW_MSG_MAX_LEN: usize = 65535;
 const SNOW_TAG_LEN: usize = 16;
+pub const TIMEOUT: u64 = 5;
 
 use crate::{
     auth::Keys,
@@ -66,6 +66,8 @@ pub enum AuthSnowErrors {
     KexFailed,
     FailedToCompleteSnowHandshake,
     WrongTag,
+    ReadTimeout,
+    WriteTimeout,
 }
 
 impl fmt::Display for AuthSnowErrors {
@@ -132,6 +134,12 @@ impl fmt::Display for AuthSnowErrors {
             AuthSnowErrors::WrongTag => {
                 write!(f, "packet has a wrong tag")
             }
+            AuthSnowErrors::ReadTimeout => {
+                write!(f, "reading from stream timed out")
+            }
+            AuthSnowErrors::WriteTimeout => {
+                write!(f, "writing to stream timed out")
+            }
         }
     }
 }
@@ -176,33 +184,6 @@ impl SecureConnection {
             .ts
             .read_message(&message, buffer)
             .map_err(|_| AuthSnowErrors::FailedToReadSnowMessage)?)
-    }
-}
-
-#[repr(u8)]
-#[derive(Clone, Copy)]
-pub enum Tags {
-    X25519Pub = 0x01,
-    ConfirmByte = 0x02,
-    MlKeyPub = 0x03,
-}
-
-impl Tags {
-    pub fn tag(self, packet: &mut Vec<u8>) {
-        packet.push(self as u8);
-    }
-
-    pub fn check_tag(self, packet: &Vec<u8>) -> bool {
-        packet.ends_with(&[self as u8])
-    }
-
-    pub fn untag(self, packet: &mut Vec<u8>) -> bool {
-        if packet.last().eq(&Some(&(self as u8))) {
-            packet.pop();
-            true
-        } else {
-            false
-        }
     }
 }
 

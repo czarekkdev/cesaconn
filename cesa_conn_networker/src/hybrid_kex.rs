@@ -3,6 +3,7 @@ TODO:
 
 add tests
 add comments
+wrap read_messages in timeout
 */
 
 use crate::{
