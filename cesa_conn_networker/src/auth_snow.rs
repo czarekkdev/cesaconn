@@ -1,15 +1,14 @@
 /*
 TODO:
-move specific errors into specific files
 add visual comparison if peer is not saved in trusted_addrs
 add tests
 add comments
 add client-side
  */
 
-const SNOW_MSG1_LEN: usize = 32;
-const SNOW_MSG2_LEN: usize = 80;
-const SNOW_MSG3_LEN: usize = 48;
+const SNOW_MSG1_LEN: usize = 32; //e
+const SNOW_MSG2_LEN: usize = 96; //e, ee, s, es
+const SNOW_MSG3_LEN: usize = 64; //s, se
 const SNOW_MSG_MAX_LEN: usize = 65535;
 const SNOW_TAG_LEN: usize = 16;
 pub const TIMEOUT: u64 = 5;
