@@ -3,11 +3,15 @@ TODO:
 
 add tests
 add comments
-wrap read_messages in timeout
 */
 
+use std::{io::ErrorKind::TimedOut, time::Duration};
+
 use crate::{
-    auth_snow::AuthSnowErrors::{self, WrongTag},
+    auth_snow::{
+        AuthSnowErrors::{self, WrongTag},
+        TIMEOUT,
+    },
     hybrid_kex::Tags::{ConfirmByte, MlKeyPub, X25519Pub},
 };
 use cesa_conn_crypto::{
@@ -24,6 +28,7 @@ use libcrux_ml_kem::mlkem1024::portable::{decapsulate, encapsulate};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
+    time::timeout,
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -72,9 +77,11 @@ async fn x25519_kex_server(stream: &mut TcpStream) -> Result<SsKey, AuthSnowErro
 
     let mut x25519_recv = Zeroizing::new(vec![0u8; 32 + 1]); // + tag
 
-    stream
-        .read_exact(&mut x25519_recv)
+    let read = stream.read_exact(&mut x25519_recv);
+
+    timeout(Duration::from_secs(TIMEOUT), read)
         .await
+        .map_err(|_| AuthSnowErrors::ReadTimeout)?
         .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
 
     if !X25519Pub.untag(&mut x25519_recv) {
@@ -88,16 +95,20 @@ async fn x25519_kex_server(stream: &mut TcpStream) -> Result<SsKey, AuthSnowErro
             .ok_or(AuthSnowErrors::FailedToConvertToArray)?,
     ));
 
-    stream
-        .write_all(&x25519_pub)
+    let write = stream.write_all(&x25519_pub);
+
+    timeout(Duration::from_secs(TIMEOUT), write)
         .await
+        .map_err(|_| AuthSnowErrors::WriteTimeout)?
         .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
 
     let mut confirm_buffer = vec![0x00];
 
-    stream
-        .read_exact(&mut confirm_buffer)
+    let read = stream.read_exact(&mut confirm_buffer);
+
+    timeout(Duration::from_secs(TIMEOUT), read)
         .await
+        .map_err(|_| AuthSnowErrors::ReadTimeout)?
         .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
 
     if !ConfirmByte.untag(&mut confirm_buffer) {
@@ -114,9 +125,11 @@ async fn x25519_kex_server(stream: &mut TcpStream) -> Result<SsKey, AuthSnowErro
 async fn mlkem_kex_server(stream: &mut TcpStream) -> Result<SsKey, AuthSnowErrors> {
     let mut ml_key_recv = Zeroizing::new(vec![0u8; 1568 + 1]); // + tag
 
-    stream
-        .read_exact(&mut ml_key_recv)
+    let read = stream.read_exact(&mut ml_key_recv);
+
+    timeout(Duration::from_secs(TIMEOUT), read)
         .await
+        .map_err(|_| AuthSnowErrors::ReadTimeout)?
         .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
 
     if !MlKeyPub.untag(&mut ml_key_recv) {
@@ -139,16 +152,20 @@ async fn mlkem_kex_server(stream: &mut TcpStream) -> Result<SsKey, AuthSnowError
     let ml_key_ss_secure = Zeroizing::new(ml_key_ss);
     ml_key_ss.zeroize();
 
-    stream
-        .write_all(&ciphertext)
+    let write = stream.write_all(&ciphertext);
+
+    timeout(Duration::from_secs(TIMEOUT), write)
         .await
+        .map_err(|_| AuthSnowErrors::WriteTimeout)?
         .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
 
     let mut confirm_buffer = vec![0x00];
 
-    stream
-        .read_exact(&mut confirm_buffer)
+    let read = stream.read_exact(&mut confirm_buffer);
+
+    timeout(Duration::from_secs(TIMEOUT), read)
         .await
+        .map_err(|_| AuthSnowErrors::ReadTimeout)?
         .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
 
     if !ConfirmByte.untag(&mut confirm_buffer) {

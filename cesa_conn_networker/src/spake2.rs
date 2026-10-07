@@ -20,7 +20,6 @@ use tokio::{
     net::TcpStream,
     time::timeout,
 };
-use tracing_subscriber::fmt::time;
 use zeroize::Zeroizing;
 
 #[repr(u8)]
