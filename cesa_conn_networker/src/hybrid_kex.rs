@@ -5,7 +5,7 @@ add tests
 add comments
 */
 
-use std::{io::ErrorKind::TimedOut, time::Duration};
+use std::time::Duration;
 
 use crate::{
     auth_snow::{

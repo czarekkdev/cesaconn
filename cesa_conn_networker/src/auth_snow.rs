@@ -1,6 +1,6 @@
 /*
 TODO:
-wrap read_messages in timeout
+move specific errors into specific files
 add visual comparison if peer is not saved in trusted_addrs
 add tests
 add comments
@@ -25,11 +25,13 @@ use snow::{Builder, TransportState, params::NoiseParams};
 use std::{
     net::SocketAddr,
     sync::{Arc, LazyLock},
+    time::Duration,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     sync::RwLock,
+    time::timeout,
 };
 use zeroize::Zeroizing;
 
@@ -209,9 +211,11 @@ async fn snow_handshake_server(
     let mut buffer = Zeroizing::new([0u8; SNOW_MSG2_LEN]);
     let mut read_buffer = Zeroizing::new([0u8; SNOW_MSG_MAX_LEN]);
 
-    stream
-        .read_exact(&mut read_buffer[..SNOW_MSG1_LEN])
+    let read = stream.read_exact(&mut read_buffer[..SNOW_MSG1_LEN]);
+
+    timeout(Duration::from_secs(TIMEOUT), read)
         .await
+        .map_err(|_| AuthSnowErrors::ReadTimeout)?
         .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
 
     builder
@@ -222,14 +226,18 @@ async fn snow_handshake_server(
         .write_message(&[], &mut buffer[..SNOW_MSG2_LEN])
         .map_err(|_| AuthSnowErrors::FailedToWriteSnowMessage)?;
 
-    stream
-        .write_all(&buffer[..SNOW_MSG2_LEN])
+    let write = stream.write_all(&buffer[..SNOW_MSG2_LEN]);
+
+    timeout(Duration::from_secs(TIMEOUT), write)
         .await
+        .map_err(|_| AuthSnowErrors::WriteTimeout)?
         .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
 
-    stream
-        .read_exact(&mut read_buffer[..SNOW_MSG3_LEN])
+    let read = stream.read_exact(&mut read_buffer[..SNOW_MSG3_LEN]);
+
+    timeout(Duration::from_secs(TIMEOUT), read)
         .await
+        .map_err(|_| AuthSnowErrors::ReadTimeout)?
         .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
 
     builder
