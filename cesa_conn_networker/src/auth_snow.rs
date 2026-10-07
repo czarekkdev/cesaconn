@@ -163,7 +163,7 @@ impl Tags {
     }
 
     pub fn untag(self, packet: &mut Vec<u8>) -> bool {
-        if packet.last().eq(&Some(&(self as u8))) {
+        if packet.ends_with(&[self as u8]) {
             packet.pop();
             true
         } else {
