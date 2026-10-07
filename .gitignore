@@ -1,3 +1,4 @@
 target/
 websites/
 .claude/
+.DS_Store
