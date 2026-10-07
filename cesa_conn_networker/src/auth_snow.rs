@@ -297,11 +297,11 @@ pub async fn auth_incoming(
     let a_key = keys.read().await.a_key.clone();
     let mut transcript = Zeroizing::new(Vec::new());
 
-    let key1 = spake2_exchange_server(&mut stream, &a_key)
+    let key1 = spake2_exchange_server(&mut stream, &a_key, &mut transcript)
         .await
         .map_err(|_| AuthSnowErrors::FailedToExchangeSpake2)?;
 
-    if (spake2_confirm_mutual_auth_server(&mut stream, &key1)
+    if (spake2_confirm_mutual_auth_server(&mut stream, &key1, &mut transcript)
         .await
         .map_err(|_| AuthSnowErrors::FailedToConfirmMutualAuthSpake2)?)
         != true
@@ -313,10 +313,17 @@ pub async fn auth_incoming(
         .await
         .map_err(|_| AuthSnowErrors::KexFailed)?;
 
+    let mut transcript_hash = Zeroizing::new([0u8; 32]);
+
+    SimpleHkdf::<Blake2s256>::new(None, &transcript)
+        .expand(&[], transcript_hash.as_mut_slice())
+        .map_err(|_| AuthSnowErrors::FaledToExpandHkdf)?;
+
     let mut psk = Zeroizing::new(Vec::new());
 
     psk.extend_from_slice(hybrid_kep.x25519_ss.as_slice());
     psk.extend_from_slice(hybrid_kep.mlkem_ss.as_slice());
+    psk.extend_from_slice(transcript_hash.as_slice());
 
     let psk_hk = SimpleHkdf::<Blake2s256>::new(None, &psk);
 

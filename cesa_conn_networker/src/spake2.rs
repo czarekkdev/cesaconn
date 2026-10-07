@@ -51,6 +51,7 @@ impl Tags {
 pub async fn spake2_exchange_server(
     stream: &mut TcpStream,
     a_key: &Zeroizing<[u8; 32]>,
+    transcript: &mut Zeroizing<Vec<u8>>
 ) -> Result<Zeroizing<Vec<u8>>, AuthSnowErrors> {
     let (s1, mut outbound_msg) = Spake2::<Ed25519Group>::start_b(
         &Password::new(a_key),
@@ -76,6 +77,9 @@ pub async fn spake2_exchange_server(
         .map_err(|_| AuthSnowErrors::ReadTimeout)?
         .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
 
+    transcript.extend_from_slice(&inbound_msg);
+    transcript.extend_from_slice(&outbound_msg);
+
     if !OutboundMsg.untag(&mut inbound_msg) {
         return Err(AuthSnowErrors::WrongTag);
     }
@@ -88,6 +92,7 @@ pub async fn spake2_exchange_server(
 pub async fn spake2_confirm_mutual_auth_server(
     stream: &mut TcpStream,
     key1: &Zeroizing<Vec<u8>>,
+    transcript: &mut Zeroizing<Vec<u8>>
 ) -> Result<bool, AuthSnowErrors> {
     let hk = SimpleHkdf::<Blake2s256>::new(None, key1);
 
@@ -120,6 +125,9 @@ pub async fn spake2_confirm_mutual_auth_server(
         .await
         .map_err(|_| AuthSnowErrors::WriteTimeout)?
         .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
+
+    transcript.extend_from_slice(&confirm_recieved);
+    transcript.extend_from_slice(&confirm_send);
 
     Ok(true)
 }
