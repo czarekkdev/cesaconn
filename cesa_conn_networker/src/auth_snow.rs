@@ -4,6 +4,7 @@ move specific errors into specific files
 add visual comparison if peer is not saved in trusted_addrs
 add tests
 add comments
+add client-side
  */
 
 const SNOW_MSG1_LEN: usize = 32;
@@ -15,7 +16,6 @@ pub const TIMEOUT: u64 = 5;
 
 use crate::{
     auth::Keys,
-    auth_snow::Tags::Regular,
     hybrid_kex::hybrid_kex_server,
     spake2::{spake2_confirm_mutual_auth_server, spake2_exchange_server},
 };
