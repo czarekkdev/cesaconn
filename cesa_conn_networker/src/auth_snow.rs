@@ -15,6 +15,7 @@ pub const TIMEOUT: u64 = 5;
 
 use crate::{
     auth::Keys,
+    auth_snow::Tags::Regular,
     hybrid_kex::hybrid_kex_server,
     spake2::{spake2_confirm_mutual_auth_server, spake2_exchange_server},
 };
@@ -146,6 +147,31 @@ impl fmt::Display for AuthSnowErrors {
     }
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy)]
+pub enum Tags {
+    Regular = 0x01,
+}
+
+impl Tags {
+    pub fn tag(self, packet: &mut Vec<u8>) {
+        packet.push(self as u8);
+    }
+
+    pub fn check_tag(self, packet: &Vec<u8>) -> bool {
+        packet.ends_with(&[self as u8])
+    }
+
+    pub fn untag(self, packet: &mut Vec<u8>) -> bool {
+        if packet.last().eq(&Some(&(self as u8))) {
+            packet.pop();
+            true
+        } else {
+            false
+        }
+    }
+}
+
 pub struct SecureConnection {
     pub stream: TcpStream,
     pub ts: TransportState,
@@ -159,7 +185,9 @@ impl SecureConnection {
         }
     }
 
-    pub async fn write(mut self, src: &[u8]) -> Result<(), AuthSnowErrors> {
+    pub async fn write(mut self, src: &mut Vec<u8>, tag: Tags) -> Result<(), AuthSnowErrors> {
+        tag.tag(src);
+
         let mut buffer = Zeroizing::new(vec![0u8; src.len() + SNOW_TAG_LEN]);
 
         self.ts
@@ -174,7 +202,7 @@ impl SecureConnection {
         Ok(())
     }
 
-    pub async fn read(mut self, buffer: &mut [u8]) -> Result<usize, AuthSnowErrors> {
+    pub async fn read(mut self, buffer: &mut Vec<u8>, tag: Tags) -> Result<usize, AuthSnowErrors> {
         let mut message = Zeroizing::new(vec![0u8; buffer.len() + SNOW_TAG_LEN]);
 
         self.stream
@@ -182,10 +210,16 @@ impl SecureConnection {
             .await
             .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
 
-        Ok(self
+        let read = self
             .ts
             .read_message(&message, buffer)
-            .map_err(|_| AuthSnowErrors::FailedToReadSnowMessage)?)
+            .map_err(|_| AuthSnowErrors::FailedToReadSnowMessage)?;
+
+        if !tag.untag(buffer) {
+            return Err(AuthSnowErrors::WrongTag);
+        }
+
+        Ok(read)
     }
 }
 
