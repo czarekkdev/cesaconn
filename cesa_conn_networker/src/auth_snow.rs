@@ -295,6 +295,7 @@ pub async fn auth_incoming(
 ) -> Result<Option<SecureConnection>, AuthSnowErrors> {
     let mut stream = incoming_connection.0;
     let a_key = keys.read().await.a_key.clone();
+    let mut transcript = Zeroizing::new(Vec::new());
 
     let key1 = spake2_exchange_server(&mut stream, &a_key)
         .await
@@ -308,7 +309,7 @@ pub async fn auth_incoming(
         return Ok(None);
     }
 
-    let hybrid_kep = hybrid_kex_server(&mut stream)
+    let hybrid_kep = hybrid_kex_server(&mut stream, &mut transcript)
         .await
         .map_err(|_| AuthSnowErrors::KexFailed)?;
 

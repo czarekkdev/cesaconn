@@ -9,16 +9,15 @@ add client-side
 use std::time::Duration;
 
 use crate::{
-    auth_snow::{
-        AuthSnowErrors::{self, WrongTag},
-        TIMEOUT,
-    },
+    auth_snow::{AuthSnowErrors, TIMEOUT},
     hybrid_kex::Tags::{ConfirmByte, MlKeyPub, X25519Pub},
 };
+use blake2::Blake2s256;
 use cesa_conn_crypto::{
     crand::random_array,
     x25519_cesa::{self, calculate_shared_key},
 };
+use hkdf::SimpleHkdf;
 use libcrux_ml_kem::mlkem1024::MlKem1024PublicKey;
 #[cfg(target_arch = "x86_64")]
 use libcrux_ml_kem::mlkem1024::avx2::{decapsulate, encapsulate};
@@ -67,7 +66,10 @@ impl Tags {
     }
 }
 
-async fn x25519_kex_server(stream: &mut TcpStream) -> Result<SsKey, AuthSnowErrors> {
+async fn x25519_kex_server(
+    stream: &mut TcpStream,
+    transcript: &mut Zeroizing<Vec<u8>>,
+) -> Result<SsKey, AuthSnowErrors> {
     let x25519_pair = x25519_cesa::generate_new_key_pair(
         *random_array::<32>().map_err(|_| AuthSnowErrors::FailedToGenerateRandomData)?,
     );
@@ -84,6 +86,9 @@ async fn x25519_kex_server(stream: &mut TcpStream) -> Result<SsKey, AuthSnowErro
         .await
         .map_err(|_| AuthSnowErrors::ReadTimeout)?
         .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
+
+    transcript.extend_from_slice(&x25519_recv);
+    transcript.extend_from_slice(&x25519_pub);
 
     if !X25519Pub.untag(&mut x25519_recv) {
         return Err(AuthSnowErrors::WrongTag);
@@ -112,6 +117,8 @@ async fn x25519_kex_server(stream: &mut TcpStream) -> Result<SsKey, AuthSnowErro
         .map_err(|_| AuthSnowErrors::ReadTimeout)?
         .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
 
+    transcript.extend_from_slice(&confirm_buffer);
+
     if !ConfirmByte.untag(&mut confirm_buffer) {
         return Err(AuthSnowErrors::WrongTag);
     }
@@ -123,7 +130,10 @@ async fn x25519_kex_server(stream: &mut TcpStream) -> Result<SsKey, AuthSnowErro
     Ok(x25519_ss)
 }
 
-async fn mlkem_kex_server(stream: &mut TcpStream) -> Result<SsKey, AuthSnowErrors> {
+async fn mlkem_kex_server(
+    stream: &mut TcpStream,
+    transcript: &mut Zeroizing<Vec<u8>>,
+) -> Result<SsKey, AuthSnowErrors> {
     let mut ml_key_recv = Zeroizing::new(vec![0u8; 1568 + 1]); // + tag
 
     let read = stream.read_exact(&mut ml_key_recv);
@@ -133,8 +143,10 @@ async fn mlkem_kex_server(stream: &mut TcpStream) -> Result<SsKey, AuthSnowError
         .map_err(|_| AuthSnowErrors::ReadTimeout)?
         .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
 
+    transcript.extend_from_slice(&ml_key_recv);
+
     if !MlKeyPub.untag(&mut ml_key_recv) {
-        return Err(WrongTag);
+        return Err(AuthSnowErrors::WrongTag);
     }
 
     let (ciphertext, mut ml_key_ss) = encapsulate(
@@ -149,6 +161,7 @@ async fn mlkem_kex_server(stream: &mut TcpStream) -> Result<SsKey, AuthSnowError
     let mut ciphertext = ciphertext.as_slice().to_vec();
 
     MlKeyPub.tag(&mut ciphertext);
+    transcript.extend_from_slice(&ciphertext);
 
     let ml_key_ss_secure = Zeroizing::new(ml_key_ss);
     ml_key_ss.zeroize();
@@ -169,6 +182,8 @@ async fn mlkem_kex_server(stream: &mut TcpStream) -> Result<SsKey, AuthSnowError
         .map_err(|_| AuthSnowErrors::ReadTimeout)?
         .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
 
+    transcript.extend_from_slice(&confirm_buffer);
+
     if !ConfirmByte.untag(&mut confirm_buffer) {
         return Err(AuthSnowErrors::WrongTag);
     }
@@ -180,11 +195,14 @@ async fn mlkem_kex_server(stream: &mut TcpStream) -> Result<SsKey, AuthSnowError
     Ok(ml_key_ss_secure)
 }
 
-pub async fn hybrid_kex_server(stream: &mut TcpStream) -> Result<HybridKep, AuthSnowErrors> {
-    let x25519_ss = x25519_kex_server(stream)
+pub async fn hybrid_kex_server(
+    stream: &mut TcpStream,
+    transcript: &mut Zeroizing<Vec<u8>>,
+) -> Result<HybridKep, AuthSnowErrors> {
+    let x25519_ss = x25519_kex_server(stream, transcript)
         .await
         .map_err(|_| AuthSnowErrors::KexFailed)?;
-    let mlkem_ss = mlkem_kex_server(stream)
+    let mlkem_ss = mlkem_kex_server(stream, transcript)
         .await
         .map_err(|_| AuthSnowErrors::KexFailed)?;
 
