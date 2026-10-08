@@ -10,7 +10,7 @@ use tokio::time::{Duration, sleep, timeout};
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroize;
 
-use crate::auth::{Keys, decrypt_tunnel, encrypt_tunnel};
+use crate::auth_old::{Keys, decrypt_tunnel, encrypt_tunnel};
 
 /// Errors that can occur during UDP networking operations
 #[derive(Debug, PartialEq)]
@@ -249,7 +249,7 @@ pub async fn udp_find_broadcaster(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::encrypt_tunnel;
+    use crate::auth_old::encrypt_tunnel;
     use tokio::net::UdpSocket;
     use tokio::time::{Duration, sleep};
 

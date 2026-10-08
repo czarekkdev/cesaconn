@@ -14,7 +14,7 @@ use tokio::task::spawn_blocking;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::auth::{Keys, auth_incoming, auth_outgoing, decrypt_tunnel, encrypt_tunnel};
+use crate::auth_old::{Keys, auth_incoming, auth_outgoing, decrypt_tunnel, encrypt_tunnel};
 
 /// Identifies what kind of action/data is being sent in a packet.
 /// Encoded as a single byte at position [0] of the init header.
@@ -515,7 +515,7 @@ pub async fn connect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::{decrypt_tunnel, encrypt_tunnel};
+    use crate::auth_old::{decrypt_tunnel, encrypt_tunnel};
     use cesa_conn_crypto::x25519_cesa::{
         calculate_public_key, calculate_shared_key, generate_private_key, hash_key,
     };

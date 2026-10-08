@@ -4,6 +4,9 @@ add visual comparison if peer is not saved in trusted_addrs
 add tests
 add client-side
 add chunking to SecureConnection read/write
+add per-device static key pairs: exchange public keys during pairing (SPAKE2),
+  keep a synced list of trusted device public keys, check the Noise remote
+  static against it (instead of the shared d_key), allow revoking one device
  */
 
 /* Constant variables for noise protocol */
@@ -24,7 +27,6 @@ const SNOW_TAG_LEN: usize = 16;
 pub const TIMEOUT: u64 = 5;
 
 use crate::{
-    auth::Keys,
     hybrid_kex::hybrid_kex_server,
     spake2::{spake2_confirm_mutual_auth_server, spake2_exchange_server},
 };
@@ -269,6 +271,91 @@ impl SecureConnection {
     }
 }
 
+/// Holds the two pre-shared 32-byte keys used by the networker.
+///
+/// * `a_key` — authentication key, verified during the ECDH handshake.
+/// * `d_key` — data key, used for the inner encryption layer on actual payloads.
+///
+/// Both fields are wrapped in `Zeroizing` so they are wiped from memory on drop.
+pub struct Keys {
+    pub a_key: Zeroizing<[u8; 32]>,
+    pub d_key: Zeroizing<[u8; 32]>,
+}
+
+impl Keys {
+    /// Splits a packed 64-byte buffer into the two keys (`a_key` = bytes 0–31, `d_key` = bytes 32–63).
+    pub fn from_ref(data: &[u8; 64]) -> Self {
+        let mut a_key_bytes = Zeroizing::new([0u8; 32]);
+        let mut d_key_bytes = Zeroizing::new([0u8; 32]);
+
+        a_key_bytes.copy_from_slice(&data[..32]);
+        d_key_bytes.copy_from_slice(&data[32..]);
+
+        Self {
+            a_key: a_key_bytes,
+            d_key: d_key_bytes,
+        }
+    }
+
+    /// Packs both keys into `data` (`a_key` in bytes 0–31, `d_key` in bytes 32–63). Inverse of `from_ref`.
+    pub fn to_ref(&self, data: &mut [u8; 64]) {
+        data[..32].copy_from_slice(&*self.a_key);
+        data[32..].copy_from_slice(&*self.d_key);
+    }
+
+    pub fn update(&mut self, data: Self) {
+        *self.a_key = *data.a_key;
+        *self.d_key = *data.d_key;
+    }
+
+    /// Wraps two raw 32-byte arrays in `Zeroizing` so they are wiped from memory on drop.
+    pub fn new(a_key: [u8; 32], d_key: [u8; 32]) -> Self {
+        Self {
+            a_key: Zeroizing::new(a_key),
+            d_key: Zeroizing::new(d_key),
+        }
+    }
+}
+
+pub struct Salts {
+    pub a_salt: Zeroizing<[u8; 32]>,
+    pub d_salt: Zeroizing<[u8; 32]>,
+}
+
+impl Salts {
+    /// Splits a packed 64-byte buffer into the two keys (`a_key` = bytes 0–31, `d_key` = bytes 32–63).
+    pub fn from_ref(data: &[u8; 64]) -> Self {
+        let mut a_salt_bytes = Zeroizing::new([0u8; 32]);
+        let mut d_salt_bytes = Zeroizing::new([0u8; 32]);
+
+        a_salt_bytes.copy_from_slice(&data[..32]);
+        d_salt_bytes.copy_from_slice(&data[32..]);
+
+        Self {
+            a_salt: a_salt_bytes,
+            d_salt: d_salt_bytes,
+        }
+    }
+
+    /// Packs both keys into `data` (`a_key` in bytes 0–31, `d_key` in bytes 32–63). Inverse of `from_ref`.
+    pub fn to_ref(&self, data: &mut [u8; 64]) {
+        data[..32].copy_from_slice(&*self.a_salt);
+        data[32..].copy_from_slice(&*self.d_salt);
+    }
+
+    pub fn update(&mut self, data: Self) {
+        *self.a_salt = *data.a_salt;
+        *self.d_salt = *data.d_salt;
+    }
+
+    pub fn new(a_salt: [u8; 32], d_salt: [u8; 32]) -> Self {
+        Self {
+            a_salt: Zeroizing::new(a_salt),
+            d_salt: Zeroizing::new(d_salt),
+        }
+    }
+}
+
 /// Runs the responder side of a `Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s` handshake.
 ///
 /// * `secure_psk` - key derived from SPAKE2 + hybrid KEX, mixed in at message 3
@@ -374,7 +461,7 @@ async fn snow_handshake_server(
 /// `Ok(Some(_))` on success.
 pub async fn auth_incoming(
     keys: Arc<RwLock<Keys>>,
-    tusted_addrs: Arc<RwLock<Vec<SocketAddr>>>,
+    trusted_peers: Arc<RwLock<SocketAddr>>,
     incoming_connection: (TcpStream, SocketAddr),
 ) -> Result<Option<SecureConnection>, AuthSnowErrors> {
     let mut stream = incoming_connection.0;

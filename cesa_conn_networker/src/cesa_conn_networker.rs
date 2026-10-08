@@ -19,7 +19,7 @@ GET RID OF STORING KEYS IN RAM
 
  */
 
-mod auth;
+mod auth_old;
 mod ipc_unix;
 mod tcp_networker;
 mod udp_networker;
@@ -35,7 +35,7 @@ use tokio::{net::TcpListener, sync::RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    auth::Keys,
+    auth_old::Keys,
     tcp_networker::{ActionType, connect, recv},
     udp_networker::{
         BROADCAST_NAME, UdpNetworkerErrors, udp_broadcast_presence, udp_find_broadcaster,
