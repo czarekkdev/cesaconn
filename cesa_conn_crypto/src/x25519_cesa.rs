@@ -20,7 +20,6 @@ impl X25519KeyPair {
     }
 }
 
-
 /// Derives the X25519 public key from a private key
 pub fn calculate_public_key(private_key: &[u8; 32]) -> [u8; 32] {
     trace!("deriving X25519 public key from private key");
@@ -29,15 +28,22 @@ pub fn calculate_public_key(private_key: &[u8; 32]) -> [u8; 32] {
     *public_key.as_bytes()
 }
 
-// TODO: add check if was_contributory
 /// Computes ECDH shared secret from private key and the other party's public key
 /// The result should be hashed with SHA-256 before use as an AES-256 key
-pub fn calculate_shared_key(private_key: &[u8; 32], their_public: &[u8; 32]) -> [u8; 32] {
+///
+/// Returns `None` if the exchange was non-contributory, i.e. `their_public`
+/// is a low-order point that would force an all-zero shared secret.
+pub fn calculate_shared_key(private_key: &[u8; 32], their_public: &[u8; 32]) -> Option<[u8; 32]> {
     trace!("computing X25519 ECDH shared secret");
-    let private_key = StaticSecret::from(*private_key);
+    let private_key = Zeroizing::new(StaticSecret::from(*private_key));
     let their_public = PublicKey::from(*their_public);
+    let shared_secret = Zeroizing::new(private_key.diffie_hellman(&their_public));
 
-    *private_key.diffie_hellman(&their_public).as_bytes()
+    if !shared_secret.was_contributory() {
+        return None;
+    }
+
+    Some(*shared_secret.as_bytes())
 }
 
 /// Hashes the ECDH shared secret using SHA-256 to produce a secure AES-256 key.
@@ -79,8 +85,8 @@ mod tests {
         let public_a = calculate_public_key(&private_a);
         let public_b = calculate_public_key(&private_b);
 
-        let shared_a = calculate_shared_key(&private_a, &public_b);
-        let shared_b = calculate_shared_key(&private_b, &public_a);
+        let shared_a = calculate_shared_key(&private_a, &public_b).expect("valid peer key");
+        let shared_b = calculate_shared_key(&private_b, &public_a).expect("valid peer key");
 
         assert_eq!(shared_a, shared_b);
     }
@@ -95,10 +101,25 @@ mod tests {
         let public_b = calculate_public_key(&private_b);
         let public_c = calculate_public_key(&private_c);
 
-        let shared_ab = calculate_shared_key(&private_a, &public_b);
-        let shared_ac = calculate_shared_key(&private_a, &public_c);
+        let shared_ab = calculate_shared_key(&private_a, &public_b).expect("valid peer key");
+        let shared_ac = calculate_shared_key(&private_a, &public_c).expect("valid peer key");
 
         assert_ne!(shared_ab, shared_ac);
+    }
+
+    /// A low-order peer public key forces an all-zero shared secret and must be rejected.
+    #[test]
+    fn test_low_order_public_key_rejected() {
+        let private_key = generate_private_key();
+
+        // the identity point (0) and the order-2 point (1)
+        for low_order in [[0u8; 32], {
+            let mut p = [0u8; 32];
+            p[0] = 1;
+            p
+        }] {
+            assert_eq!(calculate_shared_key(&private_key, &low_order), None);
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -119,7 +140,10 @@ mod tests {
     fn test_different_private_keys_different_public_keys() {
         let private_a = generate_private_key();
         let private_b = generate_private_key();
-        assert_ne!(calculate_public_key(&private_a), calculate_public_key(&private_b));
+        assert_ne!(
+            calculate_public_key(&private_a),
+            calculate_public_key(&private_b)
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -177,8 +201,10 @@ mod tests {
         let pair_a = generate_new_key_pair(seed_a);
         let pair_b = generate_new_key_pair(seed_b);
 
-        let shared_a = calculate_shared_key(&pair_a.private, &pair_b.public);
-        let shared_b = calculate_shared_key(&pair_b.private, &pair_a.public);
+        let shared_a =
+            calculate_shared_key(&pair_a.private, &pair_b.public).expect("valid peer key");
+        let shared_b =
+            calculate_shared_key(&pair_b.private, &pair_a.public).expect("valid peer key");
 
         assert_eq!(shared_a, shared_b);
     }

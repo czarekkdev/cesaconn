@@ -92,6 +92,8 @@ pub enum AuthSnowErrors {
     SnowFailedToGetRemoteStatic,
     /// The peer's ML-KEM public key failed the FIPS 203 validity check.
     MlKemInvalidPublicKey,
+    /// The X25519 shared secret was non-contributory (peer sent a low-order point).
+    FailedToCalculateSharedSecret,
 }
 
 impl fmt::Display for AuthSnowErrors {
@@ -161,6 +163,9 @@ impl fmt::Display for AuthSnowErrors {
             }
             AuthSnowErrors::MlKemInvalidPublicKey => {
                 write!(f, "invalid public key")
+            }
+            AuthSnowErrors::FailedToCalculateSharedSecret => {
+                write!(f, "failed to calculate shared secret")
             }
         }
     }

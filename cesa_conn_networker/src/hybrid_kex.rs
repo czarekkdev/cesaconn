@@ -108,12 +108,16 @@ async fn x25519_kex_server(
         return Err(AuthSnowErrors::WrongTag);
     }
 
-    let x25519_ss = Zeroizing::new(calculate_shared_key(
-        &x25519_pair.private,
-        x25519_recv
-            .as_array()
-            .ok_or(AuthSnowErrors::FailedToConvertToArray)?,
-    ));
+    // fails if the client sent a low-order point (all-zero shared secret)
+    let x25519_ss = Zeroizing::new(
+        calculate_shared_key(
+            &x25519_pair.private,
+            x25519_recv
+                .as_array()
+                .ok_or(AuthSnowErrors::FailedToConvertToArray)?,
+        )
+        .ok_or(AuthSnowErrors::FailedToCalculateSharedSecret)?,
+    );
 
     // 2. our public key
     let write = stream.write_all(&x25519_pub);
