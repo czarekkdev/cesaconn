@@ -37,7 +37,7 @@ impl Tags {
     }
 
     /// Returns `true` if `packet` ends with this tag.
-    pub fn check_tag(self, packet: &Vec<u8>) -> bool {
+    pub fn check_tag(self, packet: &[u8]) -> bool {
         packet.ends_with(&[self as u8])
     }
 
