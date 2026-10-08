@@ -90,6 +90,8 @@ pub enum AuthSnowErrors {
     WriteTimeout,
     /// The peer's static key was not available after the Noise handshake.
     SnowFailedToGetRemoteStatic,
+    /// The peer's ML-KEM public key failed the FIPS 203 validity check.
+    MlKemInvalidPublicKey,
 }
 
 impl fmt::Display for AuthSnowErrors {
@@ -156,6 +158,9 @@ impl fmt::Display for AuthSnowErrors {
             }
             AuthSnowErrors::SnowFailedToGetRemoteStatic => {
                 write!(f, "failed to get a remote static key from peer in noise")
+            }
+            AuthSnowErrors::MlKemInvalidPublicKey => {
+                write!(f, "invalid public key")
             }
         }
     }
