@@ -1,14 +1,11 @@
 /*
 TODO:
-add visual comparison if peer is not saved in trusted_addrs
 add tests
-add client-side
+add client-side (same transcript order, SPAKE2 identities and signature order)
 add chunking to SecureConnection read/write
-add per-device static key pairs: exchange public keys during pairing (SPAKE2),
-  keep a synced list of trusted device public keys, check the Noise remote
-  static against it (instead of the shared d_key), allow revoking one device
-add encrypting/decrypting data with aes256 in Secure Connection with d_key
-replace noise static key with a random keypair
+persist DeviceKeypairs (private keys encrypted / in the OS keychain)
+sync the trusted peer list between devices, allow revoking one device
+add encrypting/decrypting data with aes256 in SecureConnection with d_key
  */
 
 /* Constant variables for noise protocol */
@@ -28,6 +25,7 @@ const SNOW_TAG_LEN: usize = 16;
 /// read/write timeout (seconds)
 pub const TIMEOUT: u64 = 5;
 
+/// how long the user has to confirm a new device during pairing (seconds)
 pub const PAIRING_TIMEOUT: u64 = 60;
 
 use crate::{
@@ -108,11 +106,17 @@ pub enum AuthSnowErrors {
     MlKemInvalidPublicKey,
     /// The X25519 shared secret was non-contributory (peer sent a low-order point).
     FailedToCalculateSharedSecret,
+    /// Reading or decrypting a message from a [`SecureConnection`] failed.
     FailedToReadFromSecureConnection,
+    /// The user rejected the new device, or confirming it failed.
     FailedToPairNewDevice,
+    /// The peer's ML-DSA signature over the handshake hash is invalid.
     FailedToVerifySignature,
+    /// Signing the handshake hash with our ML-DSA key failed.
     FailedToSignData,
+    /// Encrypting or sending a message over a [`SecureConnection`] failed.
     FailedToWriteToSecureConnection,
+    /// The user did not confirm the new device within [`PAIRING_TIMEOUT`] seconds.
     PairingTimeout,
 }
 
@@ -216,7 +220,9 @@ impl fmt::Display for AuthSnowErrors {
 pub enum Tags {
     /// Ordinary application data.
     Regular = 0x01,
+    /// ML-DSA-87 verification key (2592 bytes).
     MLDSA87VerificationKeyTag = 0x02,
+    /// ML-DSA-87 signature over the handshake hash (4627 bytes).
     MLDSA87SignatureTag = 0x03,
 }
 
@@ -243,6 +249,7 @@ impl Tags {
     }
 }
 
+/// Shared list of all devices this device has paired with.
 pub type TrustedPeers = Arc<RwLock<Vec<TrustedPeer>>>;
 
 /// An authenticated, encrypted channel to a peer after a completed Noise handshake.
@@ -315,7 +322,7 @@ impl SecureConnection {
 
 /// Holds the two pre-shared 32-byte keys used by the networker.
 ///
-/// * `a_key` — authentication key, verified during the ECDH handshake.
+/// * `a_key` — authentication key, used as the SPAKE2 password during pairing/connecting.
 /// * `d_key` — data key, used for the inner encryption layer on actual payloads.
 ///
 /// Both fields are wrapped in `Zeroizing` so they are wiped from memory on drop.
@@ -345,6 +352,7 @@ impl Keys {
         data[32..].copy_from_slice(&*self.d_key);
     }
 
+    /// Replaces both keys with the ones from `data`.
     pub fn update(&mut self, data: Self) {
         *self.a_key = *data.a_key;
         *self.d_key = *data.d_key;
@@ -359,13 +367,15 @@ impl Keys {
     }
 }
 
+/// Holds the two 32-byte Argon2 salts used to derive `a_key` and `d_key` from
+/// their passwords. Salts are not secret, but all devices must use the same ones.
 pub struct Salts {
     pub a_salt: Zeroizing<[u8; 32]>,
     pub d_salt: Zeroizing<[u8; 32]>,
 }
 
 impl Salts {
-    /// Splits a packed 64-byte buffer into the two keys (`a_key` = bytes 0–31, `d_key` = bytes 32–63).
+    /// Splits a packed 64-byte buffer into the two salts (`a_salt` = bytes 0–31, `d_salt` = bytes 32–63).
     pub fn from_ref(data: &[u8; 64]) -> Self {
         let mut a_salt_bytes = Zeroizing::new([0u8; 32]);
         let mut d_salt_bytes = Zeroizing::new([0u8; 32]);
@@ -379,17 +389,19 @@ impl Salts {
         }
     }
 
-    /// Packs both keys into `data` (`a_key` in bytes 0–31, `d_key` in bytes 32–63). Inverse of `from_ref`.
+    /// Packs both salts into `data` (`a_salt` in bytes 0–31, `d_salt` in bytes 32–63). Inverse of `from_ref`.
     pub fn to_ref(&self, data: &mut [u8; 64]) {
         data[..32].copy_from_slice(&*self.a_salt);
         data[32..].copy_from_slice(&*self.d_salt);
     }
 
+    /// Replaces both salts with the ones from `data`.
     pub fn update(&mut self, data: Self) {
         *self.a_salt = *data.a_salt;
         *self.d_salt = *data.d_salt;
     }
 
+    /// Wraps two raw 32-byte arrays in `Zeroizing`.
     pub fn new(a_salt: [u8; 32], d_salt: [u8; 32]) -> Self {
         Self {
             a_salt: Zeroizing::new(a_salt),
@@ -398,12 +410,20 @@ impl Salts {
     }
 }
 
+/// This device's own long-term identity, different on every device.
+///
+/// Generated once when the device is set up, then stored and reused,
+/// otherwise every restart would look like a new, unpaired device.
 pub struct DeviceKeypairs {
+    /// Noise static key pair, sent (encrypted) during every handshake.
     x25519_kep: X25519KeyPair,
+    /// ML-DSA-87 key pair, used to sign the handshake hash.
     mldsa_kep: MLDSA87KeyPair,
 }
 
 impl DeviceKeypairs {
+    /// Generates a fresh random X25519 and ML-DSA-87 key pair.
+    /// Only call this once, when the device is set up.
     pub fn generate() -> Result<Self, AuthSnowErrors> {
         Ok(Self {
             x25519_kep: generate_new_key_pair(
@@ -415,6 +435,7 @@ impl DeviceKeypairs {
         })
     }
 
+    /// Wraps already existing key pairs, e.g. loaded from storage.
     pub fn new(x25519_kep: X25519KeyPair, mldsa_kep: MLDSA87KeyPair) -> Self {
         Self {
             x25519_kep,
@@ -423,14 +444,19 @@ impl DeviceKeypairs {
     }
 }
 
+/// A device we have paired with, identified by both of its public keys.
 #[derive(Clone)]
 pub struct TrustedPeer {
+    /// The peer's Noise static public key, used to look it up after the handshake.
     x25519_pub_key: [u8; 32],
+    /// The peer's ML-DSA-87 verification key, used to check its handshake signature.
     mldsa_verification_key: [u8; 2592],
+    /// Human-readable device name shown to the user.
     name: String,
 }
 
 impl TrustedPeer {
+    /// Creates a trusted peer entry from its two public keys and name.
     pub fn new(x25519_pub_key: [u8; 32], mldsa_verification_key: [u8; 2592], name: String) -> Self {
         Self {
             x25519_pub_key,
@@ -440,6 +466,18 @@ impl TrustedPeer {
     }
 }
 
+/// Mutual ML-DSA authentication over the finished Noise handshake (server side).
+///
+/// 1. <- (only when pairing, `trusted_peer` is `None`) client's verification key
+/// 2. <- client's signature over `handshake_hash`, checked with the client's key
+/// 3. -> our verification key
+/// 4. -> our signature over `handshake_hash`
+///
+/// The handshake hash is unique per connection and identical on both sides,
+/// so a valid signature proves the peer took part in this exact handshake.
+///
+/// Returns the client's verification key (the stored one for a known peer,
+/// the received one when pairing).
 async fn verify_sig_server(
     secure_connection: &mut SecureConnection,
     handshake_hash: Zeroizing<[u8; 32]>,
@@ -447,7 +485,9 @@ async fn verify_sig_server(
     device_keypairs: &DeviceKeypairs,
 ) -> Result<[u8; MLDSA87VerificationKey::len()], AuthSnowErrors> {
     match trusted_peer {
+        // known peer: only its signature, checked with the stored key
         Some(peer) => {
+            // +1 for the tag byte that read() removes
             let mut sig_buffer = vec![0u8; MLDSA87Signature::len() + 1];
 
             let read = secure_connection.read(&mut sig_buffer, MLDSA87SignatureTag);
@@ -471,6 +511,7 @@ async fn verify_sig_server(
             )
             .map_err(|_| AuthSnowErrors::FailedToVerifySignature)?;
 
+            // our key + signature, so the client can verify us too
             let ver_key = &mut device_keypairs
                 .mldsa_kep
                 .verification_key
@@ -504,7 +545,10 @@ async fn verify_sig_server(
 
             Ok(peer.mldsa_verification_key.clone())
         }
+        // new peer (pairing): its key first, then a signature made with that key,
+        // which proves it actually owns the key it sent
         None => {
+            // +1 for the tag byte that read() removes
             let mut ver_buffer = vec![0u8; MLDSA87VerificationKey::len() + 1];
             let mut sig_buffer = vec![0u8; MLDSA87Signature::len() + 1];
 
@@ -542,6 +586,7 @@ async fn verify_sig_server(
             )
             .map_err(|_| AuthSnowErrors::FailedToVerifySignature)?;
 
+            // our key + signature, so the client can verify us too
             let ver_key = &mut device_keypairs
                 .mldsa_kep
                 .verification_key
@@ -583,11 +628,18 @@ async fn verify_sig_server(
 /// Runs the responder side of a `Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s` handshake.
 ///
 /// * `secure_psk` - key derived from SPAKE2 + hybrid KEX, mixed in at message 3
-/// * `d_key` - our static X25519 private key (the same on both peers)
+/// * `device_keypairs` - our own long-term keys (X25519 static key, ML-DSA key pair)
+/// * `trusted_peers` - devices we already paired with
+/// * `pair_fallback` - asks the user to confirm an unknown device; gets its name
+///   and the handshake hash (to show as words). Runs on a blocking thread.
+///
+/// After the handshake, a known peer (found by its static key) must prove itself
+/// with an ML-DSA signature. An unknown peer is only accepted if the user confirms
+/// it within [`PAIRING_TIMEOUT`]; it is then added to `trusted_peers`.
 ///
 /// Every network read/write is bounded by [`TIMEOUT`].
 ///
-/// Returns `Ok(None)` if the peer's static key doesn't match ours.
+/// Returns the secure connection and the authenticated peer.
 async fn snow_handshake_server(
     mut incoming_connection: IncomingConnection,
     secure_psk: Zeroizing<[u8; 32]>,
@@ -651,14 +703,15 @@ async fn snow_handshake_server(
         .read_message(&read_buffer[..SNOW_MSG3_LEN], buffer.as_mut_slice())
         .map_err(|_| AuthSnowErrors::FailedToReadSnowMessage)?;
 
-    // both peers use the same `d_key`, so the peer's static public key
-    // must equal the one derived from ours, otherwise reject the connection
+    // the peer's static public key identifies the device in `trusted_peers`
     let peer_static: [u8; 32] = builder
         .get_remote_static()
         .ok_or(AuthSnowErrors::SnowFailedToGetRemoteStatic)?
         .try_into()
         .map_err(|_| AuthSnowErrors::FailedToConvertToArray)?;
 
+    // saved now, snow only exposes it before switching to transport mode;
+    // used for the signatures and for the words the user compares when pairing
     let mut handshake_hash = Zeroizing::new([0u8; 32]);
 
     handshake_hash.clone_from_slice(builder.get_handshake_hash());
@@ -670,6 +723,7 @@ async fn snow_handshake_server(
 
     let mut secure_connection = SecureConnection::new(incoming_connection, transport);
 
+    // cloned, so the read lock is released before any network I/O
     let new_device = trusted_peers
         .read()
         .await
@@ -690,6 +744,7 @@ async fn snow_handshake_server(
             device
         }
         None => {
+            // ask the user on a blocking thread, so tokio isn't blocked meanwhile
             let name_clone = secure_connection.connection.name.clone();
             let handshake_hash_clone = handshake_hash.clone();
 
@@ -720,6 +775,8 @@ async fn snow_handshake_server(
                 name: secure_connection.connection.name.clone(),
             };
 
+            // check again under the write lock, so two parallel pairings
+            // of the same device can't both add it
             let mut peer = trusted_peers.write().await;
 
             if !peer
@@ -742,11 +799,13 @@ async fn snow_handshake_server(
 /// 1. SPAKE2 exchange + mutual key confirmation using the shared `a_key`
 /// 2. hybrid X25519 + ML-KEM key exchange
 /// 3. derive a PSK from the SPAKE2 key, both KEX shared secrets and the transcript hash
-/// 4. Noise XXpsk3 handshake using that PSK and our static `d_key`
+/// 4. Noise XXpsk3 handshake using that PSK and our device's static key
+/// 5. mutual ML-DSA signatures over the handshake hash; unknown devices
+///    are only accepted after the user confirms them (pairing)
 ///
 /// Returns `Ok(None)` if the peer failed SPAKE2 confirmation
-/// (i.e. doesn't know the shared key) or its Noise static key doesn't match,
-/// `Ok(Some(_))` on success.
+/// (i.e. doesn't know the shared key), `Ok(Some(_))` with the secure
+/// connection and the authenticated peer on success.
 pub async fn auth_incoming(
     keys: Arc<RwLock<Keys>>,
     device_keypairs: &DeviceKeypairs,
@@ -800,7 +859,7 @@ pub async fn auth_incoming(
         .expand(b"CPQHA-psk", secure_psk.as_mut_slice())
         .map_err(|_| AuthSnowErrors::FailedToExpandHkdf)?;
 
-    // 4. Noise handshake
+    // 4. + 5. Noise handshake, then signatures / pairing
     snow_handshake_server(
         incoming_connection,
         secure_psk,
