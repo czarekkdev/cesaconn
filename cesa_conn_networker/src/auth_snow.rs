@@ -7,6 +7,8 @@ add chunking to SecureConnection read/write
 add per-device static key pairs: exchange public keys during pairing (SPAKE2),
   keep a synced list of trusted device public keys, check the Noise remote
   static against it (instead of the shared d_key), allow revoking one device
+add encrypting/decrypting data with aes256 in Secure Connection with d_key
+replace noise static key with a random keypair
  */
 
 /* Constant variables for noise protocol */
@@ -26,21 +28,31 @@ const SNOW_TAG_LEN: usize = 16;
 /// read/write timeout (seconds)
 pub const TIMEOUT: u64 = 5;
 
+pub const PARING_TIMEOUT: u64 = 60;
+
 use crate::{
+    auth_snow::Tags::{MLDSA87SignatureTag, MLDSA87VerificationKeyTag},
     hybrid_kex::hybrid_kex_server,
     spake2::{spake2_confirm_mutual_auth_server, spake2_exchange_server},
+    tcp_networker::IncomingConnection,
 };
 use blake2::Blake2s256;
-use cesa_conn_crypto::x25519_cesa::calculate_public_key;
+use cesa_conn_crypto::{
+    crand::random_array,
+    x25519_cesa::{X25519KeyPair, generate_new_key_pair},
+};
 use core::fmt;
 use hkdf::SimpleHkdf;
+use libcrux_ml_dsa::ml_dsa_87::{
+    MLDSA87KeyPair, MLDSA87Signature, MLDSA87VerificationKey, generate_key_pair, sign, verify,
+};
 use snow::{Builder, TransportState};
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
     sync::RwLock,
+    task::spawn_blocking,
     time::timeout,
 };
 use zeroize::Zeroizing;
@@ -96,6 +108,12 @@ pub enum AuthSnowErrors {
     MlKemInvalidPublicKey,
     /// The X25519 shared secret was non-contributory (peer sent a low-order point).
     FailedToCalculateSharedSecret,
+    FailedToReadFromSecureConnection,
+    FailedToPairNewDevice,
+    FailedToVerifySignature,
+    FailedToSignData,
+    FailedToWriteToSecureConnection,
+    ParingTimeout,
 }
 
 impl fmt::Display for AuthSnowErrors {
@@ -169,6 +187,24 @@ impl fmt::Display for AuthSnowErrors {
             AuthSnowErrors::FailedToCalculateSharedSecret => {
                 write!(f, "failed to calculate shared secret")
             }
+            AuthSnowErrors::FailedToReadFromSecureConnection => {
+                write!(f, "failed to read from SecureConnection")
+            }
+            AuthSnowErrors::FailedToPairNewDevice => {
+                write!(f, "failed to pair new device")
+            }
+            AuthSnowErrors::FailedToVerifySignature => {
+                write!(f, "failed to verify peers signature")
+            }
+            AuthSnowErrors::FailedToSignData => {
+                write!(f, "failed to sign the data")
+            }
+            AuthSnowErrors::FailedToWriteToSecureConnection => {
+                write!(f, "failed to write data to secure connection")
+            }
+            AuthSnowErrors::ParingTimeout => {
+                write!(f, "pairing timed out")
+            }
         }
     }
 }
@@ -180,6 +216,8 @@ impl fmt::Display for AuthSnowErrors {
 pub enum Tags {
     /// Ordinary application data.
     Regular = 0x01,
+    MLDSA87VerificationKeyTag = 0x02,
+    MLDSA87SignatureTag = 0x03,
 }
 
 impl Tags {
@@ -205,19 +243,21 @@ impl Tags {
     }
 }
 
+pub type TrustedPeers = Arc<RwLock<Vec<TrustedPeer>>>;
+
 /// An authenticated, encrypted channel to a peer after a completed Noise handshake.
 pub struct SecureConnection {
     /// Underlying TCP stream carrying the ciphertext.
-    pub stream: TcpStream,
+    pub connection: IncomingConnection,
     /// Noise transport state holding the send/receive cipher keys and nonces.
     pub ts: TransportState,
 }
 
 impl SecureConnection {
     /// Wraps an already-handshaken stream and its transport state.
-    pub fn new(stream: TcpStream, ts: TransportState) -> Self {
+    pub fn new(connection: IncomingConnection, ts: TransportState) -> Self {
         Self {
-            stream: stream,
+            connection: connection,
             ts: ts,
         }
     }
@@ -235,7 +275,8 @@ impl SecureConnection {
             .write_message(src, &mut buffer)
             .map_err(|_| AuthSnowErrors::FailedToWriteSnowMessage)?;
 
-        self.stream
+        self.connection
+            .stream
             .write_all(&buffer)
             .await
             .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
@@ -253,7 +294,8 @@ impl SecureConnection {
     pub async fn read(&mut self, buffer: &mut Vec<u8>, tag: Tags) -> Result<usize, AuthSnowErrors> {
         let mut message = Zeroizing::new(vec![0u8; buffer.len() + SNOW_TAG_LEN]);
 
-        self.stream
+        self.connection
+            .stream
             .read_exact(&mut message)
             .await
             .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
@@ -356,6 +398,188 @@ impl Salts {
     }
 }
 
+pub struct DeviceKeypairs {
+    x25519_kep: X25519KeyPair,
+    mldsa_kep: MLDSA87KeyPair,
+}
+
+impl DeviceKeypairs {
+    pub fn generate() -> Result<Self, AuthSnowErrors> {
+        Ok(Self {
+            x25519_kep: generate_new_key_pair(
+                *random_array::<32>().map_err(|_| AuthSnowErrors::FailedToGenerateRandomData)?,
+            ),
+            mldsa_kep: generate_key_pair(
+                *random_array::<32>().map_err(|_| AuthSnowErrors::FailedToGenerateRandomData)?,
+            ),
+        })
+    }
+
+    pub fn new(x25519_kep: X25519KeyPair, mldsa_kep: MLDSA87KeyPair) -> Self {
+        Self {
+            x25519_kep,
+            mldsa_kep,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct TrustedPeer {
+    x25519_pub_key: [u8; 32],
+    mldsa_verification_key: [u8; 2592],
+    name: String,
+}
+
+impl TrustedPeer {
+    pub fn new(x25519_pub_key: [u8; 32], mldsa_verification_key: [u8; 2592], name: String) -> Self {
+        Self {
+            x25519_pub_key,
+            mldsa_verification_key,
+            name,
+        }
+    }
+}
+
+async fn verify_sig_server(
+    secure_connection: &mut SecureConnection,
+    handshake_hash: Zeroizing<[u8; 32]>,
+    trusted_peer: Option<&TrustedPeer>,
+    device_keypairs: &DeviceKeypairs,
+) -> Result<[u8; MLDSA87VerificationKey::len()], AuthSnowErrors> {
+    match trusted_peer {
+        Some(peer) => {
+            let mut sig_buffer = vec![0u8; MLDSA87Signature::len() + 1];
+
+            let read = secure_connection.read(&mut sig_buffer, MLDSA87SignatureTag);
+
+            timeout(Duration::from_secs(TIMEOUT), read)
+                .await
+                .map_err(|_| AuthSnowErrors::ReadTimeout)?
+                .map_err(|_| AuthSnowErrors::FailedToReadFromSecureConnection)?;
+
+            let signature = MLDSA87Signature::new(
+                *sig_buffer
+                    .as_array()
+                    .ok_or(AuthSnowErrors::FailedToConvertToArray)?,
+            );
+
+            verify(
+                &MLDSA87VerificationKey::new(peer.mldsa_verification_key.clone()),
+                handshake_hash.as_slice(),
+                b"CesaConn Handshake",
+                &signature,
+            )
+            .map_err(|_| AuthSnowErrors::FailedToVerifySignature)?;
+
+            let ver_key = &mut device_keypairs
+                .mldsa_kep
+                .verification_key
+                .clone()
+                .as_mut_slice()
+                .to_vec();
+
+            let mut signature = sign(
+                &device_keypairs.mldsa_kep.signing_key,
+                handshake_hash.as_slice(),
+                b"CesaConn Handshake",
+                *random_array::<32>().map_err(|_| AuthSnowErrors::FailedToSignData)?,
+            )
+            .map_err(|_| AuthSnowErrors::FailedToSignData)?
+            .as_mut_slice()
+            .to_vec();
+
+            let send = secure_connection.write(ver_key, MLDSA87VerificationKeyTag);
+
+            timeout(Duration::from_secs(TIMEOUT), send)
+                .await
+                .map_err(|_| AuthSnowErrors::WriteTimeout)?
+                .map_err(|_| AuthSnowErrors::FailedToWriteToSecureConnection)?;
+
+            let send = secure_connection.write(&mut signature, MLDSA87SignatureTag);
+
+            timeout(Duration::from_secs(TIMEOUT), send)
+                .await
+                .map_err(|_| AuthSnowErrors::WriteTimeout)?
+                .map_err(|_| AuthSnowErrors::FailedToWriteToSecureConnection)?;
+
+            Ok(peer.mldsa_verification_key.clone())
+        }
+        None => {
+            let mut ver_buffer = vec![0u8; MLDSA87VerificationKey::len() + 1];
+            let mut sig_buffer = vec![0u8; MLDSA87Signature::len() + 1];
+
+            let read = secure_connection.read(&mut ver_buffer, MLDSA87VerificationKeyTag);
+
+            timeout(Duration::from_secs(TIMEOUT), read)
+                .await
+                .map_err(|_| AuthSnowErrors::ReadTimeout)?
+                .map_err(|_| AuthSnowErrors::FailedToReadFromSecureConnection)?;
+
+            let read = secure_connection.read(&mut sig_buffer, MLDSA87SignatureTag);
+
+            timeout(Duration::from_secs(TIMEOUT), read)
+                .await
+                .map_err(|_| AuthSnowErrors::ReadTimeout)?
+                .map_err(|_| AuthSnowErrors::FailedToReadFromSecureConnection)?;
+
+            let verification_key = MLDSA87VerificationKey::new(
+                *ver_buffer
+                    .as_array()
+                    .ok_or(AuthSnowErrors::FailedToConvertToArray)?,
+            );
+
+            let signature = MLDSA87Signature::new(
+                *sig_buffer
+                    .as_array()
+                    .ok_or(AuthSnowErrors::FailedToConvertToArray)?,
+            );
+
+            verify(
+                &verification_key,
+                handshake_hash.as_slice(),
+                b"CesaConn Handshake",
+                &signature,
+            )
+            .map_err(|_| AuthSnowErrors::FailedToVerifySignature)?;
+
+            let ver_key = &mut device_keypairs
+                .mldsa_kep
+                .verification_key
+                .clone()
+                .as_mut_slice()
+                .to_vec();
+
+            let mut signature = sign(
+                &device_keypairs.mldsa_kep.signing_key,
+                handshake_hash.as_slice(),
+                b"CesaConn Handshake",
+                *random_array::<32>().map_err(|_| AuthSnowErrors::FailedToSignData)?,
+            )
+            .map_err(|_| AuthSnowErrors::FailedToSignData)?
+            .as_mut_slice()
+            .to_vec();
+
+            let send = secure_connection.write(ver_key, MLDSA87VerificationKeyTag);
+
+            timeout(Duration::from_secs(TIMEOUT), send)
+                .await
+                .map_err(|_| AuthSnowErrors::WriteTimeout)?
+                .map_err(|_| AuthSnowErrors::FailedToWriteToSecureConnection)?;
+
+            let send = secure_connection.write(&mut signature, MLDSA87SignatureTag);
+
+            timeout(Duration::from_secs(TIMEOUT), send)
+                .await
+                .map_err(|_| AuthSnowErrors::WriteTimeout)?
+                .map_err(|_| AuthSnowErrors::FailedToWriteToSecureConnection)?;
+
+            Ok(*ver_buffer
+                .as_array()
+                .ok_or(AuthSnowErrors::FailedToConvertToArray)?)
+        }
+    }
+}
+
 /// Runs the responder side of a `Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s` handshake.
 ///
 /// * `secure_psk` - key derived from SPAKE2 + hybrid KEX, mixed in at message 3
@@ -365,11 +589,13 @@ impl Salts {
 ///
 /// Returns `Ok(None)` if the peer's static key doesn't match ours.
 async fn snow_handshake_server(
-    stream: TcpStream,
+    mut incoming_connection: IncomingConnection,
     secure_psk: Zeroizing<[u8; 32]>,
-    d_key: Zeroizing<[u8; 32]>,
-) -> Result<Option<SecureConnection>, AuthSnowErrors> {
-    let mut stream = stream;
+    device_keypairs: &DeviceKeypairs,
+    trusted_peers: TrustedPeers,
+    pair_fallback: fn(&String, &[u8; 32]) -> bool,
+) -> Result<Option<(SecureConnection, TrustedPeer)>, AuthSnowErrors> {
+    let stream = &mut incoming_connection.stream;
 
     // psk3: the PSK is mixed in at the end of the third handshake message
     let mut builder = Builder::new(
@@ -377,7 +603,7 @@ async fn snow_handshake_server(
             .parse()
             .map_err(|_| AuthSnowErrors::FailedToParseText)?,
     )
-    .local_private_key(d_key.as_slice())
+    .local_private_key(device_keypairs.x25519_kep.private.as_slice())
     .map_err(|_| AuthSnowErrors::FailedToSetLocalPrivateKey)?
     .psk(3, &secure_psk)
     .map_err(|_| AuthSnowErrors::FailedToSetPsk)?
@@ -427,25 +653,87 @@ async fn snow_handshake_server(
 
     // both peers use the same `d_key`, so the peer's static public key
     // must equal the one derived from ours, otherwise reject the connection
-    let peer_static = builder
+    let peer_static: [u8; 32] = builder
         .get_remote_static()
-        .ok_or(AuthSnowErrors::SnowFailedToGetRemoteStatic)?;
+        .ok_or(AuthSnowErrors::SnowFailedToGetRemoteStatic)?
+        .try_into()
+        .map_err(|_| AuthSnowErrors::FailedToConvertToArray)?;
 
-    let our_static = Zeroizing::new(calculate_public_key(&d_key));
+    let mut handshake_hash = Zeroizing::new([0u8; 32]);
 
-    if our_static.ct_eq(peer_static).unwrap_u8() != 1 {
-        return Ok(None);
-    }
+    handshake_hash.clone_from_slice(builder.get_handshake_hash());
 
     // handshake complete, switch to encrypted transport
     let transport = builder
         .into_transport_mode()
         .map_err(|_| AuthSnowErrors::FailedToEnterTansportMode)?;
 
-    Ok(Some(SecureConnection {
-        stream: stream,
-        ts: transport,
-    }))
+    let mut secure_connection = SecureConnection::new(incoming_connection, transport);
+
+    let new_device = trusted_peers
+        .read()
+        .await
+        .iter()
+        .find(|device| device.x25519_pub_key.ct_eq(&peer_static).into())
+        .cloned();
+
+    let trusted_peer = match new_device {
+        Some(device) => {
+            verify_sig_server(
+                &mut secure_connection,
+                handshake_hash,
+                Some(&device),
+                device_keypairs,
+            )
+            .await
+            .map_err(|_| AuthSnowErrors::FailedToVerifySignature)?;
+            device
+        }
+        None => {
+            let name_clone = secure_connection.connection.name.clone();
+            let handshake_hash_clone = handshake_hash.clone();
+
+            let accept = timeout(
+                Duration::from_secs(PARING_TIMEOUT),
+                spawn_blocking(move || pair_fallback(&name_clone, &handshake_hash_clone)),
+            )
+            .await
+            .map_err(|_| AuthSnowErrors::ParingTimeout)?
+            .map_err(|_| AuthSnowErrors::FailedToPairNewDevice)?;
+
+            if !accept {
+                return Err(AuthSnowErrors::FailedToPairNewDevice);
+            }
+
+            let ver_key = verify_sig_server(
+                &mut secure_connection,
+                handshake_hash,
+                None,
+                device_keypairs,
+            )
+            .await
+            .map_err(|_| AuthSnowErrors::FailedToVerifySignature)?;
+
+            let trusted_peer = TrustedPeer {
+                x25519_pub_key: peer_static,
+                mldsa_verification_key: ver_key,
+                name: secure_connection.connection.name.clone(),
+            };
+
+            let mut peer = trusted_peers.write().await;
+
+            if !peer
+                .iter()
+                .any(|peer| peer.x25519_pub_key.ct_eq(&peer_static).into())
+            {
+                peer.push(trusted_peer.clone());
+            }
+
+            trusted_peer
+        }
+    };
+
+    Ok(Some((secure_connection, trusted_peer)))
 }
 
 /// Authenticates an incoming connection (server side).
@@ -461,10 +749,12 @@ async fn snow_handshake_server(
 /// `Ok(Some(_))` on success.
 pub async fn auth_incoming(
     keys: Arc<RwLock<Keys>>,
-    trusted_peers: Arc<RwLock<SocketAddr>>,
-    incoming_connection: (TcpStream, SocketAddr),
-) -> Result<Option<SecureConnection>, AuthSnowErrors> {
-    let mut stream = incoming_connection.0;
+    device_keypairs: &DeviceKeypairs,
+    trusted_peers: TrustedPeers,
+    mut incoming_connection: IncomingConnection,
+    pair_fallback: fn(&String, &[u8; 32]) -> bool,
+) -> Result<Option<(SecureConnection, TrustedPeer)>, AuthSnowErrors> {
+    let mut stream = &mut incoming_connection.stream;
     let a_key = keys.read().await.a_key.clone();
     // every message exchanged before Noise is appended here so the
     // derived PSK is bound to the whole pre-handshake conversation
@@ -510,11 +800,14 @@ pub async fn auth_incoming(
         .expand(b"CPQHA-psk", secure_psk.as_mut_slice())
         .map_err(|_| AuthSnowErrors::FaledToExpandHkdf)?;
 
-    // copied out so the read lock isn't held during the whole handshake
-    let d_key = keys.read().await.d_key.clone();
-
     // 4. Noise handshake
-    snow_handshake_server(stream, secure_psk, d_key)
-        .await
-        .map_err(|_| AuthSnowErrors::FailedToCompleteSnowHandshake)
+    snow_handshake_server(
+        incoming_connection,
+        secure_psk,
+        device_keypairs,
+        trusted_peers,
+        pair_fallback,
+    )
+    .await
+    .map_err(|_| AuthSnowErrors::FailedToCompleteSnowHandshake)
 }
