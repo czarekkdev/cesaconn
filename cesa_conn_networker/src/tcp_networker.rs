@@ -5,6 +5,7 @@
 
 use core::net::SocketAddr;
 use std::fmt;
+use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -49,6 +50,12 @@ impl ActionType {
             _ => None,
         }
     }
+}
+
+pub struct IncomingConnection {
+    pub name: String,
+    pub stream: TcpStream,
+    pub ip_addr: IpAddr,
 }
 
 /// All errors that can occur in the TCP networker layer.
