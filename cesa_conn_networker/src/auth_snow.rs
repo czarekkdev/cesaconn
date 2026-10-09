@@ -28,7 +28,7 @@ const SNOW_TAG_LEN: usize = 16;
 /// read/write timeout (seconds)
 pub const TIMEOUT: u64 = 5;
 
-pub const PARING_TIMEOUT: u64 = 60;
+pub const PAIRING_TIMEOUT: u64 = 60;
 
 use crate::{
     auth_snow::Tags::{MLDSA87SignatureTag, MLDSA87VerificationKeyTag},
@@ -69,7 +69,7 @@ pub enum AuthSnowErrors {
     /// SPAKE2 could not derive the shared key from the peer's message.
     FailedToFinishSpake2Exchange,
     /// HKDF expand failed (requested output length too long).
-    FaledToExpandHkdf,
+    FailedToExpandHkdf,
     /// A slice/vector did not have the length required for a fixed-size array.
     FailedToConvertToArray,
     /// The Noise protocol name string could not be parsed.
@@ -85,7 +85,7 @@ pub enum AuthSnowErrors {
     /// A Noise message could not be produced (e.g. output buffer too small).
     FailedToWriteSnowMessage,
     /// The handshake was not finished when switching to transport mode.
-    FailedToEnterTansportMode,
+    FailedToEnterTransportMode,
     /// The SPAKE2 message exchange with the peer failed.
     FailedToExchangeSpake2,
     /// The SPAKE2 key confirmation step failed.
@@ -113,7 +113,7 @@ pub enum AuthSnowErrors {
     FailedToVerifySignature,
     FailedToSignData,
     FailedToWriteToSecureConnection,
-    ParingTimeout,
+    PairingTimeout,
 }
 
 impl fmt::Display for AuthSnowErrors {
@@ -123,7 +123,7 @@ impl fmt::Display for AuthSnowErrors {
                 write!(f, "failed to read from stream")
             }
             AuthSnowErrors::FailedToWriteToStream => write!(f, "failed to write to stream"),
-            AuthSnowErrors::FaledToExpandHkdf => write!(f, "failed to expand hkdf"),
+            AuthSnowErrors::FailedToExpandHkdf => write!(f, "failed to expand hkdf"),
             AuthSnowErrors::FailedToFinishSpake2Exchange => {
                 write!(f, "failed to finish spake2 exchange")
             }
@@ -151,7 +151,7 @@ impl fmt::Display for AuthSnowErrors {
             AuthSnowErrors::FailedToWriteSnowMessage => {
                 write!(f, "failed to write snow message")
             }
-            AuthSnowErrors::FailedToEnterTansportMode => {
+            AuthSnowErrors::FailedToEnterTransportMode => {
                 write!(f, "failed to enter transport mode")
             }
             AuthSnowErrors::FailedToExchangeSpake2 => {
@@ -161,7 +161,7 @@ impl fmt::Display for AuthSnowErrors {
                 write!(f, "failed to confirm mutual auth in spake2")
             }
             AuthSnowErrors::FailedToConfirmKex => {
-                write!(f, "failed to cofirm key exchange")
+                write!(f, "failed to confirm key exchange")
             }
             AuthSnowErrors::KexFailed => {
                 write!(f, "key exchange failed")
@@ -194,7 +194,7 @@ impl fmt::Display for AuthSnowErrors {
                 write!(f, "failed to pair new device")
             }
             AuthSnowErrors::FailedToVerifySignature => {
-                write!(f, "failed to verify peers signature")
+                write!(f, "failed to verify peer's signature")
             }
             AuthSnowErrors::FailedToSignData => {
                 write!(f, "failed to sign the data")
@@ -202,7 +202,7 @@ impl fmt::Display for AuthSnowErrors {
             AuthSnowErrors::FailedToWriteToSecureConnection => {
                 write!(f, "failed to write data to secure connection")
             }
-            AuthSnowErrors::ParingTimeout => {
+            AuthSnowErrors::PairingTimeout => {
                 write!(f, "pairing timed out")
             }
         }
@@ -666,7 +666,7 @@ async fn snow_handshake_server(
     // handshake complete, switch to encrypted transport
     let transport = builder
         .into_transport_mode()
-        .map_err(|_| AuthSnowErrors::FailedToEnterTansportMode)?;
+        .map_err(|_| AuthSnowErrors::FailedToEnterTransportMode)?;
 
     let mut secure_connection = SecureConnection::new(incoming_connection, transport);
 
@@ -694,11 +694,11 @@ async fn snow_handshake_server(
             let handshake_hash_clone = handshake_hash.clone();
 
             let accept = timeout(
-                Duration::from_secs(PARING_TIMEOUT),
+                Duration::from_secs(PAIRING_TIMEOUT),
                 spawn_blocking(move || pair_fallback(&name_clone, &handshake_hash_clone)),
             )
             .await
-            .map_err(|_| AuthSnowErrors::ParingTimeout)?
+            .map_err(|_| AuthSnowErrors::PairingTimeout)?
             .map_err(|_| AuthSnowErrors::FailedToPairNewDevice)?;
 
             if !accept {
@@ -783,7 +783,7 @@ pub async fn auth_incoming(
 
     SimpleHkdf::<Blake2s256>::new(None, &transcript)
         .expand(&[], transcript_hash.as_mut_slice())
-        .map_err(|_| AuthSnowErrors::FaledToExpandHkdf)?;
+        .map_err(|_| AuthSnowErrors::FailedToExpandHkdf)?;
 
     let mut psk = Zeroizing::new(Vec::new());
 
@@ -798,7 +798,7 @@ pub async fn auth_incoming(
 
     psk_hk
         .expand(b"CPQHA-psk", secure_psk.as_mut_slice())
-        .map_err(|_| AuthSnowErrors::FaledToExpandHkdf)?;
+        .map_err(|_| AuthSnowErrors::FailedToExpandHkdf)?;
 
     // 4. Noise handshake
     snow_handshake_server(

@@ -131,7 +131,7 @@ pub async fn spake2_confirm_mutual_auth_server(
     let mut confirm_expect = Zeroizing::new(vec![0u8; 32]);
 
     hk.expand(b"CPQHA-confirm-client-to-server", &mut confirm_expect)
-        .map_err(|_| AuthSnowErrors::FaledToExpandHkdf)?;
+        .map_err(|_| AuthSnowErrors::FailedToExpandHkdf)?;
 
     // 1. client's confirmation
     let mut confirm_recieved = Zeroizing::new(vec![0u8; 32]);
@@ -151,7 +151,7 @@ pub async fn spake2_confirm_mutual_auth_server(
     let mut confirm_send = Zeroizing::new(vec![0u8; 32]);
 
     hk.expand(b"CPQHA-confirm-server-to-client", &mut confirm_send)
-        .map_err(|_| AuthSnowErrors::FaledToExpandHkdf)?;
+        .map_err(|_| AuthSnowErrors::FailedToExpandHkdf)?;
 
     // 2. our confirmation
     let write = stream.write_all(&confirm_send);
