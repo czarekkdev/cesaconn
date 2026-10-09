@@ -10,7 +10,7 @@
 // use tracing::{debug, error, info, warn};
 // use zeroize::Zeroize;
 
-/// All errors that can occur during authentication.
+// All errors that can occur during authentication.
 // #[derive(Debug, PartialEq)]
 // pub enum AuthErrors {
 //     /// The TCP stream ended or errored before we could read all expected bytes.
