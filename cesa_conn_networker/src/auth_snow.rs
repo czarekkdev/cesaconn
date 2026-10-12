@@ -6,6 +6,9 @@ add chunking to SecureConnection read/write
 persist DeviceKeypairs (private keys encrypted / in the OS keychain)
 sync the trusted peer list between devices, allow revoking one device
 add encrypting/decrypting data with aes256 in SecureConnection with d_key
+always receive the client's verification key in verify_sig_server (compare it with the stored one for known peers), so both sides agree on the message order
+verify the new device's signature before asking the user in pair_fallback; client read timeout must be >= PAIRING_TIMEOUT
+use separate ML-DSA signing contexts for client and server
  */
 
 /* Constant variables for noise protocol */
@@ -476,6 +479,9 @@ impl TrustedPeer {
 /// The handshake hash is unique per connection and identical on both sides,
 /// so a valid signature proves the peer took part in this exact handshake.
 ///
+/// Every key and signature sent or received is appended to `transcript`
+/// in the order listed above.
+///
 /// Returns the client's verification key (the stored one for a known peer,
 /// the received one when pairing).
 async fn verify_sig_server(
@@ -644,6 +650,7 @@ async fn verify_sig_server(
 /// * `trusted_peers` - devices we already paired with
 /// * `pair_fallback` - asks the user to confirm an unknown device; gets its name
 ///   and the handshake hash (to show as words). Runs on a blocking thread.
+/// * `transcript` - the signature exchange is appended to it
 ///
 /// After the handshake, a known peer (found by its static key) must prove itself
 /// with an ML-DSA signature. An unknown peer is only accepted if the user confirms
@@ -831,7 +838,8 @@ pub async fn auth_incoming(
     let mut stream = &mut incoming_connection.stream;
     let a_key = keys.read().await.a_key.clone();
     // every message exchanged before Noise is appended here so the
-    // derived PSK is bound to the whole pre-handshake conversation
+    // derived PSK is bound to the whole pre-handshake conversation;
+    // the signature exchange after Noise is appended too
     let mut transcript = Zeroizing::new(Vec::new());
 
     // 1. SPAKE2
