@@ -32,7 +32,7 @@ pub const TIMEOUT: u64 = 5;
 pub const PAIRING_TIMEOUT: u64 = 60;
 
 use crate::{
-    auth_snow::Tags::{MLDSA87SignatureTag, MLDSA87VerificationKeyTag},
+    auth_snow::Tags::{ClientAcceptTag, MLDSA87SignatureTag, MLDSA87VerificationKeyTag},
     hybrid_kex::hybrid_kex_server,
     spake2::{spake2_confirm_mutual_auth_server, spake2_exchange_server},
     tcp_networker::IncomingConnection,
@@ -121,6 +121,8 @@ pub enum AuthSnowErrors {
     FailedToWriteToSecureConnection,
     /// The user did not confirm the new device within [`PAIRING_TIMEOUT`] seconds.
     PairingTimeout,
+    /// The server didnt get the confirming byte from the client
+    NoClientConfirmation,
 }
 
 impl fmt::Display for AuthSnowErrors {
@@ -212,6 +214,9 @@ impl fmt::Display for AuthSnowErrors {
             AuthSnowErrors::PairingTimeout => {
                 write!(f, "pairing timed out")
             }
+            AuthSnowErrors::NoClientConfirmation => {
+                write!(f, "server didnt recieve pairing confirmation from client")
+            }
         }
     }
 }
@@ -227,6 +232,7 @@ pub enum Tags {
     MLDSA87VerificationKeyTag = 0x02,
     /// ML-DSA-87 signature over the handshake hash (4627 bytes).
     MLDSA87SignatureTag = 0x03,
+    ClientAcceptTag = 0x04,
 }
 
 impl Tags {
@@ -779,6 +785,20 @@ async fn snow_handshake_server(
 
             if !accept {
                 return Err(AuthSnowErrors::FailedToPairNewDevice);
+            }
+
+            // wait for pairing confirmation from client
+            let mut client_accept = vec![0u8; 2];
+
+            let read = secure_connection.read(&mut client_accept, ClientAcceptTag);
+
+            timeout(Duration::from_secs(PAIRING_TIMEOUT), read)
+                .await
+                .map_err(|_| AuthSnowErrors::ReadTimeout)
+                .map_err(|_| AuthSnowErrors::FailedToReadFromSecureConnection)?;
+
+            if client_accept[0] != 0x01 {
+                return Err(AuthSnowErrors::NoClientConfirmation);
             }
 
             let ver_key = verify_sig_server(
