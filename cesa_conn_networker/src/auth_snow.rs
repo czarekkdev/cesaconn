@@ -483,6 +483,7 @@ async fn verify_sig_server(
     handshake_hash: Zeroizing<[u8; 32]>,
     trusted_peer: Option<&TrustedPeer>,
     device_keypairs: &DeviceKeypairs,
+    transcript: &mut Zeroizing<Vec<u8>>,
 ) -> Result<[u8; MLDSA87VerificationKey::len()], AuthSnowErrors> {
     match trusted_peer {
         // known peer: only its signature, checked with the stored key
@@ -496,6 +497,8 @@ async fn verify_sig_server(
                 .await
                 .map_err(|_| AuthSnowErrors::ReadTimeout)?
                 .map_err(|_| AuthSnowErrors::FailedToReadFromSecureConnection)?;
+
+            transcript.extend_from_slice(&sig_buffer);
 
             let signature = MLDSA87Signature::new(
                 *sig_buffer
@@ -528,6 +531,9 @@ async fn verify_sig_server(
             .map_err(|_| AuthSnowErrors::FailedToSignData)?
             .as_mut_slice()
             .to_vec();
+
+            transcript.extend_from_slice(ver_key);
+            transcript.extend_from_slice(&signature);
 
             let send = secure_connection.write(ver_key, MLDSA87VerificationKeyTag);
 
@@ -566,6 +572,9 @@ async fn verify_sig_server(
                 .map_err(|_| AuthSnowErrors::ReadTimeout)?
                 .map_err(|_| AuthSnowErrors::FailedToReadFromSecureConnection)?;
 
+            transcript.extend_from_slice(&ver_buffer);
+            transcript.extend_from_slice(&sig_buffer);
+
             let verification_key = MLDSA87VerificationKey::new(
                 *ver_buffer
                     .as_array()
@@ -603,6 +612,9 @@ async fn verify_sig_server(
             .map_err(|_| AuthSnowErrors::FailedToSignData)?
             .as_mut_slice()
             .to_vec();
+
+            transcript.extend_from_slice(ver_key);
+            transcript.extend_from_slice(&signature);
 
             let send = secure_connection.write(ver_key, MLDSA87VerificationKeyTag);
 
@@ -646,6 +658,7 @@ async fn snow_handshake_server(
     device_keypairs: &DeviceKeypairs,
     trusted_peers: TrustedPeers,
     pair_fallback: fn(&String, &[u8; 32]) -> bool,
+    transcript: &mut Zeroizing<Vec<u8>>,
 ) -> Result<Option<(SecureConnection, TrustedPeer)>, AuthSnowErrors> {
     let stream = &mut incoming_connection.stream;
 
@@ -738,6 +751,7 @@ async fn snow_handshake_server(
                 handshake_hash,
                 Some(&device),
                 device_keypairs,
+                transcript,
             )
             .await
             .map_err(|_| AuthSnowErrors::FailedToVerifySignature)?;
@@ -765,6 +779,7 @@ async fn snow_handshake_server(
                 handshake_hash,
                 None,
                 device_keypairs,
+                transcript,
             )
             .await
             .map_err(|_| AuthSnowErrors::FailedToVerifySignature)?;
@@ -866,6 +881,7 @@ pub async fn auth_incoming(
         device_keypairs,
         trusted_peers,
         pair_fallback,
+        &mut transcript,
     )
     .await
     .map_err(|_| AuthSnowErrors::FailedToCompleteSnowHandshake)
