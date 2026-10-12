@@ -521,7 +521,7 @@ async fn verify_sig_server(
             verify(
                 &MLDSA87VerificationKey::new(peer.mldsa_verification_key.clone()),
                 handshake_hash.as_slice(),
-                b"CesaConn Handshake",
+                b"CesaConn Client Handshake",
                 &signature,
             )
             .map_err(|_| AuthSnowErrors::FailedToVerifySignature)?;
@@ -537,7 +537,7 @@ async fn verify_sig_server(
             let mut signature = sign(
                 &device_keypairs.mldsa_kep.signing_key,
                 handshake_hash.as_slice(),
-                b"CesaConn Handshake",
+                b"CesaConn Server Handshake",
                 *random_array::<32>().map_err(|_| AuthSnowErrors::FailedToSignData)?,
             )
             .map_err(|_| AuthSnowErrors::FailedToSignData)?
@@ -602,7 +602,7 @@ async fn verify_sig_server(
             verify(
                 &verification_key,
                 handshake_hash.as_slice(),
-                b"CesaConn Handshake",
+                b"CesaConn Client Handshake",
                 &signature,
             )
             .map_err(|_| AuthSnowErrors::FailedToVerifySignature)?;
@@ -618,7 +618,7 @@ async fn verify_sig_server(
             let mut signature = sign(
                 &device_keypairs.mldsa_kep.signing_key,
                 handshake_hash.as_slice(),
-                b"CesaConn Handshake",
+                b"CesaConn Server Handshake",
                 *random_array::<32>().map_err(|_| AuthSnowErrors::FailedToSignData)?,
             )
             .map_err(|_| AuthSnowErrors::FailedToSignData)?
