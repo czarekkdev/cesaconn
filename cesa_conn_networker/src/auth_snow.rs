@@ -8,7 +8,6 @@ sync the trusted peer list between devices, allow revoking one device
 add encrypting/decrypting data with aes256 in SecureConnection with d_key
 always receive the client's verification key in verify_sig_server (compare it with the stored one for known peers), so both sides agree on the message order
 verify the new device's signature before asking the user in pair_fallback; client read timeout must be >= PAIRING_TIMEOUT
-use separate ML-DSA signing contexts for client and server
  */
 
 /* Constant variables for noise protocol */
@@ -32,7 +31,7 @@ pub const TIMEOUT: u64 = 5;
 pub const PAIRING_TIMEOUT: u64 = 60;
 
 use crate::{
-    auth_snow::Tags::{ClientAcceptTag, MLDSA87SignatureTag, MLDSA87VerificationKeyTag},
+    auth_snow::Tags::{ClientAcceptTag, IsSavedTag, MLDSA87SignatureTag, MLDSA87VerificationKeyTag},
     hybrid_kex::hybrid_kex_server,
     spake2::{spake2_confirm_mutual_auth_server, spake2_exchange_server},
     tcp_networker::IncomingConnection,
@@ -232,7 +231,10 @@ pub enum Tags {
     MLDSA87VerificationKeyTag = 0x02,
     /// ML-DSA-87 signature over the handshake hash (4627 bytes).
     MLDSA87SignatureTag = 0x03,
+    /// Client accepted to pair
     ClientAcceptTag = 0x04,
+    /// For checking whether other party has us saved
+    IsSavedTag = 0x05,
 }
 
 impl Tags {
@@ -750,12 +752,26 @@ async fn snow_handshake_server(
     let mut secure_connection = SecureConnection::new(incoming_connection, transport);
 
     // cloned, so the read lock is released before any network I/O
-    let new_device = trusted_peers
+    let mut new_device = trusted_peers
         .read()
         .await
         .iter()
         .find(|device| device.x25519_pub_key.ct_eq(&peer_static).into())
         .cloned();
+
+    // check if client have us saved
+    let mut is_saved = vec![0u8; 2];
+
+    let read = secure_connection.read(&mut is_saved, IsSavedTag);
+
+    timeout(Duration::from_secs(TIMEOUT), read)
+        .await
+        .map_err(|_| AuthSnowErrors::ReadTimeout)?
+        .map_err(|_| AuthSnowErrors::FailedToReadFromSecureConnection)?;
+
+    if is_saved[0] != 0x01 {
+        new_device = None;
+    }
 
     let trusted_peer = match new_device {
         Some(device) => {
