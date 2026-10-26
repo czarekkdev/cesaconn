@@ -185,10 +185,13 @@ def check_clippy() -> ToolResult:
         flags += ["-D", l]
     broken = []
     for crate in CRATES:
-        # --all-features: feature-gated code (e.g. test-commands) must be analysed too
-        code, out, err = run(["cargo", "clippy", "-p", crate, "--all-targets", "--all-features",
-                              "--message-format=json",
-                              "--", *flags], timeout=1800)
+        # both feature sets: code behind a feature (e.g. test-commands) and code
+        # behind cfg(not(feature)) (the default build) must each be analysed
+        out = ""
+        for features in ([], ["--all-features"]):
+            _, o, _ = run(["cargo", "clippy", "-p", crate, "--all-targets", *features,
+                           "--message-format=json", "--", *flags], timeout=1800)
+            out += o + "\n"
         build_errors = 0
         seen = set()
         for line in out.splitlines():

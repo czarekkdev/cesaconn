@@ -24,9 +24,12 @@ GET RID OF STORING KEYS IN RAM
  */
 
 mod auth_snow;
+#[cfg(unix)]
+mod daemon;
 mod guess_limiter;
 mod hybrid_kex;
-mod ipc_unix;
+#[cfg(unix)]
+mod ipc_server;
 mod spake2;
 mod tcp_networker;
 #[cfg(feature = "test-commands")]
@@ -53,12 +56,21 @@ async fn main() {
 
     let args: Vec<String> = env::args().collect();
 
+    // a subcommand runs the manual tests, no subcommand runs the daemon
     #[cfg(feature = "test-commands")]
-    test_commands::run(&args).await;
-
-    #[cfg(not(feature = "test-commands"))]
-    {
-        let _ = args;
-        tracing::error!("no daemon yet; the test commands need `--features test-commands`");
+    if args.len() > 1 {
+        test_commands::run(&args).await;
+        return;
     }
+
+    if let Some(arg) = args.get(1) {
+        tracing::error!(%arg, "unknown argument (test commands need `--features test-commands`)");
+        return;
+    }
+
+    #[cfg(unix)]
+    daemon::run().await;
+
+    #[cfg(not(unix))]
+    tracing::error!("the daemon is not supported on this platform yet");
 }
