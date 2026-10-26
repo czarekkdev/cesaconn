@@ -122,7 +122,7 @@ Why this is safe:
   then caught by the SPAKE2 confirmation, not only implicitly through
   differing keys.
 
-Privacy cost (**DECISION 1**):
+Privacy cost (**decided: option (a), the invite window**):
 - Anyone on the LAN who connects can read `a_salt`, and it is stable, so it
   works as a group identifier that can link your devices across networks.
 - Mitigation options:
@@ -298,21 +298,71 @@ audit.
 
 ---
 
-## C. Decisions needed from you
+## Part S: storage (decided)
 
-1. Salt query privacy: (a) answer only during an invite window
-   (recommended), or (b) always answer.
-2. Clipboard access: (a) `arboard` (recommended, after an audit), or
-   (b) our own platform code.
-3. Delivery: (a) a new connection per update in v1 (recommended), or (b) a
-   persistent session now.
-4. Defaults:
-   - `JOIN_WINDOW` 5 min, `JOIN_MAX_ATTEMPTS` 5, invite window 2 min;
-   - `CLIP_MAX_LEN` 1 MiB, debounce 300 ms;
-   - Ack on.
-5. Still open from the roadmap, and unblocking all of this: where keys and
-   salts are stored (OS keychain or encrypted file). Until then a daemon
-   restart forgets the group, and you have to re-enter the passwords.
+Nothing is stored unencrypted, configs included.
+
+| What | Where |
+|---|---|
+| `d_key` | daemon RAM only (`Zeroizing`); with automatic login, also the OS keychain |
+| `d_salt` + storage salt | OS keychain (device-only, never synced) |
+| `a_key`, `a_salt`, device identity, trusted peers, config | the **vault file**, encrypted |
+
+The vault file uses envelope encryption:
+- `KEK = HKDF-BLAKE2s(ikm = d_key, salt = storage salt, info = "cesaconn-storage-v1")`.
+  The KEK never uses `d_key` directly, and it is useless on the network.
+- A random 32-byte DEK encrypts the payload with AES-256-GCM. The KEK only
+  wraps the DEK, so changing the data password re-wraps 32 bytes.
+- The magic and version are in the AAD of both layers, with a different
+  label per layer.
+- The payload is padded to 4 KiB blocks, so the file size doesn't reveal
+  how many peers or how much config it holds.
+- Writes go to a temp file (0600, `O_EXCL`), which is fsynced and then
+  atomically renamed, and the directory is fsynced. The directory is 0700
+  and checked like the IPC directory. Reads are bounded and checked before
+  allocating.
+- The only plaintext in the file is format metadata: magic, version, the
+  random nonces and the ciphertexts. No salt, key, config value or length
+  of contents.
+
+Lifecycle:
+- First setup: when both keys are set, the daemon creates the storage salt
+  and the DEK, stores the two salts in the keychain, and writes the vault.
+- Restart: the vault is **locked**. The UI asks for the data password; the
+  daemon reads `d_salt` from the keychain, derives `d_key` and the KEK, and
+  opens the vault. A wrong password fails the GCM tag on the DEK wrap, and
+  the daemon answers `WrongPassword`.
+- Automatic login: opt-in, after this warning: *"Your data key will be
+  stored in the OS keychain. Its security then depends on your operating
+  system and account: anyone who can unlock your user session can use it.
+  We can't vouch for that."* On start, the daemon unlocks with the keychain
+  `d_key`. Turning it off deletes the keychain item.
+- Changing the data password re-wraps the DEK, and updates the keychain
+  `d_key` if automatic login is on.
+
+Known costs:
+- Anyone holding the vault file **and** the keychain salts can try data
+  passwords offline, at Argon2 speed (64 MiB per guess). Today that isn't
+  possible, so the UI asks for a minimum length and shows a strength hint.
+- On macOS, unsigned dev builds use the login keychain with iCloud sync
+  off. Signed releases move to the data-protection keychain with
+  `WhenUnlockedThisDeviceOnly`; that needs the entitlement that comes with
+  release signing.
+- Linux needs a Secret Service backend, which is a new dependency and a
+  separate decision. Until it exists, Linux stays RAM-only and the UI says
+  so. Headless Linux has no Secret Service.
+- A forgotten data password means the vault can't be opened. A "reset"
+  (delete the vault and re-join the group) comes with the group work.
+
+## C. Decisions
+
+1. Salt query privacy: **decided, the invite window (2 min).**
+2. Clipboard access: deferred.
+3. Clipboard delivery: deferred.
+4. Defaults: `JOIN_WINDOW` 5 min and `JOIN_MAX_ATTEMPTS` 5 are agreed. The
+   clipboard defaults come with clipboard.
+5. Storage: **decided**, see Part S.
+6. Still open: the Linux keychain backend (Secret Service crate).
 
 ## D. Implementation plan (after review), one stacked PR each
 
