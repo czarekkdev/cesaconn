@@ -310,6 +310,16 @@ def check_gitleaks(git_range: str | None) -> ToolResult:
 
 
 # ---- miri -------------------------------------------------------------------
+PASSED_RE = re.compile(r"test result: \w+\. (\d+) passed; (\d+) failed")
+
+
+def count_tests(text: str) -> str:
+    p = f = 0
+    for m in PASSED_RE.finditer(text):
+        p, f = p + int(m.group(1)), f + int(m.group(2))
+    return f"{p} tests passed, {f} failed"
+
+
 UB_RE = re.compile(r"error: (Undefined Behavior|unsupported operation)[^\n]*", re.I)
 
 
@@ -325,6 +335,7 @@ def check_miri() -> ToolResult:
                              env={"MIRIFLAGS": "-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check"},
                              timeout=int(os.environ.get("CESA_MIRI_TIMEOUT", "2400")))
         text = out + err
+        r.note = (r.note + "; " if r.note else "") + f"{crate}: {count_tests(text)}"
         for m in UB_RE.finditer(text):
             sev = "critical" if m.group(1).lower().startswith("undefined") else "info"
             loc = re.search(r"--> ([^\s:]+):(\d+)", text[m.end():m.end() + 2000])
@@ -361,6 +372,7 @@ def check_tsan() -> ToolResult:
         if "could not compile" in text:
             broken.append(crate)
             continue
+        r.note = (r.note + "; " if r.note else "") + f"{crate}: {count_tests(text)}"
         seen = set()
         for m in TSAN_RE.finditer(text):
             kind = m.group(1).strip()
