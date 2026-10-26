@@ -64,14 +64,20 @@ RNG. They are created once by the first device.
    pw1 and pw2 in `Zeroizing` buffers in a **join slot**, for at most
    `JOIN_WINDOW` (proposal: 5 min) or until the join finishes. On timeout,
    cancel, or daemon exit, the slot is wiped.
-4. **Salt fetch** (A.4): the joiner gets `a_salt` from a group member, then
-   derives `a_key` and wipes pw1.
+4. **Salt fetch** (A.4): the joiner gets `a_salt` from a group member and
+   derives a *candidate* `a_key` from it. pw1 stays in the join slot, so a
+   fake or wrong salt can be retried with another member without asking the
+   user again. There are at most `JOIN_MAX_ATTEMPTS` (proposal: 5) salt
+   attempts per window, so a man in the middle can't make the joiner run
+   Argon2 endlessly.
 5. The normal handshake runs: SPAKE2, hybrid KEX, Noise, ML-DSA, and the
    **pairing confirmation** (both users compare the code).
 6. After the handshake succeeds, the member sends `d_salt` over the secure
-   channel (A.5). The joiner derives `d_key` and wipes pw2.
-7. The salts are **committed** only after steps 5 and 6 both succeed.
-   Otherwise they are thrown away and the device stays in join mode.
+   channel (A.5), and the joiner derives `d_key`.
+7. The salts and keys are **committed** only after steps 5 and 6 both
+   succeed. Only then is the join slot (pw1 and pw2) wiped. On failure the
+   candidate salts and keys are wiped, and the device stays in join mode
+   until the window ends.
 
 After that the device behaves like any member: salts and keys sit in daemon
 memory, or in the keychain or encrypted file once storage is decided.
@@ -79,7 +85,10 @@ memory, or in the keychain or encrypted file once storage is decided.
 ### A.4 Salt fetch (pre-auth, `a_salt` only)
 
 This is a separate short TCP exchange on the same port, *before* the real
-handshake, because Argon2 can't run inside the 20 s handshake deadline.
+handshake. That keeps the existing handshake unchanged, and Argon2 runs on
+the joiner between the two connections, never inside a handshake that an
+unauthenticated peer can trigger. The member does no Argon2 work for a
+salt query.
 
 ```
 joiner -> member : SALT_QUERY_MAGIC (8) || version (1)
@@ -88,11 +97,13 @@ member -> joiner : a_salt (32)
 ```
 
 - The member answers only if it has a group, and only within the existing
-  connection cap and `guess_limiter` lockout. Each IP gets at most one
-  answer per N seconds.
+  connection cap and `guess_limiter` lockout. Each IP (IPv6: /64) gets at
+  most one answer per 5 s.
 - The query itself is not a password guess, so the guess counter is not
   touched.
 - **`d_salt` is never sent before authentication.**
+- Timeouts: each read has the 5 s `TIMEOUT`, there is one answer per
+  connection, and then the connection closes.
 
 Why this is safe:
 - `a_salt` is public by design. Knowing it gives no offline test of pw1,
@@ -129,7 +140,14 @@ A new `ActionType::GroupSalt = 0x04`, sent only inside an authenticated
 - it goes through the Noise transport only, not the `d_key` layer, because
   the joiner has no `d_key` yet;
 - it is sent only when the peer was just paired with us, *and* that pairing
-  happened while our invite window was open.
+  happened while our invite window was open;
+- the joiner accepts `GroupSalt` only on the **same** connection whose
+  pairing it just confirmed, and only while its join slot is open. It is
+  refused on any other connection and in any other state, so a different
+  (also paired) peer can't swap the data salt later.
+- The two-key model still holds. A peer that knows pw1 but not pw2 can pair
+  and receive `d_salt`, but gains nothing: every data-layer message still
+  needs `d_key`, so it can neither read nor send synced data.
 
 ### A.6 Group membership, rotation, revocation
 
@@ -148,9 +166,21 @@ keys, re-distributed to the remaining devices.
 | `OpenInvite` | `seconds (2)` (capped) | opens the invite window (A.4 option a) |
 | `Status` | adds `group: none / joining / member`, `invite_open` | still no salts or keys |
 
-The `SetAuthPassword` / `SetDataPassword` requests stay for re-entering the
-passwords on an existing member, for example after a restart while storage
-is still RAM-only. The salt is the group salt.
+Bounds for `CreateGroup` / `JoinGroup`: `pw1_len` is at least 1 and at most
+`MAX_PASSWORD_LEN`, pw2 is at least 1 and at most `MAX_PASSWORD_LEN`, and
+the payload must be consumed exactly. Both passwords are decoded into
+separate exact-size `Zeroizing` buffers, never trimmed.
+`MAX_REQUEST_BODY` becomes `1 + 2 + 2 * MAX_PASSWORD_LEN`, still far below
+`MAX_FRAME_LEN`; keep the existing compile-time assert.
+
+The `SetAuthPassword` / `SetDataPassword` requests stay only for a member
+whose daemon still holds the group salts. They always use the group salt and
+never create one.
+
+A restarted daemon with RAM-only storage has lost the salts, so it must
+`JoinGroup` again through another member. If every device restarted, the
+group is gone and a new one is created. Persistent storage (C.5) removes
+this.
 
 ---
 
@@ -176,7 +206,8 @@ The payload (plaintext inside the `d_key` layer) is versioned:
 ```
 version     (1)   = 0x01
 kind        (1)   = 0x01 text/utf-8
-origin_seq  (8)   u64 LE, per-origin counter, strictly increasing
+epoch       (8)   random per sender daemon run (OS RNG)
+origin_seq  (8)   u64 LE, per-epoch counter, strictly increasing
 content_len (4)   u32 LE, 1..=CLIP_MAX_LEN, must equal the remaining length
 content     (content_len)
 ```
@@ -186,14 +217,20 @@ content     (content_len)
 - **Receiver checks**, in this order, each failure dropping the message with
   a uniform error:
   1. the peer is allowed to send ("accept from");
-  2. `len` is at most `14 + CLIP_MAX_LEN + DATA_LAYER_OVERHEAD`, checked
-     before allocating (14 = version + kind + seq + content_len);
+  2. `len` is at most `22 + CLIP_MAX_LEN + DATA_LAYER_OVERHEAD`, checked
+     before allocating (22 = version + kind + epoch + seq + content_len);
   3. the version and kind are known;
   4. `content_len` matches exactly;
   5. the content is valid UTF-8;
-  6. `origin_seq` is greater than the last value seen from that peer, so
-     stale or reordered updates are ignored. Replay is already impossible:
-     the keys are bound to the connection, and Noise uses nonces.
+  6. ordering, per peer:
+     - a new `epoch` (the sender restarted) resets that peer's counter and
+       the message is accepted;
+     - within the same epoch, `origin_seq` must be greater than the last one
+       seen, so stale or reordered updates are ignored.
+     A plain counter would restart at 0 after a sender restart and be
+     dropped as stale forever, which is why the epoch exists. Replay is
+     already impossible: the keys are bound to the connection, and Noise
+     uses nonces.
 - **Ack** (proposal): the receiver answers with one encrypted byte, `0x00`
   for applied or `0x01` for ignored, so the sender can log delivery. Without
   it the protocol stays fire-and-forget.
@@ -206,9 +243,9 @@ content     (content_len)
   memory. A local change matching `last_applied` is not sent.
   - The hash is **keyed** so that a leaked hash can't be used to brute-force
     whatever was in the clipboard (passwords end up there).
-- **Ordering:** the last writer wins by `(origin_seq, peer fingerprint)`. A
-  simple per-origin counter is enough for clipboards; there are no vector
-  clocks in v1.
+- **Ordering:** within one sender, `(epoch, origin_seq)` as above. Across
+  senders, the last one applied wins. There are no vector clocks in v1;
+  for a clipboard, "latest arrival wins" is the expected behaviour.
 - **Debounce:** wait about 300 ms after a local change and send only the
   latest value.
 
@@ -270,7 +307,7 @@ audit.
 3. Delivery: (a) a new connection per update in v1 (recommended), or (b) a
    persistent session now.
 4. Defaults:
-   - `JOIN_WINDOW` 5 min, invite window 2 min;
+   - `JOIN_WINDOW` 5 min, `JOIN_MAX_ATTEMPTS` 5, invite window 2 min;
    - `CLIP_MAX_LEN` 1 MiB, debounce 300 ms;
    - Ack on.
 5. Still open from the roadmap, and unblocking all of this: where keys and
@@ -285,8 +322,8 @@ audit.
 2. The salt query (A.4), the invite window, and `a_salt` in the SPAKE2
    transcript.
 3. `GroupSalt` after auth (A.5), plus the commit-only-after-pairing rule.
-4. The daemon starts the networker. This needs storage decision 1 and the
-   pairing prompt over IPC.
+4. The daemon starts the networker. This needs the storage decision (C.5)
+   and the pairing prompt over IPC.
 5. Clipboard v1 (Part B).
 
 Every step gets tests for its failure paths (fake salt, expired window,
