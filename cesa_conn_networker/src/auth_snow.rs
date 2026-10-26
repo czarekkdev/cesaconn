@@ -312,6 +312,9 @@ impl SecureConnection {
     pub async fn read(&mut self, buffer: &mut Vec<u8>, tag: Tags) -> Result<usize, AuthSnowErrors> {
         let mut message = Zeroizing::new(vec![0u8; buffer.len() + SNOW_TAG_LEN]);
 
+        // Every caller wraps `SecureConnection::read` in `timeout(...)` (TIMEOUT /
+        // PAIRING_TIMEOUT), so this low-level read deliberately has none of its own.
+        // nosemgrep: cesa.net.read-without-timeout
         self.connection
             .stream
             .read_exact(&mut message)
@@ -369,11 +372,12 @@ impl Keys {
         *self.d_key = *data.d_key;
     }
 
-    /// Wraps two raw 32-byte arrays in `Zeroizing` so they are wiped from memory on drop.
-    pub fn new(a_key: [u8; 32], d_key: [u8; 32]) -> Self {
+    /// Copies two 32-byte keys into `Zeroizing` so they are wiped from memory on drop.
+    /// Taken by reference so callers don't leave an extra un-wiped copy behind.
+    pub fn new(a_key: &[u8; 32], d_key: &[u8; 32]) -> Self {
         Self {
-            a_key: Zeroizing::new(a_key),
-            d_key: Zeroizing::new(d_key),
+            a_key: Zeroizing::new(*a_key),
+            d_key: Zeroizing::new(*d_key),
         }
     }
 }

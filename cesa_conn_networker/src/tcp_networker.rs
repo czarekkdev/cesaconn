@@ -12,6 +12,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
 use tokio::sync::RwLock;
 use tokio::task::spawn_blocking;
+use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -51,6 +52,11 @@ impl ActionType {
         }
     }
 }
+
+/// Max time to wait for the init header after authentication.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Max time to receive one data packet (up to `MAX_DATA_PACKET_LEN`).
+const DATA_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Upper bound for one encrypted data packet declared in the init header.
 /// Larger payloads must be chunked (see the chunking TODO in auth_snow).
@@ -171,10 +177,16 @@ pub async fn recv_handler(
     let e_init_buf = &mut [0u8; 37];
 
     debug!(%peer_addr, "phase 2: reading encrypted init header (37 bytes)");
-    connection_mut.read_exact(e_init_buf).await.map_err(|e| {
-        error!(%peer_addr, error = %e, "failed to read encrypted init header from stream");
-        TcpNetworkerErrors::FailedToReadFromStream
-    })?;
+    timeout(HEADER_READ_TIMEOUT, connection_mut.read_exact(e_init_buf))
+        .await
+        .map_err(|_| {
+            warn!(%peer_addr, "timed out waiting for the init header");
+            TcpNetworkerErrors::FailedToReadFromStream
+        })?
+        .map_err(|e| {
+            error!(%peer_addr, error = %e, "failed to read encrypted init header from stream");
+            TcpNetworkerErrors::FailedToReadFromStream
+        })?;
 
     // Decrypt using the session key — GCM tag verification catches any in-transit tampering.
     debug!(%peer_addr, "decrypting init header with session key");
@@ -207,9 +219,12 @@ pub async fn recv_handler(
     let mut e_t_data_buf = vec![0u8; size_usize];
 
     debug!(%peer_addr, size, "phase 3a: reading double-encrypted data packet");
-    connection_mut
-        .read_exact(&mut e_t_data_buf)
+    timeout(DATA_READ_TIMEOUT, connection_mut.read_exact(&mut e_t_data_buf))
         .await
+        .map_err(|_| {
+            warn!(%peer_addr, expected_bytes = size, "timed out reading the data packet");
+            TcpNetworkerErrors::FailedToReadFromStream
+        })?
         .map_err(|e| {
             error!(%peer_addr, error = %e, expected_bytes = size, "failed to read double-encrypted data packet from stream");
             TcpNetworkerErrors::FailedToReadFromStream
@@ -561,7 +576,7 @@ mod tests {
         trusted: Vec<SocketAddr>,
     ) -> (Arc<RwLock<Keys>>, Arc<RwLock<Vec<SocketAddr>>>) {
         (
-            Arc::new(RwLock::new(Keys::new(a_key, d_key))),
+            Arc::new(RwLock::new(Keys::new(&a_key, &d_key))),
             Arc::new(RwLock::new(trusted)),
         )
     }
@@ -803,7 +818,7 @@ mod tests {
         // auth_outgoing sends the wrong key then reads the server's response.
         // When the server closes without responding, auth_outgoing returns Err(FailedToReadFromStream)
         // instead of panicking — so the client task exits cleanly.
-        let wrong_a_key = Arc::new(RwLock::new(Keys::new([0x00u8; 32], [0u8; 32])));
+        let wrong_a_key = Arc::new(RwLock::new(Keys::new(&[0x00u8; 32], &[0u8; 32])));
         let wrong_trusted = Arc::new(RwLock::new(vec![peer_addr]));
         let _ = auth_outgoing(wrong_a_key, wrong_trusted, (&mut client, peer_addr)).await;
 
@@ -1031,13 +1046,13 @@ mod tests {
         // Client's trusted list starts with just the server addr.
         let trusted = Arc::new(RwLock::new(vec![server_addr]));
         let trusted_clone = Arc::clone(&trusted);
-        let keys = Arc::new(RwLock::new(Keys::new(TEST_A_KEY, TEST_D_KEY)));
+        let keys = Arc::new(RwLock::new(Keys::new(&TEST_A_KEY, &TEST_D_KEY)));
 
         // Server side: recv_handler waits for data that never comes — it will get EOF
         // when connect_handler returns after auth (ConnectNewDevice shortcut).
         let server_task = tokio::spawn(recv_handler(
             (server_stream, peer_addr),
-            Arc::new(RwLock::new(Keys::new(TEST_A_KEY, TEST_D_KEY))),
+            Arc::new(RwLock::new(Keys::new(&TEST_A_KEY, &TEST_D_KEY))),
             Arc::new(RwLock::new(vec![client_addr])),
         ));
 
@@ -1067,7 +1082,7 @@ mod tests {
     #[tokio::test]
     async fn test_connect_cancels_before_connecting() {
         let token = CancellationToken::new();
-        let keys = Arc::new(RwLock::new(Keys::new(TEST_A_KEY, TEST_D_KEY)));
+        let keys = Arc::new(RwLock::new(Keys::new(&TEST_A_KEY, &TEST_D_KEY)));
         let trusted = Arc::new(RwLock::new(vec![]));
 
         token.cancel(); // cancel before calling connect
@@ -1088,7 +1103,7 @@ mod tests {
     /// Connecting to a closed port must return FailedToConnect.
     #[tokio::test]
     async fn test_connect_to_closed_port_fails() {
-        let keys = Arc::new(RwLock::new(Keys::new(TEST_A_KEY, TEST_D_KEY)));
+        let keys = Arc::new(RwLock::new(Keys::new(&TEST_A_KEY, &TEST_D_KEY)));
         let trusted = Arc::new(RwLock::new(vec![]));
         let token = CancellationToken::new();
 

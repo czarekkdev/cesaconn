@@ -81,8 +81,11 @@ async fn main() {
                 let len = test_psw.len().min(32);
                 salt[0..len].copy_from_slice(&test_psw[..len]);
                 let raw_key = derive_key(test_psw, salt).unwrap(); // Zeroizing: wiped on drop
-                let keys = Arc::new(RwLock::new(Keys::new(*raw_key, *raw_key)));
+                let keys = Arc::new(RwLock::new(Keys::new(&raw_key, &raw_key)));
 
+                // Test server: peers on the LAN must reach it; every connection is
+                // authenticated before any data is processed.
+                // nosemgrep: cesa.net.bind-all-interfaces
                 let listener = TcpListener::bind("0.0.0.0:3232").await.unwrap();
                 let trusted_addrs: Arc<RwLock<Vec<SocketAddr>>> = Arc::new(RwLock::new(Vec::new()));
                 let cancellation_token = CancellationToken::new();
@@ -142,7 +145,7 @@ async fn main() {
                 salt[0..len].copy_from_slice(&test_psw[..len]);
 
                 let raw_key = derive_key(test_psw, salt).unwrap(); // Zeroizing: wiped on drop
-                let keys = Arc::new(RwLock::new(Keys::new(*raw_key, *raw_key)));
+                let keys = Arc::new(RwLock::new(Keys::new(&raw_key, &raw_key)));
 
                 let trusted_addrs = Arc::new(RwLock::new(Vec::new()));
 

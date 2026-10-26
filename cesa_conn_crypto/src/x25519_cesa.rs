@@ -12,10 +12,11 @@ pub struct X25519KeyPair {
 
 impl X25519KeyPair {
     /// Wraps raw public and private key bytes in [`Zeroizing`].
-    pub fn new(pub_key: [u8; 32], priv_key: [u8; 32]) -> Self {
+    /// The private key is taken by reference so no extra un-wiped copy is made.
+    pub fn new(pub_key: [u8; 32], priv_key: &[u8; 32]) -> Self {
         Self {
             public: Zeroizing::new(pub_key),
-            private: Zeroizing::new(priv_key),
+            private: Zeroizing::new(*priv_key),
         }
     }
 }
@@ -59,7 +60,7 @@ pub fn hash_key(shared_key: &[u8; 32]) -> [u8; 32] {
 pub fn generate_new_key_pair(random_data: [u8; 32]) -> X25519KeyPair {
     let pub_key = Zeroizing::new(calculate_public_key(&random_data));
 
-    X25519KeyPair::new(*pub_key, *&random_data)
+    X25519KeyPair::new(*pub_key, &random_data)
 }
 
 #[cfg(test)]
@@ -218,7 +219,7 @@ mod tests {
     fn test_key_pair_new_stores_both_fields() {
         let pub_bytes = [0xAAu8; 32];
         let priv_bytes = [0xBBu8; 32];
-        let pair = X25519KeyPair::new(pub_bytes, priv_bytes);
+        let pair = X25519KeyPair::new(pub_bytes, &priv_bytes);
         assert_eq!(*pair.public, pub_bytes);
         assert_eq!(*pair.private, priv_bytes);
     }
@@ -227,7 +228,7 @@ mod tests {
     #[test]
     fn test_key_pair_new_same_values_independent() {
         let bytes = [0x42u8; 32];
-        let pair = X25519KeyPair::new(bytes, bytes);
+        let pair = X25519KeyPair::new(bytes, &bytes);
         assert_eq!(*pair.public, bytes);
         assert_eq!(*pair.private, bytes);
     }

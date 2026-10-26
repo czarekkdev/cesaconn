@@ -82,6 +82,10 @@ rules:
       forever (slowloris). Wrap it: `timeout(Duration::from_secs(T), $S.$M(...)).await`.
     patterns:
       - pattern: $S.$M(...).await
+      - pattern-not: $M(...).await
+      # an imported free fn `recv(...)` is name-resolved by semgrep as `recv.recv(...)`
+      - metavariable-comparison:
+          comparison: str($S) != str($M)
       - metavariable-regex:
           metavariable: $M
           regex: ^(read_exact|read|read_buf|read_to_end|read_to_string|read_u8|read_u16|read_u32|read_u64|read_line|recv|recv_from|peek)$

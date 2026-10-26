@@ -51,9 +51,13 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::RwLock,
 };
+use tokio::time::{Duration, timeout};
 use tokio_util::future::FutureExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+/// Max time to wait for the other side of an IPC exchange to send its next message.
+const IPC_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Max size of the trusted-address list received over IPC (4096 IPv4 addresses).
 const MAX_TRUSTED_ADDRS_LEN: u64 = 4096 * 4;
@@ -524,9 +528,9 @@ pub async fn ipc_recv(
     info!(peer_name = %peer_name, "Authorized peer connected, reading message size");
 
     let mut size_buffer = [0u8; 8];
-    stream
-        .read_exact(&mut size_buffer)
+    timeout(IPC_READ_TIMEOUT, stream.read_exact(&mut size_buffer))
         .await
+        .map_err(|_| IpcErrors::FailedToReadDataFromStream)?
         .map_err(|_| IpcErrors::FailedToReadDataFromStream)?;
 
     let size = u64::from_le_bytes(size_buffer);
@@ -553,11 +557,13 @@ pub async fn ipc_recv(
         .map_err(|_| IpcErrors::FailedToWriteToStream)?;
 
     debug!(size, "reading message data");
-    let mut buffer = vec![0u8; size as usize];
+    // Bounded to 64 KiB above, so the conversion cannot fail on any target.
+    let size = usize::try_from(size).map_err(|_| IpcErrors::DataTooLarge)?;
+    let mut buffer = vec![0u8; size];
 
-    stream
-        .read_exact(&mut buffer)
+    timeout(IPC_READ_TIMEOUT, stream.read_exact(&mut buffer))
         .await
+        .map_err(|_| IpcErrors::FailedToReadDataFromStream)?
         .map_err(|_| IpcErrors::FailedToReadDataFromStream)?;
 
     debug!(data_len = buffer.len(), "message data received, processing");
@@ -734,9 +740,9 @@ pub async fn handle_data_server(
                 .map_err(|_| IpcErrors::FailedToWriteToStream)?;
 
             // Step 4: Wait for client confirmation (0x01 = accept, 0x00 = reject/wrong size).
-            stream
-                .read_exact(&mut confirm_byte)
+            timeout(IPC_READ_TIMEOUT, stream.read_exact(&mut confirm_byte))
                 .await
+                .map_err(|_| IpcErrors::FailedToReadDataFromStream)?
                 .map_err(|_| IpcErrors::FailedToReadDataFromStream)?;
 
             if confirm_byte[0] == 0x00 {
@@ -884,13 +890,14 @@ pub async fn ipc_action(
                 .collect();
 
             // Merge: only add addresses not already present in the local list.
-            let trusted_addrs_clone = trusted_addrs.read().await.clone();
-
-            trusted_addrs.write().await.extend(
-                addresses
-                    .into_iter()
-                    .filter(|addr| !trusted_addrs_clone.contains(addr)),
-            );
+            // Check and insert under ONE write guard so a concurrent update can't
+            // slip in between (no duplicates, no lost updates).
+            let mut trusted = trusted_addrs.write().await;
+            for addr in addresses {
+                if !trusted.contains(&addr) {
+                    trusted.push(addr);
+                }
+            }
         }
 
         // TODO: implement AddTrustedDevice, UpdateAuthPassword, UpdateDataPassword, Default
@@ -1376,7 +1383,7 @@ mod tests {
         use crate::auth_old::{Keys, Salts};
         use std::os::unix::net::UnixStream as StdUnixStream;
         let (mut client, _server) = StdUnixStream::pair().unwrap();
-        let keys = Arc::new(RwLock::new(Keys::new([0u8; 32], [0u8; 32])));
+        let keys = Arc::new(RwLock::new(Keys::new(&[0u8; 32], &[0u8; 32])));
         let salts = Arc::new(RwLock::new(Salts::new([0u8; 32], [0u8; 32])));
         let trusted_addrs = Arc::new(RwLock::new(Vec::<std::net::SocketAddr>::new()));
         let result = ipc_action(ActionType::Default, &[], trusted_addrs, keys, salts, &mut client).await;
@@ -1389,7 +1396,7 @@ mod tests {
         use crate::auth_old::{Keys, Salts};
         use std::os::unix::net::UnixStream as StdUnixStream;
         let (mut client, _server) = StdUnixStream::pair().unwrap();
-        let keys = Arc::new(RwLock::new(Keys::new([0u8; 32], [0u8; 32])));
+        let keys = Arc::new(RwLock::new(Keys::new(&[0u8; 32], &[0u8; 32])));
         let salts = Arc::new(RwLock::new(Salts::new([0u8; 32], [0u8; 32])));
         let trusted_addrs = Arc::new(RwLock::new(Vec::<std::net::SocketAddr>::new()));
         // payload: 4 bytes for IPv4 (action byte already stripped by caller)
@@ -1404,7 +1411,7 @@ mod tests {
         use crate::auth_old::{Keys, Salts};
         use std::os::unix::net::UnixStream as StdUnixStream;
         let (mut client, _server) = StdUnixStream::pair().unwrap();
-        let keys = Arc::new(RwLock::new(Keys::new([0u8; 32], [0u8; 32])));
+        let keys = Arc::new(RwLock::new(Keys::new(&[0u8; 32], &[0u8; 32])));
         let salts = Arc::new(RwLock::new(Salts::new([0u8; 32], [0u8; 32])));
         let trusted_addrs = Arc::new(RwLock::new(Vec::<std::net::SocketAddr>::new()));
         // payload: 32 key bytes + 32 salt bytes
@@ -1419,7 +1426,7 @@ mod tests {
         use crate::auth_old::{Keys, Salts};
         use std::os::unix::net::UnixStream as StdUnixStream;
         let (mut client, _server) = StdUnixStream::pair().unwrap();
-        let keys = Arc::new(RwLock::new(Keys::new([0u8; 32], [0u8; 32])));
+        let keys = Arc::new(RwLock::new(Keys::new(&[0u8; 32], &[0u8; 32])));
         let salts = Arc::new(RwLock::new(Salts::new([0u8; 32], [0u8; 32])));
         let trusted_addrs = Arc::new(RwLock::new(Vec::<std::net::SocketAddr>::new()));
         let payload = [0u8; 64];
