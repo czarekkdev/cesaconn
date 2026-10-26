@@ -16,3 +16,7 @@ path = "src/main.rs"
 ratatui = "0.30"
 crossterm = "0.29"
 zeroize = "1.8.2"
+cesa_conn_crypto = { path = "../cesa_conn_crypto" }
+cesa_conn_system = { path = "../cesa_conn_system" }
+# runs IPC requests on the link worker thread, off the UI loop
+tokio = { version = "1.50.0", features = ["rt", "net", "time"] }
