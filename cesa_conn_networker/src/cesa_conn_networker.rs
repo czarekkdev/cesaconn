@@ -35,6 +35,8 @@ mod tcp_networker;
 #[cfg(feature = "test-commands")]
 mod test_commands;
 mod udp_networker;
+#[cfg(unix)]
+mod vault;
 
 use std::env;
 use tracing_subscriber::EnvFilter;

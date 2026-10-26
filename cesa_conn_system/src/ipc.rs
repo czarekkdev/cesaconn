@@ -22,14 +22,18 @@
 //! * `0x05` SetAuthPassword: `password (1..=MAX_PASSWORD_LEN)`; the daemon
 //!   picks the salt
 //! * `0x06` SetDataPassword: same
+//! * `0x07` Unlock: `password (1..=MAX_PASSWORD_LEN)`, the data password that
+//!   opens the encrypted vault after a restart
+//! * `0x08` SetAutoLogin: `on (1)`, exactly `0x00` or `0x01`
 //! * `0x02` / `0x03` are retired (version 1 sent `salt || password` there).
 //!   They are refused, so a mismatched UI and daemon fail loudly instead of
 //!   deriving a key from the wrong bytes.
 //!
 //! Response body: `0x00 || payload` on success, `0x01 || error code (1)` on error
 //! * Status: `flags (1) || trusted peers (u32 LE)`; flags bit 0 = auth key set,
-//!   bit 1 = data key set, bit 2 = network running
-//! * SetAuthPassword / SetDataPassword: empty
+//!   bit 1 = data key set, bit 2 = network running, bit 3 = vault locked,
+//!   bit 4 = keys saved (encrypted vault), bit 5 = automatic login on
+//! * SetAuthPassword / SetDataPassword / Unlock / SetAutoLogin: empty
 //! * ListPeers: `count (u16 LE) || count * (fingerprint (8) || name len (1) || name)`
 
 use core::fmt;
@@ -91,6 +95,13 @@ const REQ_STATUS: u8 = 0x01;
 const REQ_LIST_PEERS: u8 = 0x04;
 const REQ_SET_AUTH_PASSWORD: u8 = 0x05;
 const REQ_SET_DATA_PASSWORD: u8 = 0x06;
+const REQ_UNLOCK: u8 = 0x07;
+const REQ_SET_AUTO_LOGIN: u8 = 0x08;
+
+/// Shortest new password the daemon accepts (characters; bytes if not UTF-8). Anyone holding the vault
+/// file and the keychain salts can guess the data password offline, so short
+/// passwords are refused when they are set (not when unlocking).
+pub const MIN_NEW_PASSWORD_LEN: usize = 12;
 
 /* response status */
 const RESP_OK: u8 = 0x00;
@@ -157,6 +168,16 @@ pub enum DaemonError {
     KeyDerivationFailed = 0x02,
     /// Anything else went wrong inside the daemon.
     Internal = 0x03,
+    /// Unlock: the data password doesn't open the vault.
+    WrongPassword = 0x04,
+    /// The vault is locked: unlock it first.
+    Locked = 0x05,
+    /// The keychain or the vault file failed; the change was not saved.
+    StorageFailed = 0x06,
+    /// Nothing is saved yet (no vault), so there is nothing to unlock or log into.
+    NotSaved = 0x07,
+    /// A new password is shorter than [`MIN_NEW_PASSWORD_LEN`].
+    WeakPassword = 0x08,
 }
 
 impl DaemonError {
@@ -165,6 +186,11 @@ impl DaemonError {
             0x01 => Some(Self::BadRequest),
             0x02 => Some(Self::KeyDerivationFailed),
             0x03 => Some(Self::Internal),
+            0x04 => Some(Self::WrongPassword),
+            0x05 => Some(Self::Locked),
+            0x06 => Some(Self::StorageFailed),
+            0x07 => Some(Self::NotSaved),
+            0x08 => Some(Self::WeakPassword),
             _ => None,
         }
     }
@@ -176,6 +202,14 @@ impl fmt::Display for DaemonError {
             DaemonError::BadRequest => write!(f, "bad request"),
             DaemonError::KeyDerivationFailed => write!(f, "key derivation failed"),
             DaemonError::Internal => write!(f, "internal error"),
+            DaemonError::WrongPassword => write!(f, "wrong data password"),
+            DaemonError::Locked => write!(f, "locked: enter the data password first"),
+            DaemonError::StorageFailed => write!(f, "saving to the keychain / vault failed"),
+            DaemonError::NotSaved => write!(f, "nothing is saved yet"),
+            DaemonError::WeakPassword => write!(
+                f,
+                "password too short (at least {MIN_NEW_PASSWORD_LEN} characters)"
+            ),
         }
     }
 }
@@ -197,15 +231,25 @@ pub enum Request {
     SetDataPassword(PasswordUpdate),
     /// Paired devices.
     ListPeers,
+    /// Open the saved vault with the data password (after a restart).
+    Unlock(PasswordUpdate),
+    /// Keep `d_key` in the OS keychain (`true`) or delete it from there.
+    SetAutoLogin(bool),
 }
 
 /// Daemon status (contains no key material).
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy, Default)]
 pub struct Status {
     pub auth_key_set: bool,
     pub data_key_set: bool,
     pub network_running: bool,
     pub trusted_peers: u32,
+    /// A saved vault exists but isn't open yet.
+    pub locked: bool,
+    /// The keys are saved in the encrypted vault.
+    pub saved: bool,
+    /// `d_key` is kept in the OS keychain (automatic login).
+    pub auto_login: bool,
 }
 
 /// A paired device as shown to the user (public data only).
@@ -247,6 +291,10 @@ impl Request {
             Request::SetAuthPassword(u) => (REQ_SET_AUTH_PASSWORD, Some(u)),
             Request::SetDataPassword(u) => (REQ_SET_DATA_PASSWORD, Some(u)),
             Request::ListPeers => (REQ_LIST_PEERS, None),
+            Request::Unlock(u) => (REQ_UNLOCK, Some(u)),
+            Request::SetAutoLogin(on) => {
+                return Zeroizing::new(vec![REQ_SET_AUTO_LOGIN, u8::from(*on)]);
+            }
         };
 
         // sized up front so the buffer holding the password never reallocates
@@ -271,6 +319,12 @@ impl Request {
             REQ_LIST_PEERS if payload.is_empty() => Some(Request::ListPeers),
             REQ_SET_AUTH_PASSWORD => parse_password_update(payload).map(Request::SetAuthPassword),
             REQ_SET_DATA_PASSWORD => parse_password_update(payload).map(Request::SetDataPassword),
+            REQ_UNLOCK => parse_password_update(payload).map(Request::Unlock),
+            REQ_SET_AUTO_LOGIN => match payload {
+                [0x00] => Some(Request::SetAutoLogin(false)),
+                [0x01] => Some(Request::SetAutoLogin(true)),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -285,7 +339,10 @@ impl Response {
             Response::Status(s) => {
                 let flags = u8::from(s.auth_key_set)
                     | u8::from(s.data_key_set) << 1
-                    | u8::from(s.network_running) << 2;
+                    | u8::from(s.network_running) << 2
+                    | u8::from(s.locked) << 3
+                    | u8::from(s.saved) << 4
+                    | u8::from(s.auto_login) << 5;
 
                 body.push(flags);
                 body.extend_from_slice(&s.trusted_peers.to_le_bytes());
@@ -345,7 +402,7 @@ impl Response {
                     _ => return Err(IpcErrors::Malformed),
                 };
 
-                if flags & !0b111 != 0 {
+                if flags & !0b11_1111 != 0 {
                     return Err(IpcErrors::Malformed);
                 }
 
@@ -353,13 +410,24 @@ impl Response {
                     auth_key_set: flags & 0b001 != 0,
                     data_key_set: flags & 0b010 != 0,
                     network_running: flags & 0b100 != 0,
+                    locked: flags & 0b1000 != 0,
+                    saved: flags & 0b1_0000 != 0,
+                    auto_login: flags & 0b10_0000 != 0,
                     trusted_peers: peers,
                 }))
             }
-            Request::SetAuthPassword(_) | Request::SetDataPassword(_) if payload.is_empty() => {
+            Request::SetAuthPassword(_)
+            | Request::SetDataPassword(_)
+            | Request::Unlock(_)
+            | Request::SetAutoLogin(_)
+                if payload.is_empty() =>
+            {
                 Ok(Response::Done)
             }
-            Request::SetAuthPassword(_) | Request::SetDataPassword(_) => Err(IpcErrors::Malformed),
+            Request::SetAuthPassword(_)
+            | Request::SetDataPassword(_)
+            | Request::Unlock(_)
+            | Request::SetAutoLogin(_) => Err(IpcErrors::Malformed),
             Request::ListPeers => decode_peers(payload).ok_or(IpcErrors::Malformed),
         }
     }
@@ -586,6 +654,9 @@ mod tests {
             Request::SetDataPassword(update(b"x")),
             // spaces are part of the password, never trimmed
             Request::SetAuthPassword(update(b" pass word ")),
+            Request::Unlock(update(b"data password")),
+            Request::SetAutoLogin(true),
+            Request::SetAutoLogin(false),
         ] {
             let decoded = Request::decode(&req.encode()).unwrap();
             assert_eq!(decoded.encode().as_slice(), req.encode().as_slice());
@@ -612,9 +683,41 @@ mod tests {
         ]
         .concat();
         assert!(Request::decode(&long).is_none());
+        // auto-login flag: exactly one byte, 0 or 1
+        assert!(Request::decode(&[REQ_SET_AUTO_LOGIN]).is_none());
+        assert!(Request::decode(&[REQ_SET_AUTO_LOGIN, 2]).is_none());
+        assert!(Request::decode(&[REQ_SET_AUTO_LOGIN, 1, 0]).is_none());
+        // empty unlock password
+        assert!(Request::decode(&[REQ_UNLOCK]).is_none());
         // longest allowed password still fits
         let max = [&[REQ_SET_DATA_PASSWORD][..], &vec![b'a'; MAX_PASSWORD_LEN]].concat();
         assert!(Request::decode(&max).is_some());
+    }
+
+    /// Test that every daemon error code round-trips, and unknown status bits are refused
+    #[test]
+    fn test_error_codes_and_status_bits() {
+        for e in [
+            DaemonError::BadRequest,
+            DaemonError::KeyDerivationFailed,
+            DaemonError::Internal,
+            DaemonError::WrongPassword,
+            DaemonError::Locked,
+            DaemonError::StorageFailed,
+            DaemonError::NotSaved,
+            DaemonError::WeakPassword,
+        ] {
+            assert_eq!(
+                Response::decode(&Request::Status, &Response::encode_error(e)),
+                Err(IpcErrors::Daemon(e))
+            );
+        }
+
+        // bit 6 is not defined
+        assert_eq!(
+            Response::decode(&Request::Status, &[RESP_OK, 0b100_0000, 0, 0, 0, 0]),
+            Err(IpcErrors::Malformed)
+        );
     }
 
     /// Test that every response kind round-trips
@@ -625,6 +728,9 @@ mod tests {
             data_key_set: false,
             network_running: true,
             trusted_peers: 3,
+            locked: false,
+            saved: true,
+            auto_login: true,
         });
         assert_eq!(
             Response::decode(&Request::Status, &status.encode()),
@@ -768,6 +874,7 @@ mod tests {
                         data_key_set: false,
                         network_running: false,
                         trusted_peers: 0,
+                        ..Status::default()
                     });
                     write_frame(&mut stream, &status.encode()).await.unwrap();
                 }

@@ -97,6 +97,54 @@ pub fn decrypt(
     Ok(Zeroizing::new(plaintext))
 }
 
+/// Like [`encrypt`], but also authenticates `aad` (not encrypted, not stored):
+/// decryption fails unless exactly the same `aad` is given again.
+pub fn encrypt_with_aad(
+    key: &[u8; 32],
+    data: &[u8],
+    aad: &[u8],
+) -> Result<(Vec<u8>, [u8; 12]), AESError> {
+    use aes_gcm::aead::Payload;
+
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+
+    // random nonce, never reused with the same key (callers use fresh keys or few messages)
+    let mut nonce_bytes = [0u8; 12];
+    SysRng
+        .try_fill_bytes(&mut nonce_bytes)
+        .map_err(|_| AESError::NonceFailed)?;
+
+    let ciphertext = cipher
+        .encrypt(&Nonce::from(nonce_bytes), Payload { msg: data, aad })
+        .map_err(|_| AESError::EncryptionFailed)?;
+
+    Ok((ciphertext, nonce_bytes))
+}
+
+/// Decrypts what [`encrypt_with_aad`] produced; fails on any change to the
+/// ciphertext, the nonce, the key or `aad`.
+pub fn decrypt_with_aad(
+    key: &[u8; 32],
+    ciphertext: &[u8],
+    nonce_bytes: &[u8; 12],
+    aad: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, AESError> {
+    use aes_gcm::aead::Payload;
+
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+
+    cipher
+        .decrypt(
+            &Nonce::from(*nonce_bytes),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .map(Zeroizing::new)
+        .map_err(|_| AESError::DecryptionFailed)
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -204,5 +252,25 @@ mod tests {
         let plaintext = decrypt(&key, &ciphertext, &nonce).unwrap();
 
         assert_eq!(plaintext.as_slice(), &data[..]);
+    }
+
+    /// Test that AAD round-trips and that changing the AAD, ciphertext or key fails
+    #[test]
+    fn test_aad_binds() {
+        let key = [7u8; 32];
+        let (ct, nonce) = encrypt_with_aad(&key, b"vault", b"header").unwrap();
+
+        assert_eq!(
+            decrypt_with_aad(&key, &ct, &nonce, b"header").unwrap().as_slice(),
+            b"vault"
+        );
+        assert!(decrypt_with_aad(&key, &ct, &nonce, b"headeR").is_err());
+        assert!(decrypt_with_aad(&[8u8; 32], &ct, &nonce, b"header").is_err());
+
+        let mut flipped = ct.clone();
+        flipped[0] ^= 1;
+        assert!(decrypt_with_aad(&key, &flipped, &nonce, b"header").is_err());
+        // plain decrypt (empty aad) must not open it either
+        assert!(decrypt(&key, &ct, &nonce).is_err());
     }
 }

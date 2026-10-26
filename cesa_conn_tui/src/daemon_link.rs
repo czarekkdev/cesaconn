@@ -39,6 +39,10 @@ pub enum Command {
         kind: KeyKind,
         update: PasswordUpdate,
     },
+    /// Open the saved vault with the data password.
+    Unlock(PasswordUpdate),
+    /// Turn automatic login on (d_key into the OS keychain) or off.
+    SetAutoLogin(bool),
 }
 
 /// What the worker reports back.
@@ -49,6 +53,13 @@ pub enum LinkEvent {
     /// Answer to [`Command::SetPassword`].
     PasswordSet {
         kind: KeyKind,
+        result: Result<(), IpcErrors>,
+    },
+    /// Answer to [`Command::Unlock`].
+    Unlocked(Result<(), IpcErrors>),
+    /// Answer to [`Command::SetAutoLogin`].
+    AutoLoginSet {
+        on: bool,
         result: Result<(), IpcErrors>,
     },
     /// The worker is gone (its runtime couldn't start, or it panicked).
@@ -125,18 +136,33 @@ async fn run_command(socket: Option<&PathBuf>, command: Command) -> LinkEvent {
                 KeyKind::Data => Request::SetDataPassword(update),
             };
 
-            let result = match send(socket, &request).await {
-                Ok(Response::Done) => Ok(()),
-                Ok(_) => Err(IpcErrors::Malformed),
-                Err(e) => Err(e),
-            };
-
-            // `request` (and the password in it) is wiped here, not later
-            drop(request);
-
-            LinkEvent::PasswordSet { kind, result }
+            LinkEvent::PasswordSet {
+                kind,
+                result: send_done(socket, request).await,
+            }
         }
+        Command::Unlock(update) => {
+            LinkEvent::Unlocked(send_done(socket, Request::Unlock(update)).await)
+        }
+        Command::SetAutoLogin(on) => LinkEvent::AutoLoginSet {
+            on,
+            result: send_done(socket, Request::SetAutoLogin(on)).await,
+        },
     }
+}
+
+/// Sends a request answered with `Done`. Takes the request by value so a
+/// password in it is wiped right after sending, not later.
+async fn send_done(socket: Option<&PathBuf>, request: Request) -> Result<(), IpcErrors> {
+    let result = match send(socket, &request).await {
+        Ok(Response::Done) => Ok(()),
+        Ok(_) => Err(IpcErrors::Malformed),
+        Err(e) => Err(e),
+    };
+
+    drop(request);
+
+    result
 }
 
 /// Status first, then the paired devices.
@@ -200,6 +226,7 @@ mod tests {
             data_key_set: false,
             network_running: false,
             trusted_peers: 1,
+            ..Status::default()
         };
         let peer = PeerInfo {
             fingerprint: [0xab; ipc::FINGERPRINT_LEN],
@@ -219,14 +246,17 @@ mod tests {
             rt.block_on(async move {
                 let listener = UnixListener::bind(&server_path).unwrap();
 
-                for _ in 0..3 {
+                for _ in 0..5 {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     let body = ipc::read_frame(&mut stream).await.unwrap();
 
                     let answer = match Request::decode(&body).unwrap() {
                         Request::Status => Response::Status(status).encode(),
                         Request::ListPeers => Response::Peers(vec![answer_peer.clone()]).encode(),
-                        Request::SetAuthPassword(_) | Request::SetDataPassword(_) => {
+                        Request::SetAuthPassword(_)
+                        | Request::SetDataPassword(_)
+                        | Request::Unlock(_)
+                        | Request::SetAutoLogin(_) => {
                             seen_tx.send(body.to_vec()).unwrap();
                             Response::Done.encode()
                         }
@@ -274,6 +304,29 @@ mod tests {
             panic!("expected a data password request");
         };
         assert_eq!(sent.password.as_slice(), b"hunter2");
+
+        // unlock and automatic login reach the daemon as such
+        assert!(link.send(Command::Unlock(PasswordUpdate {
+            password: Zeroizing::new(b"data password!".to_vec()),
+        })));
+        assert_eq!(wait_for_event(&link), LinkEvent::Unlocked(Ok(())));
+        let Request::Unlock(sent) = Request::decode(&seen_rx.recv().unwrap()).unwrap() else {
+            panic!("expected an unlock request");
+        };
+        assert_eq!(sent.password.as_slice(), b"data password!");
+
+        assert!(link.send(Command::SetAutoLogin(true)));
+        assert_eq!(
+            wait_for_event(&link),
+            LinkEvent::AutoLoginSet {
+                on: true,
+                result: Ok(())
+            }
+        );
+        assert!(matches!(
+            Request::decode(&seen_rx.recv().unwrap()).unwrap(),
+            Request::SetAutoLogin(true)
+        ));
 
         server.join().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
