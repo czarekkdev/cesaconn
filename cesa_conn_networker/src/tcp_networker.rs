@@ -1,22 +1,20 @@
-//TODO: add streaming option for large files
 //TODO: add function arg to handle any further actions determined by ActionType in recv_handler
 //TODO: remove arc and rwlock for listener and CancellationToken
-//TODO: tag packets
 
 use core::net::SocketAddr;
 use std::fmt;
-use std::net::IpAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
 use tokio::sync::RwLock;
-use tokio::task::spawn_blocking;
-use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+use zeroize::Zeroizing;
 
-use crate::auth_old::{Keys, auth_incoming, auth_outgoing, decrypt_tunnel, encrypt_tunnel};
+use crate::auth_snow::{
+    DeviceKeypairs, Keys, SECURE_MSG_MAX_PAYLOAD, SecureConnection, Tags, TrustedPeer,
+    TrustedPeers, auth_incoming, auth_outgoing,
+};
 
 /// Identifies what kind of action/data is being sent in a packet.
 /// Encoded as a single byte at position [0] of the init header.
@@ -30,8 +28,8 @@ pub enum ActionType {
     Default = 0x00,
     /// Debug action — used for testing and diagnostics only, not for production data.
     Debug = 0x01,
-    /// Adds the connecting peer to the trusted address list.
-    /// No data payload is sent for this action — connection closes after auth succeeds.
+    /// Pair with the peer (pairing itself happens during authentication).
+    /// No data payload is sent for this action.
     ConnectNewDevice = 0x02,
     /// Synchronizes clipboard content between devices.
     ClipboardSync = 0x03,
@@ -53,19 +51,53 @@ impl ActionType {
     }
 }
 
-/// Max time to wait for the init header after authentication.
-const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
-/// Max time to receive one data packet (up to `MAX_DATA_PACKET_LEN`).
-const DATA_READ_TIMEOUT: Duration = Duration::from_secs(60);
+/// Init header: action type (1) + payload length as little-endian u64 (8).
+const INIT_HEADER_LEN: usize = 9;
 
-/// Upper bound for one encrypted data packet declared in the init header.
-/// Larger payloads must be chunked (see the chunking TODO in auth_snow).
-pub const MAX_DATA_PACKET_LEN: u64 = 16 * 1024 * 1024;
+/// Upper bound for one data payload declared in the init header.
+/// A payload has to fit into a single [`SecureConnection`] message until
+/// chunking lands (see the chunking TODO in auth_snow).
+pub const MAX_DATA_PACKET_LEN: u64 = SECURE_MSG_MAX_PAYLOAD as u64;
 
+/// A connection that is being authenticated, incoming or outgoing.
 pub struct IncomingConnection {
+    /// Name shown to the user when pairing (the peer's address until devices
+    /// exchange real names).
     pub name: String,
     pub stream: TcpStream,
-    pub ip_addr: IpAddr,
+}
+
+impl IncomingConnection {
+    /// Wraps a connected stream; the peer's address doubles as its display name.
+    pub fn new(stream: TcpStream, peer_addr: SocketAddr) -> Self {
+        Self {
+            name: peer_addr.to_string(),
+            stream,
+        }
+    }
+}
+
+/// Everything the TCP layer needs to authenticate peers, shared by all connections.
+#[derive(Clone)]
+pub struct NetworkerContext {
+    /// Shared `a_key` / `d_key`.
+    pub keys: Arc<RwLock<Keys>>,
+    /// This device's long-term identity.
+    pub device_keypairs: Arc<DeviceKeypairs>,
+    /// Devices we have paired with.
+    pub trusted_peers: TrustedPeers,
+    /// Asks the user to confirm a new device (name, handshake hash).
+    pub pair_fallback: fn(&String, &[u8; 32]) -> bool,
+}
+
+/// One packet received from an authenticated peer.
+pub struct ReceivedPacket {
+    /// The device that sent it.
+    pub peer: TrustedPeer,
+    /// What the data is for.
+    pub action_type: ActionType,
+    /// Decrypted payload, wiped on drop.
+    pub data: Zeroizing<Vec<u8>>,
 }
 
 /// All errors that can occur in the TCP networker layer.
@@ -74,23 +106,17 @@ pub struct IncomingConnection {
 pub enum TcpNetworkerErrors {
     /// `listener.accept()` failed — OS-level socket error, usually non-recoverable.
     FailedToAcceptConnection,
-    /// Stream closed or errored before all expected bytes arrived — peer disconnected early.
+    /// Reading or decrypting a message from the authenticated peer failed or timed out.
     FailedToReadFromStream,
-    /// ECDH + pre-shared key handshake failed — wrong key, untrusted peer, or I/O error.
+    /// Authentication failed — wrong a_key, rejected pairing, bad signature or I/O error.
     FailedToAuthenticate,
-    /// AES-GCM decryption failed — wrong key or data was tampered with in transit.
-    FailedToDecryptTunnel,
     /// Could not read local address from the listener — needed for logging.
     FailedToGetLocalAddr,
     /// TcpStream::connect failed — target unreachable, refused, or timed out.
     FailedToConnect,
-    /// AES-GCM encryption failed — should not happen under normal conditions.
-    FailedToEncryptTunnel,
-    /// Writing to the TCP stream failed — peer disconnected or network error.
+    /// Encrypting or sending a message to the authenticated peer failed or timed out.
     FailedToWriteToStream,
-    /// tokio::task::spawn_blocking returned a JoinError — blocking task panicked.
-    FailedToSpawnNewBlockingTask,
-    /// Peer declared a data packet larger than `MAX_DATA_PACKET_LEN` — rejected before allocating.
+    /// Data packet larger than `MAX_DATA_PACKET_LEN` — rejected before allocating / sending.
     DataTooLarge,
 }
 
@@ -102,186 +128,116 @@ impl fmt::Display for TcpNetworkerErrors {
             }
             TcpNetworkerErrors::FailedToReadFromStream => write!(f, "failed to read from stream"),
             TcpNetworkerErrors::FailedToAuthenticate => write!(f, "authentication failed"),
-            TcpNetworkerErrors::FailedToDecryptTunnel => write!(f, "failed to decrypt tunnel data"),
             TcpNetworkerErrors::FailedToGetLocalAddr => write!(f, "failed to get local address"),
             TcpNetworkerErrors::FailedToConnect => write!(f, "failed to make a connection request"),
-            TcpNetworkerErrors::FailedToEncryptTunnel => write!(f, "failed to encrypt tunnel data"),
             TcpNetworkerErrors::FailedToWriteToStream => write!(f, "failed to write to stream"),
-            TcpNetworkerErrors::FailedToSpawnNewBlockingTask => {
-                write!(f, "failed to spawn new blocking task")
-            }
             TcpNetworkerErrors::DataTooLarge => write!(f, "declared data packet is too large"),
         }
     }
 }
 
+/// Reads one tagged message of exactly `len` payload bytes from the peer.
+async fn read_secure(
+    secure_connection: &mut SecureConnection,
+    len: usize,
+    peer_addr: SocketAddr,
+) -> Result<Zeroizing<Vec<u8>>, TcpNetworkerErrors> {
+    // +1 for the tag byte that read() removes
+    let mut buffer = Zeroizing::new(vec![0u8; len.saturating_add(1)]);
+
+    secure_connection
+        .read_timeout(&mut buffer, Tags::Regular)
+        .await
+        .map_err(|e| {
+            warn!(%peer_addr, error = %e, "failed to read message from peer");
+            TcpNetworkerErrors::FailedToReadFromStream
+        })?;
+
+    Ok(buffer)
+}
+
 /// Handles a single incoming TCP connection after it has been accepted by `recv`.
 ///
-/// # Packet format
+/// 1. authentication ([`auth_incoming`]): SPAKE2 + hybrid KEX + Noise +
+///    ML-DSA signatures; unknown devices are paired only if both users confirm
+/// 2. <- init header (9 bytes): [0] = ActionType, [1..9] = payload length (u64 LE)
+/// 3. <- payload (only if the length is not 0)
 ///
-/// Every connection follows a fixed three-phase protocol:
+/// Everything after step 1 is encrypted and authenticated by the Noise transport.
 ///
-/// **Phase 1 — Authentication** (handled by `auth_incoming`)
-///   ECDH X25519 key exchange + pre-shared key verification.
-///   Derives an ephemeral session key (`shared_key`) unique to this connection.
-///   If the peer's IP is not in `trusted_addrs`, auth returns false immediately
-///   and the connection is closed without reading any data.
-///
-/// **Phase 2 — Init header** (37 encrypted bytes)
-///   Encrypted layout: 12 (nonce) + 9 (plaintext) + 16 (GCM tag) = 37 bytes
-///   Plaintext layout:
-///     - [0]    = ActionType as u8
-///     - [1..9] = encrypted data size as little-endian u64
-///              (byte count of the encrypted data packet, not the raw plaintext size)
-///
-/// **Phase 3 — Data packet** (variable size, declared in init header)
-///   Double-encrypted: outer layer = session key, inner layer = static data key.
-///   Decrypt outer first (strips session encryption), then inner (strips data key).
-///   Both decryption steps are offloaded to spawn_blocking for large payload support.
-///   The local d_key copy is zeroized immediately after use.
+/// Returns `Ok(None)` if the peer doesn't know `a_key` (closed without data).
 pub async fn recv_handler(
     incoming_connection: (TcpStream, SocketAddr),
-    keys: Arc<RwLock<Keys>>,
-    trusted_addrs: Arc<RwLock<Vec<SocketAddr>>>,
-) -> Result<(), TcpNetworkerErrors> {
-    let peer_addr = incoming_connection.1;
+    context: NetworkerContext,
+) -> Result<Option<ReceivedPacket>, TcpNetworkerErrors> {
+    let (stream, peer_addr) = incoming_connection;
 
-    // Move the stream out of the tuple so we can take a mutable reference to it.
-    let mut connection = incoming_connection.0;
-    let connection_mut = &mut connection;
+    debug!(%peer_addr, "recv_handler started, authenticating peer");
 
-    debug!(%peer_addr, "recv_handler started for incoming connection");
+    // 1. authentication
+    let Some((mut secure_connection, peer)) = auth_incoming(
+        context.keys,
+        &context.device_keypairs,
+        context.trusted_peers,
+        IncomingConnection::new(stream, peer_addr),
+        context.pair_fallback,
+    )
+    .await
+    .map_err(|e| {
+        warn!(%peer_addr, error = %e, "authentication of incoming connection failed");
+        TcpNetworkerErrors::FailedToAuthenticate
+    })?
+    else {
+        warn!(%peer_addr, "peer failed SPAKE2 confirmation (wrong a_key), closing");
+        return Ok(None);
+    };
 
-    // Phase 1: ECDH + pre-shared key handshake.
-    // shared_key is ephemeral — derived fresh from ECDH for every connection.
-    // All further communication on this stream uses shared_key for the outer encryption layer.
-    debug!(%peer_addr, "phase 1: starting auth_incoming handshake");
-    let (auth_result, shared_key) =
-        auth_incoming(keys.clone(), trusted_addrs, (connection_mut, peer_addr))
-            .await
-            .map_err(|e| {
-                error!(%peer_addr, error = %e, "auth_incoming returned an error");
-                TcpNetworkerErrors::FailedToAuthenticate
-            })?;
+    debug!(%peer_addr, peer = %peer.name(), "peer authenticated, reading init header");
 
-    // auth_incoming returns false (not Err) for untrusted peers — close gracefully, not as an error.
-    if !auth_result {
-        warn!(%peer_addr, "authentication failed for incoming connection, closing gracefully");
-        return Ok(());
-    }
+    // 2. init header
+    let init_buf = read_secure(&mut secure_connection, INIT_HEADER_LEN, peer_addr).await?;
 
-    debug!(%peer_addr, "phase 1 complete: authentication successful");
+    let (action_byte, size_bytes) = init_buf
+        .split_first()
+        .ok_or(TcpNetworkerErrors::FailedToReadFromStream)?;
 
-    // Phase 2: Read and decrypt the init header.
-    // Fixed size: 12 (nonce) + 9 (plaintext) + 16 (GCM tag) = 37 bytes.
-    let e_init_buf = &mut [0u8; 37];
+    let size = u64::from_le_bytes(
+        size_bytes
+            .try_into()
+            .map_err(|_| TcpNetworkerErrors::FailedToReadFromStream)?,
+    );
 
-    debug!(%peer_addr, "phase 2: reading encrypted init header (37 bytes)");
-    timeout(HEADER_READ_TIMEOUT, connection_mut.read_exact(e_init_buf))
-        .await
-        .map_err(|_| {
-            warn!(%peer_addr, "timed out waiting for the init header");
-            TcpNetworkerErrors::FailedToReadFromStream
-        })?
-        .map_err(|e| {
-            error!(%peer_addr, error = %e, "failed to read encrypted init header from stream");
-            TcpNetworkerErrors::FailedToReadFromStream
-        })?;
-
-    // Decrypt using the session key — GCM tag verification catches any in-transit tampering.
-    debug!(%peer_addr, "decrypting init header with session key");
-    let init_buf = decrypt_tunnel(&shared_key, e_init_buf)
-        .map_err(|e| {
-            error!(%peer_addr, error = %e, "failed to decrypt init header — GCM tag mismatch or wrong session key");
-            TcpNetworkerErrors::FailedToDecryptTunnel
-        })?;
-
-    // Extract the encrypted data packet size from bytes [1..9] as little-endian u64.
-    // This is the byte count of the encrypted packet below — not the raw plaintext size.
-    let size_bytes = &mut [0u8; 8];
-    size_bytes.copy_from_slice(&init_buf[1..9]);
-    let size = u64::from_le_bytes(*size_bytes);
-
-    // The size comes from the peer: bound it before allocating, otherwise a
-    // (compromised) peer can request an exabyte buffer and abort the process.
+    // the size comes from the peer: bound it before allocating
     if size > MAX_DATA_PACKET_LEN {
         warn!(%peer_addr, size, max = MAX_DATA_PACKET_LEN, "declared data packet too large, rejecting");
         return Err(TcpNetworkerErrors::DataTooLarge);
     }
-    let size_usize = usize::try_from(size).map_err(|_| TcpNetworkerErrors::DataTooLarge)?;
 
-    let action_type_raw = init_buf[0];
-    debug!(%peer_addr, action_type_byte = action_type_raw, data_packet_size = size, "init header decrypted successfully");
+    let size = usize::try_from(size).map_err(|_| TcpNetworkerErrors::DataTooLarge)?;
 
-    // Phase 3a: Read the double-encrypted data packet.
-    // Length was declared in the authenticated init header — we trust it because
-    // the header passed AES-GCM verification, so the size field was not tampered with.
-    let mut e_t_data_buf = vec![0u8; size_usize];
+    // unknown values fall back to Default, so newer peers stay compatible
+    let action_type = ActionType::from_u8(*action_byte).unwrap_or(ActionType::Default);
 
-    debug!(%peer_addr, size, "phase 3a: reading double-encrypted data packet");
-    timeout(DATA_READ_TIMEOUT, connection_mut.read_exact(&mut e_t_data_buf))
-        .await
-        .map_err(|_| {
-            warn!(%peer_addr, expected_bytes = size, "timed out reading the data packet");
-            TcpNetworkerErrors::FailedToReadFromStream
-        })?
-        .map_err(|e| {
-            error!(%peer_addr, error = %e, expected_bytes = size, "failed to read double-encrypted data packet from stream");
-            TcpNetworkerErrors::FailedToReadFromStream
-        })?;
+    // 3. payload
+    let data = if size == 0 {
+        Zeroizing::new(Vec::new())
+    } else {
+        read_secure(&mut secure_connection, size, peer_addr).await?
+    };
 
-    // Phase 3b: Strip the outer encryption layer using the session key — offloaded to
-    // spawn_blocking so large payloads don't block the tokio runtime.
-    // Result is still encrypted with d_key — forward secrecy is maintained because
-    // session keys are ephemeral and not stored anywhere.
-    debug!(%peer_addr, "phase 3b: stripping outer session-key encryption layer (spawn_blocking)");
-    let e_data_buf = spawn_blocking(move || {
-        let e_t_t_data_buf = e_t_data_buf;
-        decrypt_tunnel(&shared_key, &e_t_t_data_buf)
-    })
-    .await
-    .map_err(|e| {
-        error!(%peer_addr, error = %e, "spawn_blocking task for outer-layer decryption panicked");
-        TcpNetworkerErrors::FailedToSpawnNewBlockingTask
-    })?
-    .map_err(|e| {
-        error!(%peer_addr, error = %e, "outer-layer AES-GCM decryption failed — wrong session key or tampered data");
-        TcpNetworkerErrors::FailedToDecryptTunnel
-    })?;
-
-    // Phase 3c: Strip the inner encryption layer using the static data key.
-    // Clone d_key out of the RwLock into a local buffer so we can zeroize it after use.
-    let d_key_clone = keys.read().await.d_key.clone();
-
-    debug!(%peer_addr, "phase 3c: stripping inner d_key encryption layer (spawn_blocking)");
-
-    let data_buf = spawn_blocking(move || {
-        decrypt_tunnel(&d_key_clone, e_data_buf.as_ref())
-    })
-    .await
-    .map_err(|e| {
-        error!(%peer_addr, error = %e, "spawn task for inner-layer decryption panicked");
-        TcpNetworkerErrors::FailedToSpawnNewBlockingTask
-    })?
-    .map_err(|e| {
-        error!(%peer_addr, error = %e, "inner-layer AES-GCM decryption failed — wrong d_key or tampered data");
-        TcpNetworkerErrors::FailedToDecryptTunnel
-    })?;
-
-    // Parse the action type byte. Unknown values default to Default instead of rejecting —
-    // this keeps the protocol forward-compatible with new ActionType variants added later.
-    let action_type = ActionType::from_u8(init_buf[0]).unwrap_or(ActionType::Default);
-
-    //TODO: dispatch to the appropriate handler based on action type
     info!(
         %peer_addr,
+        peer = %peer.name(),
         action_type = ?action_type,
-        data_len = data_buf.len(),
-        data = %String::from_utf8_lossy(&data_buf),
+        data_len = data.len(),
         "received packet successfully"
     );
 
-    Ok(())
+    Ok(Some(ReceivedPacket {
+        peer,
+        action_type,
+        data,
+    }))
 }
 
 /// Accepts incoming connections in a loop, spawning a `recv_handler` task for each one.
@@ -292,8 +248,7 @@ pub async fn recv_handler(
 /// The `select!` inside each spawned task drops the handler instantly if cancelled.
 pub async fn recv(
     listener: &TcpListener,
-    keys: Arc<RwLock<Keys>>,
-    trusted_addrs: Arc<RwLock<Vec<SocketAddr>>>,
+    context: NetworkerContext,
     cancellation_token: CancellationToken,
 ) -> Result<(), TcpNetworkerErrors> {
     let local_addr = listener.local_addr().map_err(|e| {
@@ -304,11 +259,8 @@ pub async fn recv(
     info!(%local_addr, "TCP listener started, waiting for incoming connections");
 
     loop {
-        // Clone all Arc references before spawning — each task owns its own reference counts.
-        // This avoids the spawned task borrowing from the loop's local scope.
         let cloned_token = cancellation_token.clone();
-        let keys_clone = keys.clone();
-        let trusted_addrs_clone = trusted_addrs.clone();
+        let context_clone = context.clone();
 
         // select! races accept() against the cancellation signal — whichever fires first wins.
         let incoming_connection = select! {
@@ -327,22 +279,22 @@ pub async fn recv(
         let peer_addr = incoming_connection.1;
         info!(%local_addr, %peer_addr, "accepted incoming TCP connection, spawning recv_handler");
 
-        // Spawn a dedicated task for this connection — no .await, so the loop immediately
-        // circles back to accept() and can handle the next incoming connection in parallel.
         tokio::spawn(async move {
             select! {
-                // If the token fires mid-handler, drop the task immediately without waiting
-                // for it to finish — prevents stale tasks from delaying shutdown.
                 _ = cloned_token.cancelled() => {
                     info!(%peer_addr, "cancellation token fired mid-handler, dropping recv_handler task");
                 },
-                result = recv_handler(
-                    incoming_connection,
-                    keys_clone,
-                    trusted_addrs_clone,
-                ) => {
+                result = recv_handler(incoming_connection, context_clone) => {
                     match result {
-                        Ok(()) => debug!(%peer_addr, "recv_handler completed successfully"),
+                        // TODO: hand the packet to the action handler (see TODO at the top)
+                        Ok(Some(packet)) => debug!(
+                            %peer_addr,
+                            peer = %packet.peer.name(),
+                            action_type = ?packet.action_type,
+                            data_len = packet.data.len(),
+                            "recv_handler completed successfully"
+                        ),
+                        Ok(None) => debug!(%peer_addr, "recv_handler closed without data"),
                         Err(e) => error!(%peer_addr, error = %e, "recv_handler returned an error"),
                     }
                 }
@@ -353,136 +305,87 @@ pub async fn recv(
     Ok(())
 }
 
-/// Handles a single outgoing TCP connection — authenticates with the peer then
-/// sends a double-encrypted data packet.
+/// Handles a single outgoing TCP connection — authenticates with the peer, then
+/// sends one packet.
 ///
-/// # Packet format
+/// 1. authentication ([`auth_outgoing`]), pairs the device if needed
+/// 2. -> init header (9 bytes): [0] = ActionType, [1..9] = payload length (u64 LE)
+/// 3. -> payload (only if not empty)
 ///
-/// **Phase 1 — Authentication** (handled by `auth_outgoing`)
-///   ECDH X25519 key exchange + pre-shared key verification.
-///   Derives an ephemeral session key (`shared_key`) for this connection.
-///   If `connect_addr` is not in `trusted_addrs`, auth returns false and the
-///   connection is closed immediately without sending any data.
-///
-/// **Phase 2 — ConnectNewDevice shortcut**
-///   If action_type is ConnectNewDevice, `connect_addr` is added to `trusted_addrs`
-///   and the function returns immediately. No init header or data packet is sent.
-///
-/// **Phase 3 — Data packet** (double-encrypted, built before the init header)
-///   Inner layer: d_key (static pre-shared data key) — encrypted in spawn_blocking
-///   so large payloads don't block the tokio runtime.
-///   Outer layer: shared_key (ephemeral session key) — also in spawn_blocking.
-///   The local d_key copy is zeroized inside the closure immediately after use.
-///
-/// **Phase 4 — Init header** (37 encrypted bytes, sent after the data is ready)
-///   Plaintext layout:
-///     - [0]    = ActionType as u8
-///     - [1..9] = e_t_data.len() as little-endian u64 (byte count of the packet above)
-///   Built last so the exact encrypted size is known before writing to the header.
+/// `ConnectNewDevice` only pairs: it sends a header with length 0 and no payload.
 pub async fn connect_handler(
-    keys: Arc<RwLock<Keys>>,
-    trusted_addrs: Arc<RwLock<Vec<SocketAddr>>>,
+    context: NetworkerContext,
     connect_addr: SocketAddr,
     outgoing_connection: TcpStream,
     action_type: ActionType,
-    data: Vec<u8>,
+    data: Zeroizing<Vec<u8>>,
 ) -> Result<(), TcpNetworkerErrors> {
-    let mut connection = outgoing_connection;
-
     debug!(%connect_addr, action_type = ?action_type, data_len = data.len(), "connect_handler started");
 
-    // Phase 1: ECDH + pre-shared key handshake.
-    // auth_outgoing returns false (not Err) if connect_addr is not in trusted_addrs.
-    debug!(%connect_addr, "phase 1: starting auth_outgoing handshake");
-    let (auth_result, shared_key) = auth_outgoing(
-        keys.clone(),
-        trusted_addrs.clone(),
-        (&mut connection, connect_addr),
+    let size = u64::try_from(data.len()).map_err(|_| TcpNetworkerErrors::DataTooLarge)?;
+
+    // checked before authenticating, so we don't pair just to fail afterwards
+    if size > MAX_DATA_PACKET_LEN {
+        warn!(%connect_addr, size, max = MAX_DATA_PACKET_LEN, "data packet too large, not sending");
+        return Err(TcpNetworkerErrors::DataTooLarge);
+    }
+
+    // 1. authentication
+    let Some((mut secure_connection, peer)) = auth_outgoing(
+        context.keys,
+        &context.device_keypairs,
+        context.trusted_peers,
+        IncomingConnection::new(outgoing_connection, connect_addr),
+        context.pair_fallback,
     )
     .await
     .map_err(|e| {
-        error!(%connect_addr, error = %e, "auth_outgoing returned an error");
+        warn!(%connect_addr, error = %e, "authentication of outgoing connection failed");
         TcpNetworkerErrors::FailedToAuthenticate
-    })?;
-
-    // Peer rejected our key, or we rejected theirs — close gracefully without sending data.
-    if !auth_result {
-        warn!(%connect_addr, "authentication failed for outgoing connection, closing gracefully");
-        return Ok(());
-    }
-
-    debug!(%connect_addr, "phase 1 complete: authentication successful");
-
-    // Phase 2: ConnectNewDevice — register the peer as trusted and exit.
-    // No data payload is defined for this action type.
-    if action_type == ActionType::ConnectNewDevice {
-        info!(%connect_addr, "phase 2: ConnectNewDevice — adding peer to trusted_addrs and returning");
-        let mut trusted_addrs_mod = trusted_addrs.write().await;
-        trusted_addrs_mod.push(connect_addr);
-        return Ok(());
-    }
-
-    // Phase 3a: Encrypt data with d_key (inner layer) in a blocking task.
-    // spawn_blocking offloads CPU-intensive AES-GCM off the tokio worker thread —
-    // critical for large payloads (e.g. files) so other async tasks aren't starved.
-    let d_key_clone = keys.read().await.d_key.clone();
-
-    debug!(%connect_addr, data_len = data.len(), "phase 3a: encrypting data with d_key inner layer (spawn_blocking)");
-    let e_data = spawn_blocking(move || {
-        encrypt_tunnel(&d_key_clone, &data)
-    })
-    .await
-    .map_err(|e| {
-        error!(%connect_addr, error = %e, "spawn_blocking task for inner-layer encryption panicked");
-        TcpNetworkerErrors::FailedToSpawnNewBlockingTask
     })?
-    .map_err(|e| {
-        error!(%connect_addr, error = %e, "inner-layer AES-GCM encryption with d_key failed");
-        TcpNetworkerErrors::FailedToEncryptTunnel
-    })?;
+    else {
+        warn!(%connect_addr, "server failed SPAKE2 confirmation (wrong a_key), closing");
+        return Err(TcpNetworkerErrors::FailedToAuthenticate);
+    };
 
-    // Phase 3b: Wrap with the session key (outer layer) — also in spawn_blocking.
-    // Forward secrecy: even if d_key is later leaked, past sessions remain protected
-    // because shared_key is ephemeral and was never stored.
-    debug!(%connect_addr, inner_encrypted_len = e_data.len(), "phase 3b: wrapping with session key outer layer (spawn_blocking)");
-    let e_t_data = spawn_blocking(move || encrypt_tunnel(&shared_key, &e_data))
+    debug!(%connect_addr, peer = %peer.name(), "peer authenticated, sending init header");
+
+    let size = if action_type == ActionType::ConnectNewDevice {
+        0
+    } else {
+        size
+    };
+
+    // 2. init header
+    let mut init_data = Vec::with_capacity(INIT_HEADER_LEN + 1); // + tag
+
+    init_data.push(action_type as u8);
+    init_data.extend_from_slice(&size.to_le_bytes());
+
+    secure_connection
+        .write_timeout(&mut init_data, Tags::Regular)
         .await
         .map_err(|e| {
-            error!(%connect_addr, error = %e, "spawn_blocking task for outer-layer encryption panicked");
-            TcpNetworkerErrors::FailedToSpawnNewBlockingTask
-        })?
-        .map_err(|e| {
-            error!(%connect_addr, error = %e, "outer-layer AES-GCM encryption with session key failed");
-            TcpNetworkerErrors::FailedToEncryptTunnel
+            error!(%connect_addr, error = %e, "failed to send init header");
+            TcpNetworkerErrors::FailedToWriteToStream
         })?;
 
-    // Phase 4: Build and send the init header now that we know the exact encrypted size.
-    // size = e_t_data.len() so the receiver knows exactly how many bytes to read_exact().
-    let size = e_t_data.len() as u64;
-    let mut init_data = [0u8; 9];
-    init_data[0] = action_type as u8;
-    init_data[1..].copy_from_slice(&size.to_le_bytes()); // little-endian, matches recv_handler
+    // 3. payload
+    if size > 0 {
+        let mut payload = Zeroizing::new(Vec::with_capacity(data.len().saturating_add(1))); // + tag
 
-    debug!(%connect_addr, action_type = ?action_type, data_packet_size = size, "phase 4: encrypting init header");
-    let e_init_data = encrypt_tunnel(&shared_key, &init_data).map_err(|e| {
-        error!(%connect_addr, error = %e, "failed to encrypt init header with session key");
-        TcpNetworkerErrors::FailedToEncryptTunnel
-    })?;
+        payload.extend_from_slice(&data);
 
-    // Send init header first, then the double-encrypted data packet.
-    debug!(%connect_addr, "sending encrypted init header (37 bytes)");
-    connection.write_all(&e_init_data).await.map_err(|e| {
-        error!(%connect_addr, error = %e, "failed to write encrypted init header to stream");
-        TcpNetworkerErrors::FailedToWriteToStream
-    })?;
+        secure_connection
+            .write_timeout(&mut payload, Tags::Regular)
+            .await
+            .map_err(|e| {
+                error!(%connect_addr, error = %e, "failed to send data packet");
+                TcpNetworkerErrors::FailedToWriteToStream
+            })?;
+    }
 
-    debug!(%connect_addr, data_packet_size = size, "sending double-encrypted data packet");
-    connection.write_all(&e_t_data).await.map_err(|e| {
-        error!(%connect_addr, error = %e, "failed to write double-encrypted data packet to stream");
-        TcpNetworkerErrors::FailedToWriteToStream
-    })?;
-
-    info!(%connect_addr, action_type = ?action_type, data_packet_size = size, "connect_handler completed successfully");
+    info!(%connect_addr, peer = %peer.name(), action_type = ?action_type, data_len = size, "connect_handler completed successfully");
     Ok(())
 }
 
@@ -492,17 +395,13 @@ pub async fn connect_handler(
 /// inside a spawned task concurrently with other work. Cancellation is checked both
 /// before the TCP connect and mid-handler inside the spawned task.
 pub async fn connect(
-    keys: Arc<RwLock<Keys>>,
-    trusted_addrs: Arc<RwLock<Vec<SocketAddr>>>,
+    context: NetworkerContext,
     cancellation_token: CancellationToken,
     connect_addr: SocketAddr,
     action_type: ActionType,
-    data: Vec<u8>,
+    data: Zeroizing<Vec<u8>>,
 ) -> Result<(), TcpNetworkerErrors> {
-    // Clone Arcs before the select! — the spawned task needs its own reference counts.
     let cloned_token = cancellation_token.clone();
-    let keys_clone = keys.clone();
-    let trusted_addrs_clone = trusted_addrs.clone();
 
     debug!(%connect_addr, action_type = ?action_type, "connect: initiating TCP connection");
 
@@ -523,16 +422,13 @@ pub async fn connect(
 
     info!(%connect_addr, "TCP connection established, spawning connect_handler");
 
-    // Spawn the handler — no .await so connect() returns immediately after the TCP connect.
     tokio::spawn(async move {
         select! {
-            // Drop the handler immediately if the token fires mid-connection.
             _ = cloned_token.cancelled() => {
                 info!(%connect_addr, "cancellation token fired mid-handler, dropping connect_handler task");
             },
             result = connect_handler(
-                keys_clone,
-                trusted_addrs_clone,
+                context,
                 connect_addr,
                 outgoing_connection,
                 action_type,
@@ -543,7 +439,7 @@ pub async fn connect(
                     Err(e) => error!(%connect_addr, error = %e, "connect_handler returned an error"),
                 }
             }
-        };
+        }
     });
 
     Ok(())
@@ -552,75 +448,65 @@ pub async fn connect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth_old::{decrypt_tunnel, encrypt_tunnel};
-    use cesa_conn_crypto::x25519_cesa::{
-        calculate_public_key, calculate_shared_key, generate_private_key, hash_key,
-    };
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
-    use tokio_util::sync::CancellationToken;
 
-    // Pre-shared keys used across all tests — constant for deterministic, reproducible runs.
-    const TEST_A_KEY: [u8; 32] = [0xAB; 32]; // authentication key
-    const TEST_D_KEY: [u8; 32] = [0xCD; 32]; // data encryption key
+    const TEST_A_KEY: [u8; 32] = [0xAB; 32];
+    const TEST_D_KEY: [u8; 32] = [0xCD; 32];
 
-    // -------------------------------------------------------------------------
-    // Helpers
-    // -------------------------------------------------------------------------
+    /// Pairing callback that accepts every device.
+    fn accept_all(_name: &String, _hash: &[u8; 32]) -> bool {
+        true
+    }
 
-    /// Builds the Arc<RwLock<...>> state bundle used by all handlers.
-    /// Both keys are packed into a single `Keys` so callers match `recv_handler`/`connect_handler`.
-    fn make_state(
+    /// Pairing callback that rejects every device.
+    fn reject_all(_name: &String, _hash: &[u8; 32]) -> bool {
+        false
+    }
+
+    /// Fresh device identity + empty trusted list.
+    fn make_context(
         a_key: [u8; 32],
-        d_key: [u8; 32],
-        trusted: Vec<SocketAddr>,
-    ) -> (Arc<RwLock<Keys>>, Arc<RwLock<Vec<SocketAddr>>>) {
-        (
-            Arc::new(RwLock::new(Keys::new(&a_key, &d_key))),
-            Arc::new(RwLock::new(trusted)),
+        pair_fallback: fn(&String, &[u8; 32]) -> bool,
+    ) -> NetworkerContext {
+        NetworkerContext {
+            keys: Arc::new(RwLock::new(Keys::new(&a_key, &TEST_D_KEY))),
+            device_keypairs: Arc::new(DeviceKeypairs::generate().unwrap()),
+            trusted_peers: Arc::new(RwLock::new(Vec::new())),
+            pair_fallback,
+        }
+    }
+
+    /// Runs one client -> server exchange over localhost and returns both results.
+    async fn exchange(
+        server: NetworkerContext,
+        client: NetworkerContext,
+        action_type: ActionType,
+        data: &[u8],
+    ) -> (
+        Result<Option<ReceivedPacket>, TcpNetworkerErrors>,
+        Result<(), TcpNetworkerErrors>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let incoming = listener.accept().await.unwrap();
+            recv_handler(incoming, server).await
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let client_result = connect_handler(
+            client,
+            addr,
+            stream,
+            action_type,
+            Zeroizing::new(data.to_vec()),
         )
+        .await;
+
+        (server_task.await.unwrap(), client_result)
     }
 
-    /// Manually drives the CLIENT side of the auth_incoming handshake.
-    /// Mirrors what auth_outgoing sends on the wire so tests can exercise
-    /// recv_handler directly without needing a real connect_handler.
-    ///
-    /// Returns the derived shared_hash (session key) for subsequent manual encryption.
-    async fn client_auth(stream: &mut TcpStream, auth_key: [u8; 32]) -> [u8; 32] {
-        // Step 1: generate ephemeral key pair and send public key to the server.
-        let client_priv = generate_private_key();
-        let client_pub = calculate_public_key(&client_priv);
-        stream.write_all(&client_pub).await.unwrap();
-
-        // Step 2: read server's ephemeral public key and derive the shared secret.
-        let server_pub = &mut [0u8; 32];
-        stream.read_exact(server_pub).await.unwrap();
-        let shared = calculate_shared_key(&client_priv, server_pub);
-        let shared_hash = hash_key(&shared);
-
-        // Step 3: encrypt our auth key with the session key and send it (60 bytes).
-        let payload = encrypt_tunnel(&shared_hash, &auth_key).unwrap();
-        stream.write_all(&payload).await.unwrap();
-
-        // Step 4: read server's key echo (60 bytes) and verify it matches our auth key.
-        let recv_buf = &mut [0u8; 60];
-        stream.read_exact(recv_buf).await.unwrap();
-        let recv_plaintext = decrypt_tunnel(&shared_hash, recv_buf).unwrap();
-
-        // Step 5: send confirmation byte — 0x01 confirmed, 0x00 rejected (29 bytes).
-        let confirmed = recv_plaintext == auth_key;
-        let conf_byte = [if confirmed { 0x01u8 } else { 0x00u8 }];
-        let e_conf = encrypt_tunnel(&shared_hash, &conf_byte).unwrap();
-        stream.write_all(&e_conf).await.unwrap();
-
-        shared_hash
-    }
-
-    // -------------------------------------------------------------------------
-    // ActionType tests
-    // -------------------------------------------------------------------------
-
-    /// All four known byte values must map to their correct ActionType variants.
+    /// Test that every known wire byte maps to its ActionType
     #[test]
     fn test_action_type_from_u8_all_known() {
         assert_eq!(ActionType::from_u8(0x00), Some(ActionType::Default));
@@ -632,495 +518,191 @@ mod tests {
         assert_eq!(ActionType::from_u8(0x03), Some(ActionType::ClipboardSync));
     }
 
-    /// Unknown byte values must return None — not panic or silently default.
+    /// Test that unknown wire bytes are rejected instead of panicking
     #[test]
     fn test_action_type_from_u8_unknown() {
-        assert_eq!(ActionType::from_u8(0x04), None);
-        assert_eq!(ActionType::from_u8(0x10), None);
-        assert_eq!(ActionType::from_u8(0xFF), None);
-    }
-
-    /// Wire discriminants must be stable — changing them breaks protocol compatibility.
-    #[test]
-    fn test_action_type_discriminants() {
-        assert_eq!(ActionType::Default as u8, 0x00);
-        assert_eq!(ActionType::Debug as u8, 0x01);
-        assert_eq!(ActionType::ConnectNewDevice as u8, 0x02);
-        assert_eq!(ActionType::ClipboardSync as u8, 0x03);
-    }
-
-    /// from_u8 and as u8 must be a perfect roundtrip for all known variants.
-    #[test]
-    fn test_action_type_roundtrip() {
-        for variant in [
-            ActionType::Default,
-            ActionType::Debug,
-            ActionType::ConnectNewDevice,
-            ActionType::ClipboardSync,
-        ] {
-            assert_eq!(ActionType::from_u8(variant as u8), Some(variant));
+        for v in 0x04..=0xFF {
+            assert_eq!(ActionType::from_u8(v), None);
         }
     }
 
-    // -------------------------------------------------------------------------
-    // TcpNetworkerErrors display tests
-    // -------------------------------------------------------------------------
-
-    /// Every error variant must produce a non-empty, human-readable Display string.
+    /// Test that every error has a non-empty message
     #[test]
     fn test_all_error_display_non_empty() {
         let errors = [
             TcpNetworkerErrors::FailedToAcceptConnection,
             TcpNetworkerErrors::FailedToReadFromStream,
             TcpNetworkerErrors::FailedToAuthenticate,
-            TcpNetworkerErrors::FailedToDecryptTunnel,
             TcpNetworkerErrors::FailedToGetLocalAddr,
             TcpNetworkerErrors::FailedToConnect,
-            TcpNetworkerErrors::FailedToEncryptTunnel,
             TcpNetworkerErrors::FailedToWriteToStream,
-            TcpNetworkerErrors::FailedToSpawnNewBlockingTask,
+            TcpNetworkerErrors::DataTooLarge,
         ];
-        for err in errors {
-            assert!(!err.to_string().is_empty());
+
+        for e in errors {
+            assert!(!e.to_string().is_empty());
         }
     }
 
-    #[test]
-    fn test_error_display_accept() {
-        assert_eq!(
-            TcpNetworkerErrors::FailedToAcceptConnection.to_string(),
-            "failed to accept connection"
-        );
-    }
-
-    #[test]
-    fn test_error_display_read() {
-        assert_eq!(
-            TcpNetworkerErrors::FailedToReadFromStream.to_string(),
-            "failed to read from stream"
-        );
-    }
-
-    #[test]
-    fn test_error_display_auth() {
-        assert_eq!(
-            TcpNetworkerErrors::FailedToAuthenticate.to_string(),
-            "authentication failed"
-        );
-    }
-
-    #[test]
-    fn test_error_display_decrypt() {
-        assert_eq!(
-            TcpNetworkerErrors::FailedToDecryptTunnel.to_string(),
-            "failed to decrypt tunnel data"
-        );
-    }
-
-    #[test]
-    fn test_error_display_local_addr() {
-        assert_eq!(
-            TcpNetworkerErrors::FailedToGetLocalAddr.to_string(),
-            "failed to get local address"
-        );
-    }
-
-    #[test]
-    fn test_error_display_connect() {
-        assert_eq!(
-            TcpNetworkerErrors::FailedToConnect.to_string(),
-            "failed to make a connection request"
-        );
-    }
-
-    #[test]
-    fn test_error_display_encrypt() {
-        assert_eq!(
-            TcpNetworkerErrors::FailedToEncryptTunnel.to_string(),
-            "failed to encrypt tunnel data"
-        );
-    }
-
-    #[test]
-    fn test_error_display_write() {
-        assert_eq!(
-            TcpNetworkerErrors::FailedToWriteToStream.to_string(),
-            "failed to write to stream"
-        );
-    }
-
-    #[test]
-    fn test_error_display_spawn_blocking() {
-        assert_eq!(
-            TcpNetworkerErrors::FailedToSpawnNewBlockingTask.to_string(),
-            "failed to spawn new blocking task"
-        );
-    }
-
-    // -------------------------------------------------------------------------
-    // recv_handler tests
-    // -------------------------------------------------------------------------
-
-    /// A peer whose address is not in trusted_addrs must be rejected gracefully.
-    /// recv_handler returns Ok(()) — a closed untrusted connection is not an error.
+    /// Test that two new devices pair and the payload arrives intact
     #[tokio::test]
-    async fn test_recv_handler_untrusted_addr_rejected() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let client = TcpStream::connect(addr).await.unwrap();
-        let (server, peer_addr) = listener.accept().await.unwrap();
+    async fn test_pair_and_send_debug_packet() {
+        let server = make_context(TEST_A_KEY, accept_all);
+        let client = make_context(TEST_A_KEY, accept_all);
+        let server_peers = server.trusted_peers.clone();
+        let client_peers = client.trusted_peers.clone();
 
-        // Empty trusted list — peer_addr fails the allowlist check inside auth_incoming.
-        let (keys, trusted) = make_state(TEST_A_KEY, TEST_D_KEY, vec![]);
+        let (server_result, client_result) =
+            exchange(server, client, ActionType::Debug, b"Hello CesaSec!").await;
 
-        drop(client); // cleanup — server returns Ok without reading anything (IP not in trusted_addrs)
+        assert_eq!(client_result, Ok(()));
 
-        let result = recv_handler((server, peer_addr), keys, trusted).await;
-        assert!(result.is_ok());
+        let packet = server_result.unwrap().unwrap();
+
+        assert_eq!(packet.action_type, ActionType::Debug);
+        assert_eq!(packet.data.as_slice(), b"Hello CesaSec!");
+        assert_eq!(server_peers.read().await.len(), 1);
+        assert_eq!(client_peers.read().await.len(), 1);
     }
 
-    /// Stream closing during auth must return FailedToAuthenticate.
+    /// Test that a payload of exactly MAX_DATA_PACKET_LEN bytes arrives intact
     #[tokio::test]
-    async fn test_recv_handler_stream_closes_during_auth() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let client = TcpStream::connect(addr).await.unwrap();
-        let (server, peer_addr) = listener.accept().await.unwrap();
+    async fn test_max_size_payload() {
+        let data = vec![0x5A; SECURE_MSG_MAX_PAYLOAD];
 
-        // peer_addr is trusted — auth proceeds, then fails when stream closes immediately.
-        let (keys, trusted) = make_state(TEST_A_KEY, TEST_D_KEY, vec![peer_addr]);
-
-        drop(client); // EOF on auth_incoming's first read_exact
-
-        let result = recv_handler((server, peer_addr), keys, trusted).await;
-        assert_eq!(
-            result.unwrap_err(),
-            TcpNetworkerErrors::FailedToAuthenticate
-        );
-    }
-
-    /// Wrong auth key must cause auth_incoming to return false — server closes gracefully.
-    ///
-    /// We drive the client side with auth_outgoing (wrong key) instead of client_auth —
-    /// auth_outgoing handles the server closing mid-handshake gracefully (EOF → Err),
-    /// whereas client_auth would panic on unwrap() when the 60-byte server response never arrives.
-    #[tokio::test]
-    async fn test_recv_handler_wrong_auth_key() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let mut client = TcpStream::connect(addr).await.unwrap();
-        let (server, peer_addr) = listener.accept().await.unwrap();
-
-        let (keys, trusted) = make_state(TEST_A_KEY, TEST_D_KEY, vec![peer_addr]);
-
-        let server_task = tokio::spawn(recv_handler((server, peer_addr), keys, trusted));
-
-        // auth_outgoing sends the wrong key then reads the server's response.
-        // When the server closes without responding, auth_outgoing returns Err(FailedToReadFromStream)
-        // instead of panicking — so the client task exits cleanly.
-        let wrong_a_key = Arc::new(RwLock::new(Keys::new(&[0x00u8; 32], &[0u8; 32])));
-        let wrong_trusted = Arc::new(RwLock::new(vec![peer_addr]));
-        let _ = auth_outgoing(wrong_a_key, wrong_trusted, (&mut client, peer_addr)).await;
-
-        let result = server_task.await.unwrap();
-        // auth_incoming sees key mismatch → returns (false, _) → recv_handler returns Ok(()).
-        assert!(result.is_ok());
-    }
-
-    /// Garbage bytes in place of the init header must be rejected by AES-GCM tag verification.
-    #[tokio::test]
-    async fn test_recv_handler_garbage_after_auth() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let mut client = TcpStream::connect(addr).await.unwrap();
-        let (server, peer_addr) = listener.accept().await.unwrap();
-
-        let (keys, trusted) = make_state(TEST_A_KEY, TEST_D_KEY, vec![peer_addr]);
-
-        let server_task = tokio::spawn(recv_handler((server, peer_addr), keys, trusted));
-
-        // Auth succeeds, then send 37 random bytes as the init header.
-        client_auth(&mut client, TEST_A_KEY).await;
-        client.write_all(&[0xDE; 37]).await.unwrap();
-
-        let result = server_task.await.unwrap();
-        // GCM tag mismatch on the garbage bytes → FailedToDecryptTunnel.
-        assert_eq!(
-            result.unwrap_err(),
-            TcpNetworkerErrors::FailedToDecryptTunnel
-        );
-    }
-
-    /// Closing the stream after auth but before the init header must return FailedToReadFromStream.
-    #[tokio::test]
-    async fn test_recv_handler_closes_after_auth() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let mut client = TcpStream::connect(addr).await.unwrap();
-        let (server, peer_addr) = listener.accept().await.unwrap();
-
-        let (keys, trusted) = make_state(TEST_A_KEY, TEST_D_KEY, vec![peer_addr]);
-
-        let server_task = tokio::spawn(recv_handler((server, peer_addr), keys, trusted));
-
-        client_auth(&mut client, TEST_A_KEY).await;
-        drop(client); // EOF on recv_handler's read_exact for the init header
-
-        let result = server_task.await.unwrap();
-        assert_eq!(
-            result.unwrap_err(),
-            TcpNetworkerErrors::FailedToReadFromStream
-        );
-    }
-
-    // -------------------------------------------------------------------------
-    // Full client -> server test (manual client + recv_handler)
-    // -------------------------------------------------------------------------
-
-    /// Full end-to-end test: a manually constructed client sends a correctly formatted
-    /// and encrypted packet — recv_handler on the server side must accept and decrypt it.
-    ///
-    /// Driving the client manually (not via connect_handler) gives full control over the
-    /// wire format so recv_handler can be verified in isolation.
-    #[tokio::test]
-    async fn test_full_client_to_server() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let mut client = TcpStream::connect(addr).await.unwrap();
-        let (server, peer_addr) = listener.accept().await.unwrap();
-
-        let (keys, trusted) = make_state(TEST_A_KEY, TEST_D_KEY, vec![peer_addr]);
-
-        let server_task = tokio::spawn(recv_handler((server, peer_addr), keys, trusted));
-
-        // Auth: complete the handshake and obtain the ephemeral session key.
-        let shared_hash = client_auth(&mut client, TEST_A_KEY).await;
-
-        let plaintext = b"hello from client";
-
-        // Double-encrypt: inner = d_key, outer = session key — mirrors connect_handler.
-        let inner = encrypt_tunnel(&TEST_D_KEY, plaintext).unwrap();
-        let outer = encrypt_tunnel(&shared_hash, &inner).unwrap();
-
-        // Init header: store outer.len() (the encrypted packet size) so recv_handler
-        // knows exactly how many bytes to read_exact() for the data packet.
-        let mut init_plaintext = [0u8; 9];
-        init_plaintext[0] = ActionType::Debug as u8;
-        init_plaintext[1..9].copy_from_slice(&(outer.len() as u64).to_le_bytes());
-
-        let init_packet = encrypt_tunnel(&shared_hash, &init_plaintext).unwrap();
-        client.write_all(&init_packet).await.unwrap();
-        client.write_all(&outer).await.unwrap();
-
-        assert!(server_task.await.unwrap().is_ok());
-    }
-
-    /// Same as test_full_client_to_server but with a 512-byte payload to verify the
-    /// size field is decoded and used correctly for larger data.
-    #[tokio::test]
-    async fn test_full_client_to_server_large_payload() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let mut client = TcpStream::connect(addr).await.unwrap();
-        let (server, peer_addr) = listener.accept().await.unwrap();
-
-        let (keys, trusted) = make_state(TEST_A_KEY, TEST_D_KEY, vec![peer_addr]);
-
-        let server_task = tokio::spawn(recv_handler((server, peer_addr), keys, trusted));
-
-        let shared_hash = client_auth(&mut client, TEST_A_KEY).await;
-
-        let plaintext = vec![0xBE; 512];
-        let inner = encrypt_tunnel(&TEST_D_KEY, &plaintext).unwrap();
-        let outer = encrypt_tunnel(&shared_hash, &inner).unwrap();
-
-        let mut init_plaintext = [0u8; 9];
-        init_plaintext[0] = ActionType::ClipboardSync as u8;
-        init_plaintext[1..9].copy_from_slice(&(outer.len() as u64).to_le_bytes());
-
-        let init_packet = encrypt_tunnel(&shared_hash, &init_plaintext).unwrap();
-        client.write_all(&init_packet).await.unwrap();
-        client.write_all(&outer).await.unwrap();
-
-        assert!(server_task.await.unwrap().is_ok());
-    }
-
-    // -------------------------------------------------------------------------
-    // Full server -> client test (connect_handler + recv_handler)
-    // -------------------------------------------------------------------------
-
-    /// Full end-to-end test pairing connect_handler (sender) with recv_handler (receiver).
-    ///
-    /// connect_handler runs auth_outgoing, double-encrypts the payload, and sends it.
-    /// recv_handler runs auth_incoming, reads and double-decrypts the payload.
-    /// Both sides use the same pre-shared keys — the ECDH session key is negotiated live
-    /// so it's different every run.
-    #[tokio::test]
-    async fn test_full_server_to_client() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-
-        // Connect first so we can get the client's ephemeral address before building
-        // the trusted_addrs list — auth_incoming checks the peer's address.
-        let outgoing = TcpStream::connect(server_addr).await.unwrap();
-        let client_addr = outgoing.local_addr().unwrap();
-        let (server_stream, peer_addr) = listener.accept().await.unwrap();
-
-        // Server trusts the client's ephemeral addr; client trusts the server addr.
-        let (keys_s, trusted_s) = make_state(TEST_A_KEY, TEST_D_KEY, vec![client_addr]);
-        let (keys_c, trusted_c) = make_state(TEST_A_KEY, TEST_D_KEY, vec![server_addr]);
-
-        // Spawn the server (recv_handler) — blocks waiting for the client's ECDH public key.
-        let server_task = tokio::spawn(recv_handler(
-            (server_stream, peer_addr),
-            keys_s,
-            trusted_s,
-        ));
-
-        // Run the client (connect_handler) inline — drives auth + double-encrypt + send.
-        let client_result = connect_handler(
-            keys_c,
-            trusted_c,
-            server_addr,
-            outgoing,
-            ActionType::Debug,
-            b"hello from connect_handler".to_vec(),
-        )
-        .await;
-
-        assert!(client_result.is_ok());
-        assert!(server_task.await.unwrap().is_ok());
-    }
-
-    /// Same as test_full_server_to_client with a 256-byte ClipboardSync payload.
-    #[tokio::test]
-    async fn test_full_server_to_client_large_payload() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-
-        let outgoing = TcpStream::connect(server_addr).await.unwrap();
-        let client_addr = outgoing.local_addr().unwrap();
-        let (server_stream, peer_addr) = listener.accept().await.unwrap();
-
-        let (keys_s, trusted_s) = make_state(TEST_A_KEY, TEST_D_KEY, vec![client_addr]);
-        let (keys_c, trusted_c) = make_state(TEST_A_KEY, TEST_D_KEY, vec![server_addr]);
-
-        let server_task = tokio::spawn(recv_handler(
-            (server_stream, peer_addr),
-            keys_s,
-            trusted_s,
-        ));
-
-        let result = connect_handler(
-            keys_c,
-            trusted_c,
-            server_addr,
-            outgoing,
+        let (server_result, client_result) = exchange(
+            make_context(TEST_A_KEY, accept_all),
+            make_context(TEST_A_KEY, accept_all),
             ActionType::ClipboardSync,
-            vec![0xAA; 256],
+            &data,
         )
         .await;
 
-        assert!(result.is_ok());
-        assert!(server_task.await.unwrap().is_ok());
-    }
-
-    // -------------------------------------------------------------------------
-    // connect_handler specific tests
-    // -------------------------------------------------------------------------
-
-    /// ConnectNewDevice must add the peer's address to trusted_addrs and return Ok.
-    /// No init header or data packet is sent after auth — the handler exits immediately.
-    ///
-    /// recv_handler on the server side will return FailedToReadFromStream (EOF) because
-    /// connect_handler closes the stream without sending any data — this is expected.
-    #[tokio::test]
-    async fn test_connect_handler_connect_new_device_adds_trusted() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-
-        let outgoing = TcpStream::connect(server_addr).await.unwrap();
-        let client_addr = outgoing.local_addr().unwrap();
-        let (server_stream, peer_addr) = listener.accept().await.unwrap();
-
-        // Client's trusted list starts with just the server addr.
-        let trusted = Arc::new(RwLock::new(vec![server_addr]));
-        let trusted_clone = Arc::clone(&trusted);
-        let keys = Arc::new(RwLock::new(Keys::new(&TEST_A_KEY, &TEST_D_KEY)));
-
-        // Server side: recv_handler waits for data that never comes — it will get EOF
-        // when connect_handler returns after auth (ConnectNewDevice shortcut).
-        let server_task = tokio::spawn(recv_handler(
-            (server_stream, peer_addr),
-            Arc::new(RwLock::new(Keys::new(&TEST_A_KEY, &TEST_D_KEY))),
-            Arc::new(RwLock::new(vec![client_addr])),
-        ));
-
-        let result = connect_handler(
-            keys,
-            trusted_clone,
-            server_addr,
-            outgoing,
-            ActionType::ConnectNewDevice,
-            vec![],
-        )
-        .await;
-
-        assert!(result.is_ok());
-        // server_addr must now be in the client's trusted list.
-        assert!(trusted.read().await.contains(&server_addr));
-
-        // Server gets EOF after auth — FailedToReadFromStream is expected here.
-        let server_result = server_task.await.unwrap();
+        assert_eq!(client_result, Ok(()));
         assert_eq!(
-            server_result.unwrap_err(),
-            TcpNetworkerErrors::FailedToReadFromStream
+            server_result.unwrap().unwrap().data.as_slice(),
+            data.as_slice()
         );
     }
 
-    /// Cancelling before connect() is called must return Ok(()) immediately.
+    /// Test that the client refuses to send more than MAX_DATA_PACKET_LEN
+    #[tokio::test]
+    async fn test_oversized_payload_rejected_by_sender() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = TcpStream::connect(addr).await.unwrap();
+
+        let result = connect_handler(
+            make_context(TEST_A_KEY, accept_all),
+            addr,
+            stream,
+            ActionType::ClipboardSync,
+            Zeroizing::new(vec![0u8; SECURE_MSG_MAX_PAYLOAD + 1]),
+        )
+        .await;
+
+        assert_eq!(result, Err(TcpNetworkerErrors::DataTooLarge));
+    }
+
+    /// Test that ConnectNewDevice pairs and delivers an empty payload
+    #[tokio::test]
+    async fn test_connect_new_device_pairs_without_payload() {
+        let server = make_context(TEST_A_KEY, accept_all);
+        let server_peers = server.trusted_peers.clone();
+
+        let (server_result, client_result) = exchange(
+            server,
+            make_context(TEST_A_KEY, accept_all),
+            ActionType::ConnectNewDevice,
+            b"ignored",
+        )
+        .await;
+
+        assert_eq!(client_result, Ok(()));
+
+        let packet = server_result.unwrap().unwrap();
+
+        assert_eq!(packet.action_type, ActionType::ConnectNewDevice);
+        assert!(packet.data.is_empty());
+        assert_eq!(server_peers.read().await.len(), 1);
+    }
+
+    /// Test that a peer with a different a_key gets nothing and pairs nothing
+    #[tokio::test]
+    async fn test_wrong_a_key_rejected() {
+        let server = make_context(TEST_A_KEY, accept_all);
+        let server_peers = server.trusted_peers.clone();
+
+        let (server_result, client_result) = exchange(
+            server,
+            make_context([0x11; 32], accept_all),
+            ActionType::Debug,
+            b"secret",
+        )
+        .await;
+
+        assert!(server_result.unwrap().is_none());
+        assert_eq!(client_result, Err(TcpNetworkerErrors::FailedToAuthenticate));
+        assert!(server_peers.read().await.is_empty());
+    }
+
+    /// Test that a rejected pairing delivers no data and saves no peer on either side
+    #[tokio::test]
+    async fn test_rejected_pairing_sends_nothing() {
+        let server = make_context(TEST_A_KEY, reject_all);
+        let client = make_context(TEST_A_KEY, accept_all);
+        let server_peers = server.trusted_peers.clone();
+        let client_peers = client.trusted_peers.clone();
+
+        let (server_result, client_result) =
+            exchange(server, client, ActionType::Debug, b"secret").await;
+
+        assert_eq!(
+            server_result.err(),
+            Some(TcpNetworkerErrors::FailedToAuthenticate)
+        );
+        assert_eq!(client_result, Err(TcpNetworkerErrors::FailedToAuthenticate));
+        assert!(server_peers.read().await.is_empty());
+        assert!(client_peers.read().await.is_empty());
+    }
+
+    /// Test that cancelling before connect() returns Ok(()) without connecting
     #[tokio::test]
     async fn test_connect_cancels_before_connecting() {
         let token = CancellationToken::new();
-        let keys = Arc::new(RwLock::new(Keys::new(&TEST_A_KEY, &TEST_D_KEY)));
-        let trusted = Arc::new(RwLock::new(vec![]));
 
-        token.cancel(); // cancel before calling connect
+        token.cancel();
 
         let unreachable: SocketAddr = "127.0.0.1:19999".parse().unwrap();
         let result = connect(
-            keys,
-            trusted,
+            make_context(TEST_A_KEY, accept_all),
             token,
             unreachable,
             ActionType::Debug,
-            vec![],
+            Zeroizing::new(Vec::new()),
         )
         .await;
+
         assert!(result.is_ok());
     }
 
-    /// Connecting to a closed port must return FailedToConnect.
+    /// Test that connecting to a closed port returns FailedToConnect
     #[tokio::test]
     async fn test_connect_to_closed_port_fails() {
-        let keys = Arc::new(RwLock::new(Keys::new(&TEST_A_KEY, &TEST_D_KEY)));
-        let trusted = Arc::new(RwLock::new(vec![]));
-        let token = CancellationToken::new();
-
-        // Bind then drop immediately — port is closed by the time TcpStream::connect runs.
+        // bind then drop, so the port is closed when connect runs
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
 
         let result = connect(
-            keys,
-            trusted,
-            token,
+            make_context(TEST_A_KEY, accept_all),
+            CancellationToken::new(),
             addr,
             ActionType::Debug,
-            vec![],
+            Zeroizing::new(Vec::new()),
         )
         .await;
+
         assert_eq!(result.unwrap_err(), TcpNetworkerErrors::FailedToConnect);
     }
 }

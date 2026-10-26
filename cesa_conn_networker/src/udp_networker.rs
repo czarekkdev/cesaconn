@@ -10,7 +10,42 @@ use tokio::time::{Duration, sleep, timeout};
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroize;
 
-use crate::auth_old::{Keys, decrypt_tunnel, encrypt_tunnel};
+use crate::auth_snow::Keys;
+use cesa_conn_crypto::aes::{AESError, decrypt, encrypt};
+
+/// AES-GCM nonce length (bytes).
+const TUNNEL_NONCE_LEN: usize = 12;
+/// AES-GCM authentication tag length (bytes).
+const TUNNEL_TAG_LEN: usize = 16;
+
+/// Encrypts `plaintext` with AES-256-GCM under `key`.
+/// Returns: nonce (12 bytes) + ciphertext (N + 16 bytes). The nonce is random,
+/// so the output differs on every call even for the same input.
+pub(crate) fn encrypt_tunnel(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, AESError> {
+    let (ciphertext, nonce) = encrypt(key, plaintext)?;
+
+    let mut packet = Vec::with_capacity(ciphertext.len().saturating_add(TUNNEL_NONCE_LEN));
+
+    packet.extend_from_slice(&nonce);
+    packet.extend_from_slice(&ciphertext);
+
+    Ok(packet)
+}
+
+/// Inverse of [`encrypt_tunnel`]: splits off the nonce and decrypts the rest.
+/// Packets shorter than nonce + tag are rejected before touching AES.
+pub(crate) fn decrypt_tunnel(key: &[u8; 32], packet: &[u8]) -> Result<Vec<u8>, AESError> {
+    if packet.len() < TUNNEL_NONCE_LEN + TUNNEL_TAG_LEN {
+        return Err(AESError::DecryptionFailed);
+    }
+
+    let (nonce, ciphertext) = packet.split_at(TUNNEL_NONCE_LEN);
+
+    let nonce: &[u8; TUNNEL_NONCE_LEN] =
+        nonce.try_into().map_err(|_| AESError::DecryptionFailed)?;
+
+    decrypt(key, ciphertext, nonce)
+}
 
 /// Errors that can occur during UDP networking operations
 #[derive(Debug, PartialEq)]
@@ -230,7 +265,9 @@ pub async fn udp_find_broadcaster(
 
     // Convert received bytes to string for device name comparison
     debug!(%addr, "decrypting received UDP packet");
-    let name = decrypt_tunnel(&keys.read().await.a_key, &buf[..len])
+    // len < buf.len() checked above
+    let received = buf.get(..len).ok_or(UdpNetworkerErrors::DataTooBig)?;
+    let name = decrypt_tunnel(&keys.read().await.a_key, received)
         .map_err(|e| {
             warn!(%addr, error = %e, "failed to decrypt received UDP packet — wrong key or tampered data");
             UdpNetworkerErrors::FailedToDecryptTunnel
@@ -251,9 +288,11 @@ pub async fn udp_find_broadcaster(
 }
 
 #[cfg(test)]
+// tests bind the fixed discovery port 3636: the guard is held across awaits on
+// purpose, so they run one at a time
+#[allow(clippy::await_holding_invalid_type)]
 mod tests {
     use super::*;
-    use crate::auth_old::encrypt_tunnel;
     use tokio::net::UdpSocket;
     use tokio::time::{Duration, sleep};
 
@@ -397,6 +436,7 @@ mod tests {
         let addrs = known_addrs.read().await;
         assert_eq!(addrs.len(), 3);
         assert!(addrs.contains(&"192.168.1.2:6363".parse::<SocketAddr>().unwrap()));
+        drop(addrs);
     }
 
     /// An `Arc::clone` of a `RwLock<Vec<SocketAddr>>` must share the same underlying data
@@ -410,8 +450,7 @@ mod tests {
         let clone = Arc::clone(&known_addrs);
 
         tokio::spawn(async move {
-            let addrs = clone.read().await;
-            assert_eq!(addrs.len(), 1);
+            assert_eq!(clone.read().await.len(), 1);
         })
         .await
         .unwrap();

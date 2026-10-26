@@ -1,13 +1,10 @@
 /*
 TODO:
 add tests
-add client-side (same transcript order, SPAKE2 identities and signature order)
 add chunking to SecureConnection read/write
 persist DeviceKeypairs (private keys encrypted / in the OS keychain)
 sync the trusted peer list between devices, allow revoking one device
 add encrypting/decrypting data with aes256 in SecureConnection with d_key
-always receive the client's verification key in verify_sig_server (compare it with the stored one for known peers), so both sides agree on the message order
-verify the new device's signature before asking the user in pair_fallback; client read timeout must be >= PAIRING_TIMEOUT
  */
 
 /* Constant variables for noise protocol */
@@ -23,6 +20,9 @@ const SNOW_MSG3_LEN: usize = 64;
 const SNOW_MSG_MAX_LEN: usize = 65535;
 /// authentication tag
 const SNOW_TAG_LEN: usize = 16;
+/// biggest payload one [`SecureConnection`] message can carry:
+/// max noise message - AEAD tag - our tag byte
+pub const SECURE_MSG_MAX_PAYLOAD: usize = SNOW_MSG_MAX_LEN - SNOW_TAG_LEN - 1;
 
 /// read/write timeout (seconds)
 pub const TIMEOUT: u64 = 5;
@@ -31,9 +31,15 @@ pub const TIMEOUT: u64 = 5;
 pub const PAIRING_TIMEOUT: u64 = 60;
 
 use crate::{
-    auth_snow::Tags::{ClientAcceptTag, IsSavedTag, MLDSA87SignatureTag, MLDSA87VerificationKeyTag},
-    hybrid_kex::hybrid_kex_server,
-    spake2::{spake2_confirm_mutual_auth_server, spake2_exchange_server},
+    auth_snow::Tags::ServerAcceptTag,
+    auth_snow::Tags::{
+        ClientAcceptTag, IsSavedTag, MLDSA87SignatureTag, MLDSA87VerificationKeyTag,
+    },
+    hybrid_kex::{HybridKep, hybrid_kex_client, hybrid_kex_server},
+    spake2::{
+        spake2_confirm_mutual_auth_client, spake2_confirm_mutual_auth_server,
+        spake2_exchange_client, spake2_exchange_server,
+    },
     tcp_networker::IncomingConnection,
 };
 use blake2::Blake2s256;
@@ -94,8 +100,6 @@ pub enum AuthSnowErrors {
     FailedToConfirmKex,
     /// The hybrid (X25519 + ML-KEM) key exchange failed.
     KexFailed,
-    /// Any step of the Noise handshake failed.
-    FailedToCompleteSnowHandshake,
     /// A decrypted packet did not end with the expected tag byte.
     WrongTag,
     /// The peer did not send data within [`TIMEOUT`] seconds.
@@ -122,6 +126,14 @@ pub enum AuthSnowErrors {
     PairingTimeout,
     /// The server didnt get the confirming byte from the client
     NoClientConfirmation,
+    /// The client did not get a positive pairing decision from the server.
+    NoServerConfirmation,
+    /// Snow could not build the handshake state for the initiator role.
+    FailedToBuildSnowInitiator,
+    /// A known peer sent a different ML-DSA verification key than the one we stored.
+    PeerKeyMismatch,
+    /// A message is bigger than one [`SecureConnection`] message can carry.
+    MessageTooLarge,
 }
 
 impl fmt::Display for AuthSnowErrors {
@@ -174,9 +186,6 @@ impl fmt::Display for AuthSnowErrors {
             AuthSnowErrors::KexFailed => {
                 write!(f, "key exchange failed")
             }
-            AuthSnowErrors::FailedToCompleteSnowHandshake => {
-                write!(f, "failed to complete snow handshake")
-            }
             AuthSnowErrors::WrongTag => {
                 write!(f, "packet has a wrong tag")
             }
@@ -216,6 +225,18 @@ impl fmt::Display for AuthSnowErrors {
             AuthSnowErrors::NoClientConfirmation => {
                 write!(f, "server didnt recieve pairing confirmation from client")
             }
+            AuthSnowErrors::NoServerConfirmation => {
+                write!(f, "client didn't receive pairing confirmation from server")
+            }
+            AuthSnowErrors::FailedToBuildSnowInitiator => {
+                write!(f, "failed to build snow initiator")
+            }
+            AuthSnowErrors::PeerKeyMismatch => {
+                write!(f, "peer's verification key doesn't match the stored one")
+            }
+            AuthSnowErrors::MessageTooLarge => {
+                write!(f, "message is too large for one secure connection message")
+            }
         }
     }
 }
@@ -235,6 +256,8 @@ pub enum Tags {
     ClientAcceptTag = 0x04,
     /// For checking whether other party has us saved
     IsSavedTag = 0x05,
+    /// Server accepted to pair
+    ServerAcceptTag = 0x06,
 }
 
 impl Tags {
@@ -244,6 +267,7 @@ impl Tags {
     }
 
     /// Returns `true` if `packet` ends with this tag.
+    #[allow(dead_code)] // API for callers outside the PoC binary (daemon, tests)
     pub fn check_tag(self, packet: &[u8]) -> bool {
         packet.ends_with(&[self as u8])
     }
@@ -283,11 +307,16 @@ impl SecureConnection {
     /// Tags `src`, encrypts it and sends it to the peer.
     ///
     /// Note: `src` is modified (the tag byte is appended).
+    /// At most [`SECURE_MSG_MAX_PAYLOAD`] bytes fit into one message.
     pub async fn write(&mut self, src: &mut Vec<u8>, tag: Tags) -> Result<(), AuthSnowErrors> {
+        if src.len() > SECURE_MSG_MAX_PAYLOAD {
+            return Err(AuthSnowErrors::MessageTooLarge);
+        }
+
         tag.tag(src);
 
         // ciphertext = plaintext + AEAD tag
-        let mut buffer = Zeroizing::new(vec![0u8; src.len() + SNOW_TAG_LEN]);
+        let mut buffer = Zeroizing::new(vec![0u8; src.len().saturating_add(SNOW_TAG_LEN)]);
 
         self.ts
             .write_message(src, &mut buffer)
@@ -310,7 +339,12 @@ impl SecureConnection {
     ///
     /// Returns the payload length (decrypted bytes without the tag byte).
     pub async fn read(&mut self, buffer: &mut Vec<u8>, tag: Tags) -> Result<usize, AuthSnowErrors> {
-        let mut message = Zeroizing::new(vec![0u8; buffer.len() + SNOW_TAG_LEN]);
+        // +1 is the tag byte inside the payload
+        if buffer.len() > SECURE_MSG_MAX_PAYLOAD + 1 {
+            return Err(AuthSnowErrors::MessageTooLarge);
+        }
+
+        let mut message = Zeroizing::new(vec![0u8; buffer.len().saturating_add(SNOW_TAG_LEN)]);
 
         // Every caller wraps `SecureConnection::read` in `timeout(...)` (TIMEOUT /
         // PAIRING_TIMEOUT), so this low-level read deliberately has none of its own.
@@ -330,7 +364,31 @@ impl SecureConnection {
             return Err(AuthSnowErrors::WrongTag);
         }
 
-        Ok(read - 1)
+        // read >= 1, untag() just removed the tag byte
+        Ok(read.saturating_sub(1))
+    }
+
+    /// [`Self::write`] bounded by [`TIMEOUT`].
+    pub async fn write_timeout(
+        &mut self,
+        src: &mut Vec<u8>,
+        tag: Tags,
+    ) -> Result<(), AuthSnowErrors> {
+        send_secure(self, src, tag, TIMEOUT).await
+    }
+
+    /// [`Self::read`] bounded by [`TIMEOUT`].
+    pub async fn read_timeout(
+        &mut self,
+        buffer: &mut Vec<u8>,
+        tag: Tags,
+    ) -> Result<usize, AuthSnowErrors> {
+        let read = self.read(buffer, tag);
+
+        timeout(Duration::from_secs(TIMEOUT), read)
+            .await
+            .map_err(|_| AuthSnowErrors::ReadTimeout)?
+            .map_err(|_| AuthSnowErrors::FailedToReadFromSecureConnection)
     }
 }
 
@@ -417,6 +475,7 @@ impl Salts {
     }
 
     /// Wraps two raw 32-byte arrays in `Zeroizing`.
+    #[allow(dead_code)] // API for callers outside the PoC binary (daemon, tests)
     pub fn new(a_salt: [u8; 32], d_salt: [u8; 32]) -> Self {
         Self {
             a_salt: Zeroizing::new(a_salt),
@@ -451,6 +510,7 @@ impl DeviceKeypairs {
     }
 
     /// Wraps already existing key pairs, e.g. loaded from storage.
+    #[allow(dead_code)] // API for callers outside the PoC binary (daemon, tests)
     pub fn new(x25519_kep: X25519KeyPair, mldsa_kep: MLDSA87KeyPair) -> Self {
         Self {
             x25519_kep,
@@ -472,6 +532,7 @@ pub struct TrustedPeer {
 
 impl TrustedPeer {
     /// Creates a trusted peer entry from its two public keys and name.
+    #[allow(dead_code)] // API for callers outside the PoC binary (daemon, tests)
     pub fn new(x25519_pub_key: [u8; 32], mldsa_verification_key: [u8; 2592], name: String) -> Self {
         Self {
             x25519_pub_key,
@@ -479,181 +540,438 @@ impl TrustedPeer {
             name,
         }
     }
+
+    /// Human-readable device name shown to the user.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The peer's Noise static public key.
+    #[allow(dead_code)] // API for callers outside the PoC binary (daemon, tests)
+    pub fn x25519_pub_key(&self) -> &[u8; 32] {
+        &self.x25519_pub_key
+    }
 }
 
-/// Mutual ML-DSA authentication over the finished Noise handshake (server side).
-///
-/// 1. <- (only when pairing, `trusted_peer` is `None`) client's verification key
-/// 2. <- client's signature over `handshake_hash`, checked with the client's key
-/// 3. -> our verification key
-/// 4. -> our signature over `handshake_hash`
-///
-/// The handshake hash is unique per connection and identical on both sides,
-/// so a valid signature proves the peer took part in this exact handshake.
-///
-/// Every key and signature sent or received is appended to `transcript`
-/// in the order listed above.
-///
-/// Returns the client's verification key (the stored one for a known peer,
-/// the received one when pairing).
-async fn verify_sig_server(
-    secure_connection: &mut SecureConnection,
-    handshake_hash: Zeroizing<[u8; 32]>,
-    trusted_peer: Option<&TrustedPeer>,
-    device_keypairs: &DeviceKeypairs,
-    transcript: &mut Zeroizing<Vec<u8>>,
-) -> Result<[u8; MLDSA87VerificationKey::len()], AuthSnowErrors> {
-    match trusted_peer {
-        // known peer: only its signature, checked with the stored key
-        Some(peer) => {
-            // +1 for the tag byte that read() removes
-            let mut sig_buffer = vec![0u8; MLDSA87Signature::len() + 1];
+/// Which end of the connection we are. Decides who sends first after the
+/// Noise handshake and which ML-DSA signing context belongs to whom.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Role {
+    /// We opened the connection (Noise initiator, SPAKE2 side A).
+    Client,
+    /// We accepted the connection (Noise responder, SPAKE2 side B).
+    Server,
+}
 
-            let read = secure_connection.read(&mut sig_buffer, MLDSA87SignatureTag);
+impl Role {
+    /// ML-DSA context of the client's handshake signature.
+    const CLIENT_CONTEXT: &'static [u8] = b"CesaConn Client Handshake";
+    /// ML-DSA context of the server's handshake signature.
+    const SERVER_CONTEXT: &'static [u8] = b"CesaConn Server Handshake";
 
-            timeout(Duration::from_secs(TIMEOUT), read)
-                .await
-                .map_err(|_| AuthSnowErrors::ReadTimeout)?
-                .map_err(|_| AuthSnowErrors::FailedToReadFromSecureConnection)?;
-
-            transcript.extend_from_slice(&sig_buffer);
-
-            let signature = MLDSA87Signature::new(
-                *sig_buffer
-                    .as_array()
-                    .ok_or(AuthSnowErrors::FailedToConvertToArray)?,
-            );
-
-            verify(
-                &MLDSA87VerificationKey::new(peer.mldsa_verification_key.clone()),
-                handshake_hash.as_slice(),
-                b"CesaConn Client Handshake",
-                &signature,
-            )
-            .map_err(|_| AuthSnowErrors::FailedToVerifySignature)?;
-
-            // our key + signature, so the client can verify us too
-            let ver_key = &mut device_keypairs
-                .mldsa_kep
-                .verification_key
-                .clone()
-                .as_mut_slice()
-                .to_vec();
-
-            let mut signature = sign(
-                &device_keypairs.mldsa_kep.signing_key,
-                handshake_hash.as_slice(),
-                b"CesaConn Server Handshake",
-                *random_array::<32>().map_err(|_| AuthSnowErrors::FailedToSignData)?,
-            )
-            .map_err(|_| AuthSnowErrors::FailedToSignData)?
-            .as_mut_slice()
-            .to_vec();
-
-            transcript.extend_from_slice(ver_key);
-            transcript.extend_from_slice(&signature);
-
-            let send = secure_connection.write(ver_key, MLDSA87VerificationKeyTag);
-
-            timeout(Duration::from_secs(TIMEOUT), send)
-                .await
-                .map_err(|_| AuthSnowErrors::WriteTimeout)?
-                .map_err(|_| AuthSnowErrors::FailedToWriteToSecureConnection)?;
-
-            let send = secure_connection.write(&mut signature, MLDSA87SignatureTag);
-
-            timeout(Duration::from_secs(TIMEOUT), send)
-                .await
-                .map_err(|_| AuthSnowErrors::WriteTimeout)?
-                .map_err(|_| AuthSnowErrors::FailedToWriteToSecureConnection)?;
-
-            Ok(peer.mldsa_verification_key.clone())
+    /// Context we sign our own handshake signature with.
+    fn own_context(self) -> &'static [u8] {
+        match self {
+            Role::Client => Self::CLIENT_CONTEXT,
+            Role::Server => Self::SERVER_CONTEXT,
         }
-        // new peer (pairing): its key first, then a signature made with that key,
-        // which proves it actually owns the key it sent
-        None => {
-            // +1 for the tag byte that read() removes
-            let mut ver_buffer = vec![0u8; MLDSA87VerificationKey::len() + 1];
-            let mut sig_buffer = vec![0u8; MLDSA87Signature::len() + 1];
+    }
 
-            let read = secure_connection.read(&mut ver_buffer, MLDSA87VerificationKeyTag);
-
-            timeout(Duration::from_secs(TIMEOUT), read)
-                .await
-                .map_err(|_| AuthSnowErrors::ReadTimeout)?
-                .map_err(|_| AuthSnowErrors::FailedToReadFromSecureConnection)?;
-
-            let read = secure_connection.read(&mut sig_buffer, MLDSA87SignatureTag);
-
-            timeout(Duration::from_secs(TIMEOUT), read)
-                .await
-                .map_err(|_| AuthSnowErrors::ReadTimeout)?
-                .map_err(|_| AuthSnowErrors::FailedToReadFromSecureConnection)?;
-
-            transcript.extend_from_slice(&ver_buffer);
-            transcript.extend_from_slice(&sig_buffer);
-
-            let verification_key = MLDSA87VerificationKey::new(
-                *ver_buffer
-                    .as_array()
-                    .ok_or(AuthSnowErrors::FailedToConvertToArray)?,
-            );
-
-            let signature = MLDSA87Signature::new(
-                *sig_buffer
-                    .as_array()
-                    .ok_or(AuthSnowErrors::FailedToConvertToArray)?,
-            );
-
-            verify(
-                &verification_key,
-                handshake_hash.as_slice(),
-                b"CesaConn Client Handshake",
-                &signature,
-            )
-            .map_err(|_| AuthSnowErrors::FailedToVerifySignature)?;
-
-            // our key + signature, so the client can verify us too
-            let ver_key = &mut device_keypairs
-                .mldsa_kep
-                .verification_key
-                .clone()
-                .as_mut_slice()
-                .to_vec();
-
-            let mut signature = sign(
-                &device_keypairs.mldsa_kep.signing_key,
-                handshake_hash.as_slice(),
-                b"CesaConn Server Handshake",
-                *random_array::<32>().map_err(|_| AuthSnowErrors::FailedToSignData)?,
-            )
-            .map_err(|_| AuthSnowErrors::FailedToSignData)?
-            .as_mut_slice()
-            .to_vec();
-
-            transcript.extend_from_slice(ver_key);
-            transcript.extend_from_slice(&signature);
-
-            let send = secure_connection.write(ver_key, MLDSA87VerificationKeyTag);
-
-            timeout(Duration::from_secs(TIMEOUT), send)
-                .await
-                .map_err(|_| AuthSnowErrors::WriteTimeout)?
-                .map_err(|_| AuthSnowErrors::FailedToWriteToSecureConnection)?;
-
-            let send = secure_connection.write(&mut signature, MLDSA87SignatureTag);
-
-            timeout(Duration::from_secs(TIMEOUT), send)
-                .await
-                .map_err(|_| AuthSnowErrors::WriteTimeout)?
-                .map_err(|_| AuthSnowErrors::FailedToWriteToSecureConnection)?;
-
-            Ok(*ver_buffer
-                .as_array()
-                .ok_or(AuthSnowErrors::FailedToConvertToArray)?)
+    /// Context the peer signed its handshake signature with.
+    fn peer_context(self) -> &'static [u8] {
+        match self {
+            Role::Client => Self::SERVER_CONTEXT,
+            Role::Server => Self::CLIENT_CONTEXT,
         }
     }
 }
+
+/// ML-DSA-87 verification key length (2592 bytes).
+const MLDSA87_VK_LEN: usize = MLDSA87VerificationKey::len();
+/// ML-DSA-87 signature length (4627 bytes).
+const MLDSA87_SIG_LEN: usize = MLDSA87Signature::len();
+
+/// Tags and sends `data` over `secure_connection`, bounded by `secs` seconds.
+async fn send_secure(
+    secure_connection: &mut SecureConnection,
+    data: &mut Vec<u8>,
+    tag: Tags,
+    secs: u64,
+) -> Result<(), AuthSnowErrors> {
+    let send = secure_connection.write(data, tag);
+
+    timeout(Duration::from_secs(secs), send)
+        .await
+        .map_err(|_| AuthSnowErrors::WriteTimeout)?
+        .map_err(|_| AuthSnowErrors::FailedToWriteToSecureConnection)
+}
+
+/// Reads one message of exactly `len` payload bytes with the expected `tag`,
+/// bounded by `secs` seconds. The returned buffer no longer contains the tag.
+async fn recv_secure(
+    secure_connection: &mut SecureConnection,
+    len: usize,
+    tag: Tags,
+    secs: u64,
+) -> Result<Zeroizing<Vec<u8>>, AuthSnowErrors> {
+    // +1 for the tag byte that read() removes
+    let mut buffer = Zeroizing::new(vec![0u8; len.saturating_add(1)]);
+
+    let read = secure_connection.read(&mut buffer, tag);
+
+    timeout(Duration::from_secs(secs), read)
+        .await
+        .map_err(|_| AuthSnowErrors::ReadTimeout)?
+        .map_err(|_| AuthSnowErrors::FailedToReadFromSecureConnection)?;
+
+    Ok(buffer)
+}
+
+/// Tells the peer whether we have it in `trusted_peers` and learns the same
+/// about us. The client sends first.
+///
+/// 1. -> client's "I have you saved" byte
+/// 2. <- server's "I have you saved" byte
+///
+/// Returns `true` only if BOTH sides have each other saved (no pairing needed).
+async fn exchange_is_saved(
+    secure_connection: &mut SecureConnection,
+    role: Role,
+    we_have_peer: bool,
+) -> Result<bool, AuthSnowErrors> {
+    let mut ours = vec![u8::from(we_have_peer)];
+
+    let theirs = match role {
+        Role::Client => {
+            send_secure(secure_connection, &mut ours, IsSavedTag, TIMEOUT).await?;
+            recv_secure(secure_connection, 1, IsSavedTag, TIMEOUT).await?
+        }
+        Role::Server => {
+            let theirs = recv_secure(secure_connection, 1, IsSavedTag, TIMEOUT).await?;
+            send_secure(secure_connection, &mut ours, IsSavedTag, TIMEOUT).await?;
+            theirs
+        }
+    };
+
+    Ok(we_have_peer && theirs.first() == Some(&0x01))
+}
+
+/// Checks the peer's handshake signature.
+///
+/// For a known peer the received verification key must match the stored one
+/// (constant-time), so a device can't swap its identity key. The signature is
+/// always verified with the received key, which proves the peer owns it.
+fn verify_peer_signature(
+    received_key: &[u8; MLDSA87_VK_LEN],
+    signature: &[u8; MLDSA87_SIG_LEN],
+    stored_key: Option<&[u8; MLDSA87_VK_LEN]>,
+    handshake_hash: &Zeroizing<[u8; 32]>,
+    context: &[u8],
+) -> Result<(), AuthSnowErrors> {
+    if let Some(stored_key) = stored_key {
+        if stored_key.ct_eq(received_key).unwrap_u8() != 1 {
+            return Err(AuthSnowErrors::PeerKeyMismatch);
+        }
+    }
+
+    verify(
+        &MLDSA87VerificationKey::new(*received_key),
+        handshake_hash.as_slice(),
+        context,
+        &MLDSA87Signature::new(*signature),
+    )
+    .map_err(|_| AuthSnowErrors::FailedToVerifySignature)
+}
+
+/// Mutual ML-DSA-87 authentication over the finished Noise handshake.
+///
+/// 1. -> client's verification key
+/// 2. -> client's signature over `handshake_hash`
+/// 3. <- server's verification key
+/// 4. <- server's signature over `handshake_hash`
+///
+/// Both sides ALWAYS send their key, so the message order never depends on
+/// whether the peer is known. The server checks the client's signature before
+/// sending its own. The handshake hash is unique per connection and identical
+/// on both sides, so a valid signature proves the peer took part in this exact
+/// handshake. Everything is appended to `transcript` in the order above.
+///
+/// Returns the peer's (verified) verification key.
+async fn exchange_signatures(
+    secure_connection: &mut SecureConnection,
+    role: Role,
+    handshake_hash: &Zeroizing<[u8; 32]>,
+    stored_key: Option<&[u8; MLDSA87_VK_LEN]>,
+    device_keypairs: &DeviceKeypairs,
+    transcript: &mut Zeroizing<Vec<u8>>,
+) -> Result<[u8; MLDSA87_VK_LEN], AuthSnowErrors> {
+    let mut our_key = device_keypairs
+        .mldsa_kep
+        .verification_key
+        .as_slice()
+        .to_vec();
+
+    let mut our_signature = sign(
+        &device_keypairs.mldsa_kep.signing_key,
+        handshake_hash.as_slice(),
+        role.own_context(),
+        *random_array::<32>().map_err(|_| AuthSnowErrors::FailedToSignData)?,
+    )
+    .map_err(|_| AuthSnowErrors::FailedToSignData)?
+    .as_slice()
+    .to_vec();
+
+    // kept before send_secure() appends the tag byte to our buffers
+    let our_key_wire = our_key.clone();
+    let our_signature_wire = our_signature.clone();
+
+    let (peer_key, peer_signature) = match role {
+        Role::Client => {
+            // 1. + 2.
+            send_secure(
+                secure_connection,
+                &mut our_key,
+                MLDSA87VerificationKeyTag,
+                TIMEOUT,
+            )
+            .await?;
+            send_secure(
+                secure_connection,
+                &mut our_signature,
+                MLDSA87SignatureTag,
+                TIMEOUT,
+            )
+            .await?;
+
+            // 3. + 4.
+            let peer_key = recv_secure(
+                secure_connection,
+                MLDSA87_VK_LEN,
+                MLDSA87VerificationKeyTag,
+                TIMEOUT,
+            )
+            .await?;
+            let peer_signature = recv_secure(
+                secure_connection,
+                MLDSA87_SIG_LEN,
+                MLDSA87SignatureTag,
+                TIMEOUT,
+            )
+            .await?;
+
+            transcript.extend_from_slice(&our_key_wire);
+            transcript.extend_from_slice(&our_signature_wire);
+            transcript.extend_from_slice(&peer_key);
+            transcript.extend_from_slice(&peer_signature);
+
+            (peer_key, peer_signature)
+        }
+        Role::Server => {
+            // 1. + 2.
+            let peer_key = recv_secure(
+                secure_connection,
+                MLDSA87_VK_LEN,
+                MLDSA87VerificationKeyTag,
+                TIMEOUT,
+            )
+            .await?;
+            let peer_signature = recv_secure(
+                secure_connection,
+                MLDSA87_SIG_LEN,
+                MLDSA87SignatureTag,
+                TIMEOUT,
+            )
+            .await?;
+
+            transcript.extend_from_slice(&peer_key);
+            transcript.extend_from_slice(&peer_signature);
+            transcript.extend_from_slice(&our_key_wire);
+            transcript.extend_from_slice(&our_signature_wire);
+
+            (peer_key, peer_signature)
+        }
+    };
+
+    let peer_key: &[u8; MLDSA87_VK_LEN] = peer_key
+        .as_slice()
+        .try_into()
+        .map_err(|_| AuthSnowErrors::FailedToConvertToArray)?;
+    let peer_signature: &[u8; MLDSA87_SIG_LEN] = peer_signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| AuthSnowErrors::FailedToConvertToArray)?;
+
+    // checked before we send anything else, and before any user is asked to pair
+    verify_peer_signature(
+        peer_key,
+        peer_signature,
+        stored_key,
+        handshake_hash,
+        role.peer_context(),
+    )?;
+
+    if role == Role::Server {
+        // 3. + 4. only after the client proved itself
+        send_secure(
+            secure_connection,
+            &mut our_key,
+            MLDSA87VerificationKeyTag,
+            TIMEOUT,
+        )
+        .await?;
+        send_secure(
+            secure_connection,
+            &mut our_signature,
+            MLDSA87SignatureTag,
+            TIMEOUT,
+        )
+        .await?;
+    }
+
+    Ok(*peer_key)
+}
+
+/// Pairing confirmation, run only when the two devices don't both know each other.
+///
+/// Our user compares the words derived from the handshake hash and decides
+/// (`pair_fallback`, on a blocking thread, at most [`PAIRING_TIMEOUT`]). Then:
+///
+/// 1. -> our decision (client: `ClientAcceptTag`, server: `ServerAcceptTag`)
+/// 2. <- the peer's decision
+///
+/// The peer's user may still be deciding, so the read waits up to
+/// [`PAIRING_TIMEOUT`] + [`TIMEOUT`]. We always send our decision, even a
+/// rejection, so the peer doesn't wait for nothing.
+///
+/// Returns `Ok(())` only if both users accepted.
+async fn confirm_pairing(
+    secure_connection: &mut SecureConnection,
+    role: Role,
+    handshake_hash: &Zeroizing<[u8; 32]>,
+    pair_fallback: fn(&String, &[u8; 32]) -> bool,
+) -> Result<(), AuthSnowErrors> {
+    // ask the user on a blocking thread, so tokio isn't blocked meanwhile
+    let name_clone = secure_connection.connection.name.clone();
+    let handshake_hash_clone = handshake_hash.clone();
+
+    let accept = timeout(
+        Duration::from_secs(PAIRING_TIMEOUT),
+        spawn_blocking(move || pair_fallback(&name_clone, &handshake_hash_clone)),
+    )
+    .await
+    .map_err(|_| AuthSnowErrors::PairingTimeout)?
+    .map_err(|_| AuthSnowErrors::FailedToPairNewDevice)?;
+
+    let (our_tag, peer_tag, peer_rejected) = match role {
+        Role::Client => (
+            ClientAcceptTag,
+            ServerAcceptTag,
+            AuthSnowErrors::NoServerConfirmation,
+        ),
+        Role::Server => (
+            ServerAcceptTag,
+            ClientAcceptTag,
+            AuthSnowErrors::NoClientConfirmation,
+        ),
+    };
+
+    // 1. our decision
+    let mut decision = vec![u8::from(accept)];
+
+    send_secure(secure_connection, &mut decision, our_tag, TIMEOUT).await?;
+
+    if !accept {
+        return Err(AuthSnowErrors::FailedToPairNewDevice);
+    }
+
+    // 2. the peer's decision
+    let peer_decision =
+        recv_secure(secure_connection, 1, peer_tag, PAIRING_TIMEOUT + TIMEOUT).await?;
+
+    if peer_decision.first() != Some(&0x01) {
+        return Err(peer_rejected);
+    }
+
+    Ok(())
+}
+
+/// Adds `peer` to `trusted_peers` unless a device with the same static key is
+/// already there. Checked under the write lock, so two parallel pairings of the
+/// same device can't both add it.
+async fn save_peer(trusted_peers: &TrustedPeers, peer: &TrustedPeer) {
+    let mut peers = trusted_peers.write().await;
+
+    if !peers
+        .iter()
+        .any(|saved| saved.x25519_pub_key.ct_eq(&peer.x25519_pub_key).into())
+    {
+        peers.push(peer.clone());
+    }
+}
+
+/// Everything after the Noise handshake, the same for both roles.
+///
+/// 1. tell each other whether we have the peer saved ([`exchange_is_saved`])
+/// 2. mutual ML-DSA signatures over the handshake hash ([`exchange_signatures`])
+/// 3. only if the devices don't both know each other: both users confirm
+///    ([`confirm_pairing`]), then the peer is saved
+///
+/// Returns the secure connection and the authenticated peer.
+#[allow(clippy::too_many_arguments)] // one call per role, a struct would only move the list
+async fn authenticate_peer(
+    mut secure_connection: SecureConnection,
+    role: Role,
+    peer_static: [u8; 32],
+    handshake_hash: Zeroizing<[u8; 32]>,
+    device_keypairs: &DeviceKeypairs,
+    trusted_peers: TrustedPeers,
+    pair_fallback: fn(&String, &[u8; 32]) -> bool,
+    transcript: &mut Zeroizing<Vec<u8>>,
+) -> Result<(SecureConnection, TrustedPeer), AuthSnowErrors> {
+    // cloned, so the read lock is released before any network I/O
+    let stored_peer = trusted_peers
+        .read()
+        .await
+        .iter()
+        .find(|device| device.x25519_pub_key.ct_eq(&peer_static).into())
+        .cloned();
+
+    // 1.
+    let both_saved = exchange_is_saved(&mut secure_connection, role, stored_peer.is_some()).await?;
+
+    // 2.
+    let peer_key = exchange_signatures(
+        &mut secure_connection,
+        role,
+        &handshake_hash,
+        stored_peer
+            .as_ref()
+            .map(|peer| &peer.mldsa_verification_key),
+        device_keypairs,
+        transcript,
+    )
+    .await?;
+
+    let peer = TrustedPeer {
+        x25519_pub_key: peer_static,
+        mldsa_verification_key: peer_key,
+        name: match stored_peer {
+            Some(stored_peer) => stored_peer.name,
+            None => secure_connection.connection.name.clone(),
+        },
+    };
+
+    // 3.
+    if !both_saved {
+        confirm_pairing(&mut secure_connection, role, &handshake_hash, pair_fallback).await?;
+        save_peer(&trusted_peers, &peer).await;
+    }
+
+    Ok((secure_connection, peer))
+}
+
+/// Noise protocol used for the final handshake.
+const NOISE_PARAMS: &str = "Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s";
 
 /// Runs the responder side of a `Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s` handshake.
 ///
@@ -664,9 +982,9 @@ async fn verify_sig_server(
 ///   and the handshake hash (to show as words). Runs on a blocking thread.
 /// * `transcript` - the signature exchange is appended to it
 ///
-/// After the handshake, a known peer (found by its static key) must prove itself
-/// with an ML-DSA signature. An unknown peer is only accepted if the user confirms
-/// it within [`PAIRING_TIMEOUT`]; it is then added to `trusted_peers`.
+/// After the handshake both sides authenticate each other with ML-DSA
+/// signatures; devices that don't both know each other are only accepted after
+/// both users confirm ([`authenticate_peer`]).
 ///
 /// Every network read/write is bounded by [`TIMEOUT`].
 ///
@@ -678,12 +996,12 @@ async fn snow_handshake_server(
     trusted_peers: TrustedPeers,
     pair_fallback: fn(&String, &[u8; 32]) -> bool,
     transcript: &mut Zeroizing<Vec<u8>>,
-) -> Result<Option<(SecureConnection, TrustedPeer)>, AuthSnowErrors> {
+) -> Result<(SecureConnection, TrustedPeer), AuthSnowErrors> {
     let stream = &mut incoming_connection.stream;
 
     // psk3: the PSK is mixed in at the end of the third handshake message
     let mut builder = Builder::new(
-        "Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s"
+        NOISE_PARAMS
             .parse()
             .map_err(|_| AuthSnowErrors::FailedToParseText)?,
     )
@@ -700,7 +1018,11 @@ async fn snow_handshake_server(
     let mut read_buffer = Zeroizing::new([0u8; SNOW_MSG3_LEN]);
 
     // -> e
-    let read = stream.read_exact(&mut read_buffer[..SNOW_MSG1_LEN]);
+    let read = stream.read_exact(
+        read_buffer
+            .get_mut(..SNOW_MSG1_LEN)
+            .ok_or(AuthSnowErrors::FailedToReadFromStream)?,
+    );
 
     timeout(Duration::from_secs(TIMEOUT), read)
         .await
@@ -708,15 +1030,29 @@ async fn snow_handshake_server(
         .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
 
     builder
-        .read_message(&read_buffer[..SNOW_MSG1_LEN], buffer.as_mut_slice())
+        .read_message(
+            read_buffer
+                .get(..SNOW_MSG1_LEN)
+                .ok_or(AuthSnowErrors::FailedToReadSnowMessage)?,
+            buffer.as_mut_slice(),
+        )
         .map_err(|_| AuthSnowErrors::FailedToReadSnowMessage)?;
 
     // <- e, ee, s, es (empty payload)
     builder
-        .write_message(&[], &mut buffer[..SNOW_MSG2_LEN])
+        .write_message(
+            &[],
+            buffer
+                .get_mut(..SNOW_MSG2_LEN)
+                .ok_or(AuthSnowErrors::FailedToWriteSnowMessage)?,
+        )
         .map_err(|_| AuthSnowErrors::FailedToWriteSnowMessage)?;
 
-    let write = stream.write_all(&buffer[..SNOW_MSG2_LEN]);
+    let write = stream.write_all(
+        buffer
+            .get(..SNOW_MSG2_LEN)
+            .ok_or(AuthSnowErrors::FailedToWriteToStream)?,
+    );
 
     timeout(Duration::from_secs(TIMEOUT), write)
         .await
@@ -724,7 +1060,11 @@ async fn snow_handshake_server(
         .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
 
     // -> s, se, psk
-    let read = stream.read_exact(&mut read_buffer[..SNOW_MSG3_LEN]);
+    let read = stream.read_exact(
+        read_buffer
+            .get_mut(..SNOW_MSG3_LEN)
+            .ok_or(AuthSnowErrors::FailedToReadFromStream)?,
+    );
 
     timeout(Duration::from_secs(TIMEOUT), read)
         .await
@@ -732,7 +1072,12 @@ async fn snow_handshake_server(
         .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
 
     builder
-        .read_message(&read_buffer[..SNOW_MSG3_LEN], buffer.as_mut_slice())
+        .read_message(
+            read_buffer
+                .get(..SNOW_MSG3_LEN)
+                .ok_or(AuthSnowErrors::FailedToReadSnowMessage)?,
+            buffer.as_mut_slice(),
+        )
         .map_err(|_| AuthSnowErrors::FailedToReadSnowMessage)?;
 
     // the peer's static public key identifies the device in `trusted_peers`
@@ -753,106 +1098,173 @@ async fn snow_handshake_server(
         .into_transport_mode()
         .map_err(|_| AuthSnowErrors::FailedToEnterTransportMode)?;
 
-    let mut secure_connection = SecureConnection::new(incoming_connection, transport);
+    let secure_connection = SecureConnection::new(incoming_connection, transport);
 
-    // cloned, so the read lock is released before any network I/O
-    let mut new_device = trusted_peers
-        .read()
+    authenticate_peer(
+        secure_connection,
+        Role::Server,
+        peer_static,
+        handshake_hash,
+        device_keypairs,
+        trusted_peers,
+        pair_fallback,
+        transcript,
+    )
+    .await
+}
+
+/// Runs the initiator side of a `Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s` handshake.
+///
+/// 1. -> e
+/// 2. <- e, ee, s, es
+/// 3. -> s, se, psk
+///
+/// Same arguments and result as [`snow_handshake_server`].
+async fn snow_handshake_client(
+    mut outgoing_connection: IncomingConnection,
+    secure_psk: Zeroizing<[u8; 32]>,
+    device_keypairs: &DeviceKeypairs,
+    trusted_peers: TrustedPeers,
+    pair_fallback: fn(&String, &[u8; 32]) -> bool,
+    transcript: &mut Zeroizing<Vec<u8>>,
+) -> Result<(SecureConnection, TrustedPeer), AuthSnowErrors> {
+    let stream = &mut outgoing_connection.stream;
+
+    let mut noise = Builder::new(
+        NOISE_PARAMS
+            .parse()
+            .map_err(|_| AuthSnowErrors::FailedToParseText)?,
+    )
+    .local_private_key(device_keypairs.x25519_kep.private.as_slice())
+    .map_err(|_| AuthSnowErrors::FailedToSetLocalPrivateKey)?
+    .psk(3, &secure_psk)
+    .map_err(|_| AuthSnowErrors::FailedToSetPsk)?
+    .build_initiator()
+    .map_err(|_| AuthSnowErrors::FailedToBuildSnowInitiator)?;
+
+    let mut buffer = Zeroizing::new([0u8; SNOW_MSG2_LEN]);
+    let mut read_buffer = Zeroizing::new([0u8; SNOW_MSG2_LEN]);
+
+    // 1. -> e
+    let len = noise
+        .write_message(&[], buffer.as_mut_slice())
+        .map_err(|_| AuthSnowErrors::FailedToWriteSnowMessage)?;
+
+    if len != SNOW_MSG1_LEN {
+        return Err(AuthSnowErrors::FailedToWriteSnowMessage);
+    }
+
+    let write = stream.write_all(
+        buffer
+            .get(..SNOW_MSG1_LEN)
+            .ok_or(AuthSnowErrors::FailedToWriteToStream)?,
+    );
+
+    timeout(Duration::from_secs(TIMEOUT), write)
         .await
-        .iter()
-        .find(|device| device.x25519_pub_key.ct_eq(&peer_static).into())
-        .cloned();
+        .map_err(|_| AuthSnowErrors::WriteTimeout)?
+        .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
 
-    // check if client have us saved
-    let mut is_saved = vec![0u8; 2];
-
-    let read = secure_connection.read(&mut is_saved, IsSavedTag);
+    // 2. <- e, ee, s, es
+    let read = stream.read_exact(
+        read_buffer
+            .get_mut(..SNOW_MSG2_LEN)
+            .ok_or(AuthSnowErrors::FailedToReadFromStream)?,
+    );
 
     timeout(Duration::from_secs(TIMEOUT), read)
         .await
         .map_err(|_| AuthSnowErrors::ReadTimeout)?
-        .map_err(|_| AuthSnowErrors::FailedToReadFromSecureConnection)?;
+        .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
 
-    if is_saved[0] != 0x01 {
-        new_device = None;
+    noise
+        .read_message(
+            read_buffer
+                .get(..SNOW_MSG2_LEN)
+                .ok_or(AuthSnowErrors::FailedToReadSnowMessage)?,
+            buffer.as_mut_slice(),
+        )
+        .map_err(|_| AuthSnowErrors::FailedToReadSnowMessage)?;
+
+    // 3. -> s, se, psk
+    let len = noise
+        .write_message(&[], buffer.as_mut_slice())
+        .map_err(|_| AuthSnowErrors::FailedToWriteSnowMessage)?;
+
+    if len != SNOW_MSG3_LEN {
+        return Err(AuthSnowErrors::FailedToWriteSnowMessage);
     }
 
-    let trusted_peer = match new_device {
-        Some(device) => {
-            verify_sig_server(
-                &mut secure_connection,
-                handshake_hash,
-                Some(&device),
-                device_keypairs,
-                transcript,
-            )
-            .await
-            .map_err(|_| AuthSnowErrors::FailedToVerifySignature)?;
-            device
-        }
-        None => {
-            // ask the user on a blocking thread, so tokio isn't blocked meanwhile
-            let name_clone = secure_connection.connection.name.clone();
-            let handshake_hash_clone = handshake_hash.clone();
+    let write = stream.write_all(
+        buffer
+            .get(..SNOW_MSG3_LEN)
+            .ok_or(AuthSnowErrors::FailedToWriteToStream)?,
+    );
 
-            let accept = timeout(
-                Duration::from_secs(PAIRING_TIMEOUT),
-                spawn_blocking(move || pair_fallback(&name_clone, &handshake_hash_clone)),
-            )
-            .await
-            .map_err(|_| AuthSnowErrors::PairingTimeout)?
-            .map_err(|_| AuthSnowErrors::FailedToPairNewDevice)?;
+    timeout(Duration::from_secs(TIMEOUT), write)
+        .await
+        .map_err(|_| AuthSnowErrors::WriteTimeout)?
+        .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
 
-            if !accept {
-                return Err(AuthSnowErrors::FailedToPairNewDevice);
-            }
+    let peer_static: [u8; 32] = noise
+        .get_remote_static()
+        .ok_or(AuthSnowErrors::SnowFailedToGetRemoteStatic)?
+        .try_into()
+        .map_err(|_| AuthSnowErrors::FailedToConvertToArray)?;
 
-            // wait for pairing confirmation from client
-            let mut client_accept = vec![0u8; 2];
+    let mut handshake_hash = Zeroizing::new([0u8; 32]);
 
-            let read = secure_connection.read(&mut client_accept, ClientAcceptTag);
+    handshake_hash.clone_from_slice(noise.get_handshake_hash());
 
-            timeout(Duration::from_secs(PAIRING_TIMEOUT), read)
-                .await
-                .map_err(|_| AuthSnowErrors::ReadTimeout)
-                .map_err(|_| AuthSnowErrors::FailedToReadFromSecureConnection)?;
+    let transport = noise
+        .into_transport_mode()
+        .map_err(|_| AuthSnowErrors::FailedToEnterTransportMode)?;
 
-            if client_accept[0] != 0x01 {
-                return Err(AuthSnowErrors::NoClientConfirmation);
-            }
+    let secure_connection = SecureConnection::new(outgoing_connection, transport);
 
-            let ver_key = verify_sig_server(
-                &mut secure_connection,
-                handshake_hash,
-                None,
-                device_keypairs,
-                transcript,
-            )
-            .await
-            .map_err(|_| AuthSnowErrors::FailedToVerifySignature)?;
+    authenticate_peer(
+        secure_connection,
+        Role::Client,
+        peer_static,
+        handshake_hash,
+        device_keypairs,
+        trusted_peers,
+        pair_fallback,
+        transcript,
+    )
+    .await
+}
 
-            let trusted_peer = TrustedPeer {
-                x25519_pub_key: peer_static,
-                mldsa_verification_key: ver_key,
-                name: secure_connection.connection.name.clone(),
-            };
+/// PSK = HKDF(key1 || x25519_ss || mlkem_ss || HKDF(transcript)), label `CPQHA-psk`.
+///
+/// key1 binds the KEX to SPAKE2, so a MITM that only relays SPAKE2 can't derive it.
+/// Both sides must have built `transcript` in the same order.
+fn derive_secure_psk(
+    key1: &Zeroizing<Vec<u8>>,
+    hybrid_kep: &HybridKep,
+    transcript: &Zeroizing<Vec<u8>>,
+) -> Result<Zeroizing<[u8; 32]>, AuthSnowErrors> {
+    let mut transcript_hash = Zeroizing::new([0u8; 32]);
 
-            // check again under the write lock, so two parallel pairings
-            // of the same device can't both add it
-            let mut peer = trusted_peers.write().await;
+    SimpleHkdf::<Blake2s256>::new(None, transcript)
+        .expand(&[], transcript_hash.as_mut_slice())
+        .map_err(|_| AuthSnowErrors::FailedToExpandHkdf)?;
 
-            if !peer
-                .iter()
-                .any(|peer| peer.x25519_pub_key.ct_eq(&peer_static).into())
-            {
-                peer.push(trusted_peer.clone());
-            }
+    // sized up front, so the secret buffer never reallocates (old copies aren't wiped)
+    let mut psk = Zeroizing::new(Vec::with_capacity(key1.len().saturating_add(3 * 32)));
 
-            trusted_peer
-        }
-    };
+    psk.extend_from_slice(key1);
+    psk.extend_from_slice(hybrid_kep.x25519_ss.as_slice());
+    psk.extend_from_slice(hybrid_kep.mlkem_ss.as_slice());
+    psk.extend_from_slice(transcript_hash.as_slice());
 
-    Ok(Some((secure_connection, trusted_peer)))
+    let mut secure_psk = Zeroizing::new([0u8; 32]);
+
+    SimpleHkdf::<Blake2s256>::new(None, &psk)
+        .expand(b"CPQHA-psk", secure_psk.as_mut_slice())
+        .map_err(|_| AuthSnowErrors::FailedToExpandHkdf)?;
+
+    Ok(secure_psk)
 }
 
 /// Authenticates an incoming connection (server side).
@@ -862,8 +1274,8 @@ async fn snow_handshake_server(
 /// 2. hybrid X25519 + ML-KEM key exchange
 /// 3. derive a PSK from the SPAKE2 key, both KEX shared secrets and the transcript hash
 /// 4. Noise XXpsk3 handshake using that PSK and our device's static key
-/// 5. mutual ML-DSA signatures over the handshake hash; unknown devices
-///    are only accepted after the user confirms them (pairing)
+/// 5. mutual ML-DSA signatures over the handshake hash; devices that don't both
+///    know each other are only accepted after both users confirm (pairing)
 ///
 /// Returns `Ok(None)` if the peer failed SPAKE2 confirmation
 /// (i.e. doesn't know the shared key), `Ok(Some(_))` with the secure
@@ -899,28 +1311,8 @@ pub async fn auth_incoming(
         .await
         .map_err(|_| AuthSnowErrors::KexFailed)?;
 
-    // 3. PSK = HKDF(key1 || x25519_ss || mlkem_ss || HKDF(transcript))
-    // key1 binds the KEX to SPAKE2, so a MITM that only relays SPAKE2 can't derive it
-    let mut transcript_hash = Zeroizing::new([0u8; 32]);
-
-    SimpleHkdf::<Blake2s256>::new(None, &transcript)
-        .expand(&[], transcript_hash.as_mut_slice())
-        .map_err(|_| AuthSnowErrors::FailedToExpandHkdf)?;
-
-    let mut psk = Zeroizing::new(Vec::new());
-
-    psk.extend_from_slice(&key1);
-    psk.extend_from_slice(hybrid_kep.x25519_ss.as_slice());
-    psk.extend_from_slice(hybrid_kep.mlkem_ss.as_slice());
-    psk.extend_from_slice(transcript_hash.as_slice());
-
-    let psk_hk = SimpleHkdf::<Blake2s256>::new(None, &psk);
-
-    let mut secure_psk = Zeroizing::new([0u8; 32]);
-
-    psk_hk
-        .expand(b"CPQHA-psk", secure_psk.as_mut_slice())
-        .map_err(|_| AuthSnowErrors::FailedToExpandHkdf)?;
+    // 3. PSK
+    let secure_psk = derive_secure_psk(&key1, &hybrid_kep, &transcript)?;
 
     // 4. + 5. Noise handshake, then signatures / pairing
     snow_handshake_server(
@@ -932,5 +1324,351 @@ pub async fn auth_incoming(
         &mut transcript,
     )
     .await
-    .map_err(|_| AuthSnowErrors::FailedToCompleteSnowHandshake)
+    .map(Some)
+}
+
+/// Authenticates an outgoing connection (client side). Mirrors [`auth_incoming`]
+/// step by step, with the client sending first wherever both sides send.
+///
+/// Returns `Ok(None)` if the server's SPAKE2 confirmation was wrong (it doesn't
+/// know the shared key), `Ok(Some(_))` with the secure connection and the
+/// authenticated peer on success.
+pub async fn auth_outgoing(
+    keys: Arc<RwLock<Keys>>,
+    device_keypairs: &DeviceKeypairs,
+    trusted_peers: TrustedPeers,
+    mut outgoing_connection: IncomingConnection,
+    pair_fallback: fn(&String, &[u8; 32]) -> bool,
+) -> Result<Option<(SecureConnection, TrustedPeer)>, AuthSnowErrors> {
+    let mut stream = &mut outgoing_connection.stream;
+    let a_key = keys.read().await.a_key.clone();
+    let mut transcript = Zeroizing::new(Vec::new());
+
+    // 1. SPAKE2
+    let key1 = spake2_exchange_client(&mut stream, &a_key, &mut transcript)
+        .await
+        .map_err(|_| AuthSnowErrors::FailedToExchangeSpake2)?;
+
+    if !spake2_confirm_mutual_auth_client(&mut stream, &key1, &mut transcript)
+        .await
+        .map_err(|_| AuthSnowErrors::FailedToConfirmMutualAuthSpake2)?
+    {
+        return Ok(None);
+    }
+
+    // 2. hybrid KEX (classic + post-quantum)
+    let hybrid_kep = hybrid_kex_client(&mut stream, &mut transcript)
+        .await
+        .map_err(|_| AuthSnowErrors::KexFailed)?;
+
+    // 3. PSK
+    let secure_psk = derive_secure_psk(&key1, &hybrid_kep, &transcript)?;
+
+    // 4. + 5. Noise handshake, then signatures / pairing
+    snow_handshake_client(
+        outgoing_connection,
+        secure_psk,
+        device_keypairs,
+        trusted_peers,
+        pair_fallback,
+        &mut transcript,
+    )
+    .await
+    .map(Some)
+}
+
+#[cfg(test)]
+#[allow(clippy::large_futures)] // full handshakes in tests, stack size doesn't matter
+mod tests {
+
+    use super::*;
+    use tokio::net::{TcpListener, TcpStream};
+
+    const TEST_A_KEY: [u8; 32] = [0xAB; 32];
+
+    /// Pairing callback that accepts every device.
+    fn accept_all(_name: &String, _hash: &[u8; 32]) -> bool {
+        true
+    }
+
+    /// Pairing callback for peers that must already be known: fails the test
+    /// path by rejecting, so an unexpected prompt shows up as an error.
+    fn must_not_prompt(_name: &String, _hash: &[u8; 32]) -> bool {
+        false
+    }
+
+    /// One side of a test connection: keys, identity and trusted list.
+    struct Device {
+        keys: Arc<RwLock<Keys>>,
+        keypairs: DeviceKeypairs,
+        peers: TrustedPeers,
+    }
+
+    impl Device {
+        fn new(a_key: [u8; 32]) -> Self {
+            Self {
+                keys: Arc::new(RwLock::new(Keys::new(&a_key, &[0xCD; 32]))),
+                keypairs: DeviceKeypairs::generate().unwrap(),
+                peers: Arc::new(RwLock::new(Vec::new())),
+            }
+        }
+    }
+
+    type AuthResult = Result<Option<(SecureConnection, TrustedPeer)>, AuthSnowErrors>;
+
+    /// Runs auth_incoming / auth_outgoing against each other over localhost.
+    async fn handshake(
+        server: &Device,
+        client: &Device,
+        server_pair: fn(&String, &[u8; 32]) -> bool,
+        client_pair: fn(&String, &[u8; 32]) -> bool,
+    ) -> (AuthResult, AuthResult) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_side = async {
+            let (stream, peer_addr) = listener.accept().await.unwrap();
+            auth_incoming(
+                server.keys.clone(),
+                &server.keypairs,
+                server.peers.clone(),
+                IncomingConnection::new(stream, peer_addr),
+                server_pair,
+            )
+            .await
+        };
+
+        let client_side = async {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            auth_outgoing(
+                client.keys.clone(),
+                &client.keypairs,
+                client.peers.clone(),
+                IncomingConnection::new(stream, addr),
+                client_pair,
+            )
+            .await
+        };
+
+        tokio::join!(server_side, client_side)
+    }
+
+    /// Test that two new devices pair, save each other and get a working channel
+    #[tokio::test]
+    async fn test_first_pairing_saves_both_peers() {
+        let server = Device::new(TEST_A_KEY);
+        let client = Device::new(TEST_A_KEY);
+
+        let (server_result, client_result) =
+            handshake(&server, &client, accept_all, accept_all).await;
+
+        let (mut server_conn, client_as_seen) = server_result.unwrap().unwrap();
+        let (mut client_conn, server_as_seen) = client_result.unwrap().unwrap();
+
+        // each side identified the other by its real static key
+        assert_eq!(
+            client_as_seen.x25519_pub_key(),
+            &*client.keypairs.x25519_kep.public
+        );
+        assert_eq!(
+            server_as_seen.x25519_pub_key(),
+            &*server.keypairs.x25519_kep.public
+        );
+        assert_eq!(server.peers.read().await.len(), 1);
+        assert_eq!(client.peers.read().await.len(), 1);
+
+        // the transport works in both directions
+        let mut msg = b"ping".to_vec();
+        client_conn
+            .write_timeout(&mut msg, Tags::Regular)
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 4 + 1];
+        server_conn
+            .read_timeout(&mut buf, Tags::Regular)
+            .await
+            .unwrap();
+        assert_eq!(buf, b"ping");
+
+        let mut msg = b"pong".to_vec();
+        server_conn
+            .write_timeout(&mut msg, Tags::Regular)
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 4 + 1];
+        client_conn
+            .read_timeout(&mut buf, Tags::Regular)
+            .await
+            .unwrap();
+        assert_eq!(buf, b"pong");
+    }
+
+    /// Test that known devices reconnect without asking the user again
+    #[tokio::test]
+    async fn test_known_peers_reconnect_without_prompt() {
+        let server = Device::new(TEST_A_KEY);
+        let client = Device::new(TEST_A_KEY);
+
+        let (s, c) = handshake(&server, &client, accept_all, accept_all).await;
+        assert!(s.unwrap().is_some() && c.unwrap().is_some());
+
+        // must_not_prompt rejects, so this only succeeds if nobody is asked
+        let (s, c) = handshake(&server, &client, must_not_prompt, must_not_prompt).await;
+
+        assert!(s.unwrap().is_some());
+        assert!(c.unwrap().is_some());
+        assert_eq!(server.peers.read().await.len(), 1);
+        assert_eq!(client.peers.read().await.len(), 1);
+    }
+
+    /// Test that a device which forgot its peer re-pairs instead of failing
+    #[tokio::test]
+    async fn test_one_sided_forget_repairs() {
+        let server = Device::new(TEST_A_KEY);
+        let client = Device::new(TEST_A_KEY);
+
+        let (s, c) = handshake(&server, &client, accept_all, accept_all).await;
+        assert!(s.unwrap().is_some() && c.unwrap().is_some());
+
+        client.peers.write().await.clear();
+
+        // the server still knows the client, but both must confirm again
+        let (s, c) = handshake(&server, &client, must_not_prompt, accept_all).await;
+        assert!(s.is_err() && c.is_err());
+
+        let (s, c) = handshake(&server, &client, accept_all, accept_all).await;
+        assert!(s.unwrap().is_some() && c.unwrap().is_some());
+
+        // no duplicate entry on the side that never forgot
+        assert_eq!(server.peers.read().await.len(), 1);
+        assert_eq!(client.peers.read().await.len(), 1);
+    }
+
+    /// Test that a known peer presenting a different ML-DSA key is rejected
+    #[tokio::test]
+    async fn test_known_peer_with_swapped_mldsa_key_rejected() {
+        let server = Device::new(TEST_A_KEY);
+        let mut client = Device::new(TEST_A_KEY);
+
+        let (s, c) = handshake(&server, &client, accept_all, accept_all).await;
+        assert!(s.unwrap().is_some() && c.unwrap().is_some());
+
+        // same Noise static key, new ML-DSA identity
+        client.keypairs = DeviceKeypairs::new(
+            generate_new_key_pair(*client.keypairs.x25519_kep.private),
+            generate_key_pair(*random_array::<32>().unwrap()),
+        );
+
+        let (s, c) = handshake(&server, &client, accept_all, accept_all).await;
+
+        assert_eq!(s.err(), Some(AuthSnowErrors::PeerKeyMismatch));
+        assert!(c.is_err());
+    }
+
+    /// Test that a peer without the shared a_key is turned away before Noise
+    #[tokio::test]
+    async fn test_wrong_a_key_returns_none() {
+        let server = Device::new(TEST_A_KEY);
+        let client = Device::new([0x11; 32]);
+
+        let (s, c) = handshake(&server, &client, accept_all, accept_all).await;
+
+        assert!(s.unwrap().is_none());
+        // the server closes instead of sending its confirmation
+        assert!(c.is_err());
+        assert!(server.peers.read().await.is_empty());
+        assert!(client.peers.read().await.is_empty());
+    }
+
+    /// Test that a rejection on either side means nobody saves anybody
+    #[tokio::test]
+    async fn test_client_rejects_pairing() {
+        let server = Device::new(TEST_A_KEY);
+        let client = Device::new(TEST_A_KEY);
+
+        let (s, c) = handshake(&server, &client, accept_all, must_not_prompt).await;
+
+        assert_eq!(s.err(), Some(AuthSnowErrors::NoClientConfirmation));
+        assert_eq!(c.err(), Some(AuthSnowErrors::FailedToPairNewDevice));
+        assert!(server.peers.read().await.is_empty());
+        assert!(client.peers.read().await.is_empty());
+    }
+
+    /// Test that SecureConnection refuses messages bigger than one Noise message
+    #[tokio::test]
+    async fn test_secure_connection_message_too_large() {
+        let server = Device::new(TEST_A_KEY);
+        let client = Device::new(TEST_A_KEY);
+
+        let (_s, c) = handshake(&server, &client, accept_all, accept_all).await;
+        let (mut conn, _) = c.unwrap().unwrap();
+
+        let mut too_big = vec![0u8; SECURE_MSG_MAX_PAYLOAD + 1];
+        assert_eq!(
+            conn.write(&mut too_big, Tags::Regular).await.err(),
+            Some(AuthSnowErrors::MessageTooLarge)
+        );
+
+        let mut too_big = vec![0u8; SECURE_MSG_MAX_PAYLOAD + 2];
+        assert_eq!(
+            conn.read(&mut too_big, Tags::Regular).await.err(),
+            Some(AuthSnowErrors::MessageTooLarge)
+        );
+    }
+
+    /// Test that a message with the wrong tag is rejected
+    #[tokio::test]
+    async fn test_wrong_tag_rejected() {
+        let server = Device::new(TEST_A_KEY);
+        let client = Device::new(TEST_A_KEY);
+
+        let (s, c) = handshake(&server, &client, accept_all, accept_all).await;
+        let (mut server_conn, _) = s.unwrap().unwrap();
+        let (mut client_conn, _) = c.unwrap().unwrap();
+
+        let mut msg = b"x".to_vec();
+        client_conn.write(&mut msg, Tags::IsSavedTag).await.unwrap();
+
+        let mut buf = vec![0u8; 1 + 1];
+        assert_eq!(
+            server_conn.read(&mut buf, Tags::Regular).await.err(),
+            Some(AuthSnowErrors::WrongTag)
+        );
+    }
+
+    /// Test that both roles derive the same PSK from the same inputs
+    #[test]
+    fn test_derive_secure_psk_deterministic() {
+        let key1 = Zeroizing::new(vec![1u8; 32]);
+        let kep = HybridKep {
+            x25519_ss: Zeroizing::new([2u8; 32]),
+            mlkem_ss: Zeroizing::new([3u8; 32]),
+        };
+        let transcript = Zeroizing::new(vec![4u8; 100]);
+
+        let a = derive_secure_psk(&key1, &kep, &transcript).unwrap();
+        let b = derive_secure_psk(&key1, &kep, &transcript).unwrap();
+        assert_eq!(*a, *b);
+
+        // any transcript change changes the PSK
+        let other = Zeroizing::new(vec![5u8; 100]);
+        let c = derive_secure_psk(&key1, &kep, &other).unwrap();
+        assert_ne!(*a, *c);
+    }
+
+    /// Test that every error has a non-empty message
+    #[test]
+    fn test_error_display_non_empty() {
+        for e in [
+            AuthSnowErrors::PeerKeyMismatch,
+            AuthSnowErrors::NoServerConfirmation,
+            AuthSnowErrors::FailedToBuildSnowInitiator,
+            AuthSnowErrors::MessageTooLarge,
+            AuthSnowErrors::NoClientConfirmation,
+        ] {
+            assert!(!e.to_string().is_empty());
+        }
+    }
 }
