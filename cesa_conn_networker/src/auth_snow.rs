@@ -267,6 +267,7 @@ impl Tags {
     }
 
     /// Returns `true` if `packet` ends with this tag.
+    #[allow(dead_code)] // API for callers outside the PoC binary (daemon, tests)
     pub fn check_tag(self, packet: &[u8]) -> bool {
         packet.ends_with(&[self as u8])
     }
@@ -474,6 +475,7 @@ impl Salts {
     }
 
     /// Wraps two raw 32-byte arrays in `Zeroizing`.
+    #[allow(dead_code)] // API for callers outside the PoC binary (daemon, tests)
     pub fn new(a_salt: [u8; 32], d_salt: [u8; 32]) -> Self {
         Self {
             a_salt: Zeroizing::new(a_salt),
@@ -508,6 +510,7 @@ impl DeviceKeypairs {
     }
 
     /// Wraps already existing key pairs, e.g. loaded from storage.
+    #[allow(dead_code)] // API for callers outside the PoC binary (daemon, tests)
     pub fn new(x25519_kep: X25519KeyPair, mldsa_kep: MLDSA87KeyPair) -> Self {
         Self {
             x25519_kep,
@@ -529,6 +532,7 @@ pub struct TrustedPeer {
 
 impl TrustedPeer {
     /// Creates a trusted peer entry from its two public keys and name.
+    #[allow(dead_code)] // API for callers outside the PoC binary (daemon, tests)
     pub fn new(x25519_pub_key: [u8; 32], mldsa_verification_key: [u8; 2592], name: String) -> Self {
         Self {
             x25519_pub_key,
@@ -543,6 +547,7 @@ impl TrustedPeer {
     }
 
     /// The peer's Noise static public key.
+    #[allow(dead_code)] // API for callers outside the PoC binary (daemon, tests)
     pub fn x25519_pub_key(&self) -> &[u8; 32] {
         &self.x25519_pub_key
     }
@@ -1013,7 +1018,11 @@ async fn snow_handshake_server(
     let mut read_buffer = Zeroizing::new([0u8; SNOW_MSG3_LEN]);
 
     // -> e
-    let read = stream.read_exact(&mut read_buffer[..SNOW_MSG1_LEN]);
+    let read = stream.read_exact(
+        read_buffer
+            .get_mut(..SNOW_MSG1_LEN)
+            .ok_or(AuthSnowErrors::FailedToReadFromStream)?,
+    );
 
     timeout(Duration::from_secs(TIMEOUT), read)
         .await
@@ -1021,15 +1030,29 @@ async fn snow_handshake_server(
         .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
 
     builder
-        .read_message(&read_buffer[..SNOW_MSG1_LEN], buffer.as_mut_slice())
+        .read_message(
+            read_buffer
+                .get(..SNOW_MSG1_LEN)
+                .ok_or(AuthSnowErrors::FailedToReadSnowMessage)?,
+            buffer.as_mut_slice(),
+        )
         .map_err(|_| AuthSnowErrors::FailedToReadSnowMessage)?;
 
     // <- e, ee, s, es (empty payload)
     builder
-        .write_message(&[], &mut buffer[..SNOW_MSG2_LEN])
+        .write_message(
+            &[],
+            buffer
+                .get_mut(..SNOW_MSG2_LEN)
+                .ok_or(AuthSnowErrors::FailedToWriteSnowMessage)?,
+        )
         .map_err(|_| AuthSnowErrors::FailedToWriteSnowMessage)?;
 
-    let write = stream.write_all(&buffer[..SNOW_MSG2_LEN]);
+    let write = stream.write_all(
+        buffer
+            .get(..SNOW_MSG2_LEN)
+            .ok_or(AuthSnowErrors::FailedToWriteToStream)?,
+    );
 
     timeout(Duration::from_secs(TIMEOUT), write)
         .await
@@ -1037,7 +1060,11 @@ async fn snow_handshake_server(
         .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
 
     // -> s, se, psk
-    let read = stream.read_exact(&mut read_buffer[..SNOW_MSG3_LEN]);
+    let read = stream.read_exact(
+        read_buffer
+            .get_mut(..SNOW_MSG3_LEN)
+            .ok_or(AuthSnowErrors::FailedToReadFromStream)?,
+    );
 
     timeout(Duration::from_secs(TIMEOUT), read)
         .await
@@ -1045,7 +1072,12 @@ async fn snow_handshake_server(
         .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
 
     builder
-        .read_message(&read_buffer[..SNOW_MSG3_LEN], buffer.as_mut_slice())
+        .read_message(
+            read_buffer
+                .get(..SNOW_MSG3_LEN)
+                .ok_or(AuthSnowErrors::FailedToReadSnowMessage)?,
+            buffer.as_mut_slice(),
+        )
         .map_err(|_| AuthSnowErrors::FailedToReadSnowMessage)?;
 
     // the peer's static public key identifies the device in `trusted_peers`
@@ -1122,7 +1154,11 @@ async fn snow_handshake_client(
         return Err(AuthSnowErrors::FailedToWriteSnowMessage);
     }
 
-    let write = stream.write_all(&buffer[..SNOW_MSG1_LEN]);
+    let write = stream.write_all(
+        buffer
+            .get(..SNOW_MSG1_LEN)
+            .ok_or(AuthSnowErrors::FailedToWriteToStream)?,
+    );
 
     timeout(Duration::from_secs(TIMEOUT), write)
         .await
@@ -1130,7 +1166,11 @@ async fn snow_handshake_client(
         .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
 
     // 2. <- e, ee, s, es
-    let read = stream.read_exact(&mut read_buffer[..SNOW_MSG2_LEN]);
+    let read = stream.read_exact(
+        read_buffer
+            .get_mut(..SNOW_MSG2_LEN)
+            .ok_or(AuthSnowErrors::FailedToReadFromStream)?,
+    );
 
     timeout(Duration::from_secs(TIMEOUT), read)
         .await
@@ -1138,7 +1178,12 @@ async fn snow_handshake_client(
         .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
 
     noise
-        .read_message(&read_buffer[..SNOW_MSG2_LEN], buffer.as_mut_slice())
+        .read_message(
+            read_buffer
+                .get(..SNOW_MSG2_LEN)
+                .ok_or(AuthSnowErrors::FailedToReadSnowMessage)?,
+            buffer.as_mut_slice(),
+        )
         .map_err(|_| AuthSnowErrors::FailedToReadSnowMessage)?;
 
     // 3. -> s, se, psk
@@ -1150,7 +1195,11 @@ async fn snow_handshake_client(
         return Err(AuthSnowErrors::FailedToWriteSnowMessage);
     }
 
-    let write = stream.write_all(&buffer[..SNOW_MSG3_LEN]);
+    let write = stream.write_all(
+        buffer
+            .get(..SNOW_MSG3_LEN)
+            .ok_or(AuthSnowErrors::FailedToWriteToStream)?,
+    );
 
     timeout(Duration::from_secs(TIMEOUT), write)
         .await

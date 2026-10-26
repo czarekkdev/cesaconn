@@ -3,7 +3,6 @@
 
 use core::net::SocketAddr;
 use std::fmt;
-use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
@@ -66,7 +65,6 @@ pub struct IncomingConnection {
     /// exchange real names).
     pub name: String,
     pub stream: TcpStream,
-    pub ip_addr: IpAddr,
 }
 
 impl IncomingConnection {
@@ -75,7 +73,6 @@ impl IncomingConnection {
         Self {
             name: peer_addr.to_string(),
             stream,
-            ip_addr: peer_addr.ip(),
         }
     }
 }
@@ -289,7 +286,15 @@ pub async fn recv(
                 },
                 result = recv_handler(incoming_connection, context_clone) => {
                     match result {
-                        Ok(_) => debug!(%peer_addr, "recv_handler completed successfully"),
+                        // TODO: hand the packet to the action handler (see TODO at the top)
+                        Ok(Some(packet)) => debug!(
+                            %peer_addr,
+                            peer = %packet.peer.name(),
+                            action_type = ?packet.action_type,
+                            data_len = packet.data.len(),
+                            "recv_handler completed successfully"
+                        ),
+                        Ok(None) => debug!(%peer_addr, "recv_handler closed without data"),
                         Err(e) => error!(%peer_addr, error = %e, "recv_handler returned an error"),
                     }
                 }

@@ -265,7 +265,9 @@ pub async fn udp_find_broadcaster(
 
     // Convert received bytes to string for device name comparison
     debug!(%addr, "decrypting received UDP packet");
-    let name = decrypt_tunnel(&keys.read().await.a_key, &buf[..len])
+    // len < buf.len() checked above
+    let received = buf.get(..len).ok_or(UdpNetworkerErrors::DataTooBig)?;
+    let name = decrypt_tunnel(&keys.read().await.a_key, received)
         .map_err(|e| {
             warn!(%addr, error = %e, "failed to decrypt received UDP packet — wrong key or tampered data");
             UdpNetworkerErrors::FailedToDecryptTunnel
@@ -286,6 +288,9 @@ pub async fn udp_find_broadcaster(
 }
 
 #[cfg(test)]
+// tests bind the fixed discovery port 3636: the guard is held across awaits on
+// purpose, so they run one at a time
+#[allow(clippy::await_holding_invalid_type)]
 mod tests {
     use super::*;
     use tokio::net::UdpSocket;
@@ -431,6 +436,7 @@ mod tests {
         let addrs = known_addrs.read().await;
         assert_eq!(addrs.len(), 3);
         assert!(addrs.contains(&"192.168.1.2:6363".parse::<SocketAddr>().unwrap()));
+        drop(addrs);
     }
 
     /// An `Arc::clone` of a `RwLock<Vec<SocketAddr>>` must share the same underlying data
@@ -444,8 +450,7 @@ mod tests {
         let clone = Arc::clone(&known_addrs);
 
         tokio::spawn(async move {
-            let addrs = clone.read().await;
-            assert_eq!(addrs.len(), 1);
+            assert_eq!(clone.read().await.len(), 1);
         })
         .await
         .unwrap();

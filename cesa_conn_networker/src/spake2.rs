@@ -36,6 +36,7 @@ impl Tags {
     }
 
     /// Returns `true` if `packet` ends with this tag.
+    #[allow(dead_code)] // API for callers outside the PoC binary (daemon, tests)
     pub fn check_tag(self, packet: &[u8]) -> bool {
         packet.ends_with(&[self as u8])
     }

@@ -15,7 +15,7 @@ use cesa_conn_crypto::{
     x25519_cesa::{self, calculate_shared_key},
 };
 use libcrux_ml_kem::mlkem1024::{MlKem1024Ciphertext, decapsulate, encapsulate, generate_key_pair};
-use libcrux_ml_kem::mlkem1024::{MlKem1024PublicKey, validate_private_key, validate_public_key};
+use libcrux_ml_kem::mlkem1024::{MlKem1024PublicKey, validate_public_key};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -57,6 +57,7 @@ impl Tags {
     }
 
     /// Returns `true` if `packet` ends with this tag.
+    #[allow(dead_code)] // API for callers outside the PoC binary (daemon, tests)
     pub fn check_tag(self, packet: &[u8]) -> bool {
         packet.ends_with(&[self as u8])
     }
@@ -145,7 +146,8 @@ async fn x25519_kex_server(
         return Err(AuthSnowErrors::WrongTag);
     }
 
-    if confirm_buffer[0].eq(&0x00) {
+    // anything other than an explicit 0x01 counts as a rejection
+    if confirm_buffer.first() != Some(&0x01) {
         return Err(AuthSnowErrors::FailedToConfirmKex);
     }
 
@@ -230,7 +232,8 @@ async fn mlkem_kex_server(
         return Err(AuthSnowErrors::WrongTag);
     }
 
-    if confirm_buffer[0].eq(&0x00) {
+    // anything other than an explicit 0x01 counts as a rejection
+    if confirm_buffer.first() != Some(&0x01) {
         return Err(AuthSnowErrors::FailedToConfirmKex);
     }
 

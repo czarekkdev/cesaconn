@@ -46,13 +46,12 @@ use std::{
 #[cfg(unix)]
 use std::{net::Ipv4Addr, os::unix::fs::PermissionsExt};
 use tokio::select;
+use tokio::time::{Duration, timeout};
 #[cfg(unix)]
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::RwLock,
 };
-use tokio::time::{Duration, timeout};
-use tokio_util::future::FutureExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -681,13 +680,19 @@ pub async fn handle_data_server(
 
     let (mut stream, _addr) = incoming_connection;
 
-    match ActionType::from_u8(data[0]) {
+    let Some((&action_byte, payload)) = data.split_first() else {
+        return Err(IpcErrors::WrongDataSize);
+    };
+
+    match ActionType::from_u8(action_byte) {
         Some(ActionType::AddTrustedDevice) => {
             debug!("Processing AddTrustedDevice action");
 
-            let mut ip_bytes = [0u8; 4];
-
-            ip_bytes.copy_from_slice(&data[1..size_of::<Ipv4Addr>() + 1]);
+            // the payload comes from another process: never index it unchecked
+            let ip_bytes: [u8; 4] = payload
+                .get(..size_of::<Ipv4Addr>())
+                .and_then(|b| b.try_into().ok())
+                .ok_or(IpcErrors::WrongDataSize)?;
 
             let socket_addr = get_ip_from_bytes(&ip_bytes);
             let addr = socket_addr.ip();
@@ -745,7 +750,8 @@ pub async fn handle_data_server(
                 .map_err(|_| IpcErrors::FailedToReadDataFromStream)?
                 .map_err(|_| IpcErrors::FailedToReadDataFromStream)?;
 
-            if confirm_byte[0] == 0x00 {
+            // anything other than an explicit 0x01 counts as a rejection
+            if confirm_byte.first() != Some(&0x01) {
                 return Err(IpcErrors::WrongDataSize);
             }
 
@@ -764,8 +770,9 @@ pub async fn handle_data_server(
             }
 
             // bytes 1–32 → a_key, bytes 33–64 → a_salt
-            keys.write().await.a_key.clone_from_slice(&data[1..33]);
-            salts.write().await.a_salt.clone_from_slice(&data[33..65]);
+            let (key, salt) = payload.split_at(32);
+            keys.write().await.a_key.clone_from_slice(key);
+            salts.write().await.a_salt.clone_from_slice(salt);
         }
         Some(ActionType::UpdateDataPassword) => {
             debug!("Processing UpdateDataPassword action");
@@ -776,17 +783,15 @@ pub async fn handle_data_server(
             }
 
             // bytes 1–32 → d_key, bytes 33–64 → d_salt
-            keys.write().await.d_key.clone_from_slice(&data[1..33]);
-            salts.write().await.d_salt.clone_from_slice(&data[33..65]);
+            let (key, salt) = payload.split_at(32);
+            keys.write().await.d_key.clone_from_slice(key);
+            salts.write().await.d_salt.clone_from_slice(salt);
         }
         Some(ActionType::Default) => {
             debug!("Received Default action (no operation)");
         }
         None => {
-            warn!(
-                action_byte = data[0],
-                "Received unknown action type, ignoring"
-            );
+            warn!(action_byte, "Received unknown action type, ignoring");
         }
     }
 
@@ -822,7 +827,7 @@ pub async fn handle_data_server(
 /// - `Default`: intentional no-op; currently handled by the `_ => {}` catch-all
 pub async fn ipc_action(
     action_type: ActionType,
-    data: &[u8],
+    _data: &[u8],
     trusted_addrs: Arc<RwLock<Vec<std::net::SocketAddr>>>,
     keys: Arc<RwLock<Keys>>,
     salts: Arc<RwLock<Salts>>,
@@ -842,8 +847,9 @@ pub async fn ipc_action(
             let mut keys_bytes = Zeroizing::new([0u8; size_of::<Keys>()]);
             let mut salts_bytes = Zeroizing::new([0u8; size_of::<Salts>()]);
 
-            keys_bytes.copy_from_slice(&cred_buffer[..64]);
-            salts_bytes.copy_from_slice(&cred_buffer[64..]);
+            let (keys_part, salts_part) = cred_buffer.split_at(size_of::<Keys>());
+            keys_bytes.copy_from_slice(keys_part);
+            salts_bytes.copy_from_slice(salts_part);
 
             keys.write().await.update(Keys::from_ref(&keys_bytes));
             salts.write().await.update(Salts::from_ref(&salts_bytes));
@@ -859,7 +865,7 @@ pub async fn ipc_action(
 
             // Validate that size is bounded and a clean multiple of 4 (each IPv4 address is 4 bytes).
             // Send 0x00 to reject or 0x01 to accept before the daemon sends the list.
-            if size > MAX_TRUSTED_ADDRS_LEN || size % size_of::<Ipv4Addr>() as u64 != 0 {
+            if size > MAX_TRUSTED_ADDRS_LEN || !size.is_multiple_of(size_of::<Ipv4Addr>() as u64) {
                 stream
                     .write_all(&[0u8])
                     .map_err(|_| IpcErrors::FailedToWriteToStream)?;
@@ -938,9 +944,9 @@ pub async fn ipc_send(
     action_type: ActionType,
     data: &[u8],
     // TODO: pass these through to ipc_action once the caller wires them together
-    trusted_addrs: Arc<RwLock<Vec<std::net::SocketAddr>>>,
-    keys: Arc<RwLock<Keys>>,
-    salts: Arc<RwLock<Salts>>,
+    _trusted_addrs: Arc<RwLock<Vec<std::net::SocketAddr>>>,
+    _keys: Arc<RwLock<Keys>>,
+    _salts: Arc<RwLock<Salts>>,
 ) -> Result<(), IpcErrors> {
     let path = socket_path().map_err(|_| IpcErrors::FailedToFetchSocketPath)?;
 
@@ -956,7 +962,7 @@ pub async fn ipc_send(
     info!(action_type = ?action_type, data_len = data.len(), "connecting to IPC daemon");
 
     let mut stream = UnixStream::connect(path).map_err(|_| IpcErrors::FailedToConnectToPipe)?;
-    let mut final_data = Vec::with_capacity(data.len() + 1);
+    let mut final_data = Vec::with_capacity(data.len().saturating_add(1));
 
     final_data.push(action_type as u8);
     final_data.extend_from_slice(&data);
@@ -1386,7 +1392,15 @@ mod tests {
         let keys = Arc::new(RwLock::new(Keys::new(&[0u8; 32], &[0u8; 32])));
         let salts = Arc::new(RwLock::new(Salts::new([0u8; 32], [0u8; 32])));
         let trusted_addrs = Arc::new(RwLock::new(Vec::<std::net::SocketAddr>::new()));
-        let result = ipc_action(ActionType::Default, &[], trusted_addrs, keys, salts, &mut client).await;
+        let result = ipc_action(
+            ActionType::Default,
+            &[],
+            trusted_addrs,
+            keys,
+            salts,
+            &mut client,
+        )
+        .await;
         assert!(result.is_ok());
     }
 
@@ -1401,7 +1415,15 @@ mod tests {
         let trusted_addrs = Arc::new(RwLock::new(Vec::<std::net::SocketAddr>::new()));
         // payload: 4 bytes for IPv4 (action byte already stripped by caller)
         let payload = [192u8, 168, 1, 1];
-        let result = ipc_action(ActionType::AddTrustedDevice, &payload, trusted_addrs, keys, salts, &mut client).await;
+        let result = ipc_action(
+            ActionType::AddTrustedDevice,
+            &payload,
+            trusted_addrs,
+            keys,
+            salts,
+            &mut client,
+        )
+        .await;
         assert!(result.is_ok());
     }
 
@@ -1416,7 +1438,15 @@ mod tests {
         let trusted_addrs = Arc::new(RwLock::new(Vec::<std::net::SocketAddr>::new()));
         // payload: 32 key bytes + 32 salt bytes
         let payload = [0u8; 64];
-        let result = ipc_action(ActionType::UpdateAuthPassword, &payload, trusted_addrs, keys, salts, &mut client).await;
+        let result = ipc_action(
+            ActionType::UpdateAuthPassword,
+            &payload,
+            trusted_addrs,
+            keys,
+            salts,
+            &mut client,
+        )
+        .await;
         assert!(result.is_ok());
     }
 
@@ -1430,7 +1460,15 @@ mod tests {
         let salts = Arc::new(RwLock::new(Salts::new([0u8; 32], [0u8; 32])));
         let trusted_addrs = Arc::new(RwLock::new(Vec::<std::net::SocketAddr>::new()));
         let payload = [0u8; 64];
-        let result = ipc_action(ActionType::UpdateDataPassword, &payload, trusted_addrs, keys, salts, &mut client).await;
+        let result = ipc_action(
+            ActionType::UpdateDataPassword,
+            &payload,
+            trusted_addrs,
+            keys,
+            salts,
+            &mut client,
+        )
+        .await;
         assert!(result.is_ok());
     }
 
