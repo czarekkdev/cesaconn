@@ -80,8 +80,8 @@ async fn main() {
                 let mut salt = [0u8; 32];
                 let len = test_psw.len().min(32);
                 salt[0..len].copy_from_slice(&test_psw[..len]);
-                let raw_key: [u8; 32] = derive_key(test_psw, salt).unwrap();
-                let keys = Arc::new(RwLock::new(Keys::new(raw_key, raw_key)));
+                let raw_key = derive_key(test_psw, salt).unwrap(); // Zeroizing: wiped on drop
+                let keys = Arc::new(RwLock::new(Keys::new(*raw_key, *raw_key)));
 
                 let listener = TcpListener::bind("0.0.0.0:3232").await.unwrap();
                 let trusted_addrs: Arc<RwLock<Vec<SocketAddr>>> = Arc::new(RwLock::new(Vec::new()));
@@ -141,8 +141,8 @@ async fn main() {
                 let len = test_psw.len().min(32);
                 salt[0..len].copy_from_slice(&test_psw[..len]);
 
-                let raw_key: [u8; 32] = derive_key(test_psw, salt).unwrap();
-                let keys = Arc::new(RwLock::new(Keys::new(raw_key, raw_key)));
+                let raw_key = derive_key(test_psw, salt).unwrap(); // Zeroizing: wiped on drop
+                let keys = Arc::new(RwLock::new(Keys::new(*raw_key, *raw_key)));
 
                 let trusted_addrs = Arc::new(RwLock::new(Vec::new()));
 

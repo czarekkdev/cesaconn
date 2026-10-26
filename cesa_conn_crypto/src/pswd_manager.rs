@@ -1,4 +1,5 @@
 use argon2::Argon2;
+use zeroize::Zeroizing;
 
 use core::fmt;
 use tracing::{debug, error};
@@ -26,20 +27,20 @@ impl fmt::Display for PswdMErrors {
 /// * `salt`     - 32-byte salt — must be unique per user/session
 ///
 /// # Returns
-/// * `Ok([u8; 32])` - Derived key ready for cryptographic use
+/// * `Ok(Zeroizing<[u8; 32]>)` - Derived key, wiped from memory on drop
 /// * `Err(PswdMErrors::HashFailed)` - Argon2 derivation failed
-pub fn derive_key(password: &[u8], salt: [u8; 32]) -> Result<[u8; 32], PswdMErrors> {
+pub fn derive_key(password: &[u8], salt: [u8; 32]) -> Result<Zeroizing<[u8; 32]>, PswdMErrors> {
     debug!(
         password_len = password.len(),
         "deriving AES-256 key from password using Argon2 (intentionally slow)"
     );
-    let mut key = [0u8; 32];
+    let mut key = Zeroizing::new([0u8; 32]);
 
     // Argon2 is intentionally slow — makes brute force attacks impractical
     let cipher = Argon2::default();
 
     cipher
-        .hash_password_into(password, &salt, &mut key)
+        .hash_password_into(password, &salt, key.as_mut_slice())
         .map_err(|e| {
             error!(error = %e, password_len = password.len(), "Argon2 key derivation failed");
             PswdMErrors::HashFailed
@@ -115,7 +116,7 @@ mod tests {
         let salt = [0u8; 32];
 
         let key = derive_key(password, salt).unwrap();
-        assert_ne!(key, [0u8; 32]);
+        assert_ne!(*key, [0u8; 32]);
     }
 
     /// Test with empty password

@@ -2,6 +2,7 @@ use core::fmt;
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use rand::{TryRng, rngs::SysRng};
 use tracing::{error, trace};
+use zeroize::Zeroizing;
 
 /// Errors that can occur during ECC operations
 #[derive(Debug)]
@@ -23,20 +24,22 @@ impl fmt::Display for ECCErrors {
     }
 }
 
-/// Generates a cryptographically secure Ed25519 signing key using OS entropy
-pub fn generate_signing_key() -> Result<[u8; 32], ECCErrors> {
+/// Generates a cryptographically secure Ed25519 signing key using OS entropy.
+/// The key is returned in `Zeroizing`, so it is wiped from memory on drop.
+pub fn generate_signing_key() -> Result<Zeroizing<[u8; 32]>, ECCErrors> {
     trace!("generating Ed25519 signing key from OS entropy");
-    let mut signing_key_bytes = [0u8; 32];
+    let mut signing_key_bytes = Zeroizing::new([0u8; 32]);
     let mut rng = SysRng::default();
 
-    rng.try_fill_bytes(&mut signing_key_bytes).map_err(|e| {
+    rng.try_fill_bytes(signing_key_bytes.as_mut_slice()).map_err(|e| {
         error!(error = %e, "OS failed to provide random bytes for Ed25519 signing key generation");
         ECCErrors::FailedToGenerateSigningKey
     })?;
 
-    let signing_key = SigningKey::from(signing_key_bytes);
+    // SigningKey zeroizes itself on drop; the returned copy is wrapped in Zeroizing.
+    let signing_key = SigningKey::from_bytes(&signing_key_bytes);
     trace!("Ed25519 signing key generated successfully");
-    Ok(signing_key.to_bytes())
+    Ok(Zeroizing::new(signing_key.to_bytes()))
 }
 
 /// Derives the Ed25519 verifying (public) key from a signing key
