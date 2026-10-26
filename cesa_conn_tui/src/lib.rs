@@ -1113,6 +1113,22 @@ pub fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result
     };
     let mut last_refresh: Option<Instant> = None;
 
+    // say plainly how much the daemon is checked before a password goes to it
+    if !cesa_conn_system::ipc::daemon_requirement_valid() {
+        app.push_log(
+            "[ERROR] CESA_IPC_DAEMON_CODE_REQUIREMENT doesn't parse (or this platform has no \
+             code signing): every daemon is refused, rebuild with a valid requirement",
+        );
+    } else if !cesa_conn_system::ipc::daemon_signature_checked() {
+        app.push_log(if cfg!(target_os = "macos") {
+            "[ WARN] Daemon signature check disabled (built without \
+             CESA_IPC_DAEMON_CODE_REQUIREMENT): any process of this user holding the socket \
+             would receive your passwords"
+        } else {
+            "[ WARN] No OS code signing here: the daemon is checked by user id only"
+        });
+    }
+
     loop {
         if let Some(link) = &link {
             pump_link(app, link, &mut last_refresh);

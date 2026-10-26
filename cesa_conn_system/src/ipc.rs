@@ -9,16 +9,22 @@
 //! * The daemon accepts a connection only from a process of the same user
 //!   (kernel peer credentials), and on macOS only from code whose signature
 //!   satisfies a requirement fixed at build time (see the networker).
+//! * The other way round too: the UI only talks to (and sends a password to)
+//!   a daemon of the same user, and on macOS only to one whose signature
+//!   satisfies [`DAEMON_CODE_REQUIREMENT`].
 //!
-//! Wire format (version 1), one request and one response per connection:
+//! Wire format (version 2), one request and one response per connection:
 //! `frame = length (u32 LE, 1..=MAX_FRAME_LEN) || body`
 //!
 //! Request body: `kind (1) || payload`
 //! * `0x01` Status
-//! * `0x02` SetAuthPassword: `password (1..=MAX_PASSWORD_LEN)`; the daemon
-//!   picks the salt
-//! * `0x03` SetDataPassword: same
 //! * `0x04` ListPeers
+//! * `0x05` SetAuthPassword: `password (1..=MAX_PASSWORD_LEN)`; the daemon
+//!   picks the salt
+//! * `0x06` SetDataPassword: same
+//! * `0x02` / `0x03` are retired (version 1 sent `salt || password` there).
+//!   They are refused, so a mismatched UI and daemon fail loudly instead of
+//!   deriving a key from the wrong bytes.
 //!
 //! Response body: `0x00 || payload` on success, `0x01 || error code (1)` on error
 //! * Status: `flags (1) || trusted peers (u32 LE)`; flags bit 0 = auth key set,
@@ -55,6 +61,26 @@ const MAX_REQUEST_BODY: usize = 1 + MAX_PASSWORD_LEN;
 const _: () = assert!(MAX_PEERS_BODY <= MAX_FRAME_LEN as usize);
 const _: () = assert!(MAX_REQUEST_BODY <= MAX_FRAME_LEN as usize);
 
+/// Code requirement the daemon must satisfy (macOS), fixed when the UI is built:
+/// `CESA_IPC_DAEMON_CODE_REQUIREMENT='anchor apple generic and certificate
+/// leaf[subject.OU] = "TEAMID" and identifier "dev.czarekk.cesaconn.daemon"'`
+///
+/// Only meaningful with a Developer ID signature and the hardened runtime on
+/// the daemon. Unset: the daemon is checked by uid only, and the UI says so.
+pub const DAEMON_CODE_REQUIREMENT: Option<&str> = option_env!("CESA_IPC_DAEMON_CODE_REQUIREMENT");
+
+/// Whether the daemon's code signature is checked before anything is sent.
+pub fn daemon_signature_checked() -> bool {
+    DAEMON_CODE_REQUIREMENT.is_some()
+}
+
+/// `false` if a requirement was built in but doesn't parse (or this platform
+/// has no code signing): then every daemon is refused, which fails closed.
+pub fn daemon_requirement_valid() -> bool {
+    DAEMON_CODE_REQUIREMENT
+        .is_none_or(|requirement| crate::code_signature::validate_requirement(requirement).is_ok())
+}
+
 /// Socket file name inside the private directory.
 const SOCKET_NAME: &str = "daemon.sock";
 /// Private directory name inside the per-user runtime/temp directory.
@@ -62,9 +88,9 @@ const DIR_NAME: &str = "cesaconn";
 
 /* request kinds */
 const REQ_STATUS: u8 = 0x01;
-const REQ_SET_AUTH_PASSWORD: u8 = 0x02;
-const REQ_SET_DATA_PASSWORD: u8 = 0x03;
 const REQ_LIST_PEERS: u8 = 0x04;
+const REQ_SET_AUTH_PASSWORD: u8 = 0x05;
+const REQ_SET_DATA_PASSWORD: u8 = 0x06;
 
 /* response status */
 const RESP_OK: u8 = 0x00;
@@ -83,7 +109,8 @@ pub enum IpcErrors {
     FailedToPrepareSocket,
     /// The daemon isn't running (nothing listens on the socket).
     FailedToConnect,
-    /// The process behind the socket runs as a different user.
+    /// The process behind the socket runs as a different user, or (macOS)
+    /// its code signature doesn't satisfy [`DAEMON_CODE_REQUIREMENT`].
     UntrustedDaemon,
     /// Reading from the socket failed or the peer closed it early.
     FailedToRead,
@@ -488,6 +515,16 @@ pub fn socket_path() -> Result<PathBuf, IpcErrors> {
 /// Sends `request` to the daemon at `path` and returns its answer.
 #[cfg(unix)]
 pub async fn request_at(path: &Path, request: &Request) -> Result<Response, IpcErrors> {
+    request_at_checked(path, request, DAEMON_CODE_REQUIREMENT).await
+}
+
+/// [`request_at`] with an explicit daemon code requirement (tests).
+#[cfg(unix)]
+async fn request_at_checked(
+    path: &Path,
+    request: &Request,
+    daemon_requirement: Option<&'static str>,
+) -> Result<Response, IpcErrors> {
     // the directory must still be private, or the socket could be someone else's
     check_private_dir(path.parent().ok_or(IpcErrors::FailedToPrepareSocket)?)?;
 
@@ -501,6 +538,13 @@ pub async fn request_at(path: &Path, request: &Request) -> Result<Response, IpcE
 
     if daemon.uid() != nix::unistd::geteuid().as_raw() {
         return Err(IpcErrors::UntrustedDaemon);
+    }
+
+    // macOS: ...and only to a daemon signed as required (fails closed elsewhere)
+    if let Some(requirement) = daemon_requirement {
+        crate::code_signature::verify_peer(&stream, requirement)
+            .await
+            .map_err(|_| IpcErrors::UntrustedDaemon)?;
     }
 
     write_frame(&mut stream, &request.encode()).await?;
@@ -556,6 +600,11 @@ mod tests {
         assert!(Request::decode(&[REQ_STATUS, 0]).is_none());
         // empty password
         assert!(Request::decode(&[REQ_SET_AUTH_PASSWORD]).is_none());
+        // retired version-1 kinds (salt || password) are refused, not misread
+        for retired in [0x02u8, 0x03] {
+            let v1 = [&[retired][..], &[7; 32], b"password"].concat();
+            assert!(Request::decode(&v1).is_none());
+        }
         // password too long
         let long = [
             &[REQ_SET_DATA_PASSWORD][..],
@@ -694,6 +743,56 @@ mod tests {
     async fn test_silent_peer_times_out() {
         let (_a, mut b) = tokio::io::duplex(64);
         assert_eq!(read_frame(&mut b).await.err(), Some(IpcErrors::Timeout));
+    }
+
+    /// Test that the UI checks the daemon's code signature before sending
+    /// anything (macOS; the test binary is not Apple-signed)
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn test_daemon_code_requirement_checked() {
+        let base = std::env::temp_dir().join(format!("cesa-ipc-sig-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let path = prepare_socket_dir(&base).unwrap();
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+
+        // fake daemon: answers Status, records whether it got any bytes
+        let server = tokio::spawn(async move {
+            let mut got_bytes = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let body = read_frame(&mut stream).await;
+                got_bytes.push(body.is_ok());
+                if body.is_ok() {
+                    let status = Response::Status(Status {
+                        auth_key_set: false,
+                        data_key_set: false,
+                        network_running: false,
+                        trusted_peers: 0,
+                    });
+                    write_frame(&mut stream, &status.encode()).await.unwrap();
+                }
+            }
+            got_bytes
+        });
+
+        let password = Request::SetAuthPassword(update(b"secret"));
+
+        // requirement not met: refused before a single byte is sent
+        assert_eq!(
+            request_at_checked(&path, &password, Some("anchor apple"))
+                .await
+                .err(),
+            Some(IpcErrors::UntrustedDaemon)
+        );
+        // requirement met: served
+        assert!(
+            request_at_checked(&path, &Request::Status, Some("! anchor apple"))
+                .await
+                .is_ok()
+        );
+
+        assert_eq!(server.await.unwrap(), vec![false, true]);
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// Test that the socket directory is created private and checked

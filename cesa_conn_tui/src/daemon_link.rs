@@ -238,9 +238,14 @@ mod tests {
         });
 
         // the listener must exist before the first connect
-        while !path.exists() {
+        // bounded, so a failed server thread can't hang the test
+        for _ in 0..2000 {
+            if path.exists() {
+                break;
+            }
             thread::sleep(std::time::Duration::from_millis(5));
         }
+        assert!(path.exists(), "fake daemon didn't start");
 
         let link = DaemonLink::spawn_with(Some(path)).unwrap();
 

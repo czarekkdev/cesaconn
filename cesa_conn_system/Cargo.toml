@@ -5,12 +5,18 @@ edition = "2024"
 publish = false
 
 [dependencies]
-tokio = { version = "1.50.0", features = ["io-util", "net", "time"] }
+# rt: spawn_blocking for the macOS code-signature check
+tokio = { version = "1.50.0", features = ["io-util", "net", "time", "rt"] }
 zeroize = "1.8.2"
 
 [target.'cfg(unix)'.dependencies]
-# geteuid() without unsafe
-nix = { version = "0.31", features = ["user"] }
+# geteuid() / peer audit token without unsafe
+nix = { version = "0.31.3", features = ["socket", "user"] }
+
+# code-signature check of the IPC peer (see code_signature.rs)
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10.1"
+security-framework = "3.7.0"
 
 [dev-dependencies]
 tokio = { version = "1.50.0", features = ["io-util", "net", "time", "macros", "rt", "test-util"] }
