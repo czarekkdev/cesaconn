@@ -43,6 +43,9 @@ jobs:
           toolchain: stable
           components: clippy
 
+      - name: System deps (btleplug -> libdbus)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libdbus-1-dev pkg-config
+
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
@@ -89,6 +92,9 @@ jobs:
         with:
           toolchain: nightly
           components: miri, rust-src
+
+      - name: System deps (btleplug -> libdbus)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libdbus-1-dev pkg-config
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
