@@ -52,6 +52,10 @@ impl ActionType {
     }
 }
 
+/// Upper bound for one encrypted data packet declared in the init header.
+/// Larger payloads must be chunked (see the chunking TODO in auth_snow).
+pub const MAX_DATA_PACKET_LEN: u64 = 16 * 1024 * 1024;
+
 pub struct IncomingConnection {
     pub name: String,
     pub stream: TcpStream,
@@ -80,6 +84,8 @@ pub enum TcpNetworkerErrors {
     FailedToWriteToStream,
     /// tokio::task::spawn_blocking returned a JoinError — blocking task panicked.
     FailedToSpawnNewBlockingTask,
+    /// Peer declared a data packet larger than `MAX_DATA_PACKET_LEN` — rejected before allocating.
+    DataTooLarge,
 }
 
 impl fmt::Display for TcpNetworkerErrors {
@@ -98,6 +104,7 @@ impl fmt::Display for TcpNetworkerErrors {
             TcpNetworkerErrors::FailedToSpawnNewBlockingTask => {
                 write!(f, "failed to spawn new blocking task")
             }
+            TcpNetworkerErrors::DataTooLarge => write!(f, "declared data packet is too large"),
         }
     }
 }
@@ -183,13 +190,21 @@ pub async fn recv_handler(
     size_bytes.copy_from_slice(&init_buf[1..9]);
     let size = u64::from_le_bytes(*size_bytes);
 
+    // The size comes from the peer: bound it before allocating, otherwise a
+    // (compromised) peer can request an exabyte buffer and abort the process.
+    if size > MAX_DATA_PACKET_LEN {
+        warn!(%peer_addr, size, max = MAX_DATA_PACKET_LEN, "declared data packet too large, rejecting");
+        return Err(TcpNetworkerErrors::DataTooLarge);
+    }
+    let size_usize = usize::try_from(size).map_err(|_| TcpNetworkerErrors::DataTooLarge)?;
+
     let action_type_raw = init_buf[0];
     debug!(%peer_addr, action_type_byte = action_type_raw, data_packet_size = size, "init header decrypted successfully");
 
     // Phase 3a: Read the double-encrypted data packet.
     // Length was declared in the authenticated init header — we trust it because
     // the header passed AES-GCM verification, so the size field was not tampered with.
-    let mut e_t_data_buf = vec![0u8; size as usize];
+    let mut e_t_data_buf = vec![0u8; size_usize];
 
     debug!(%peer_addr, size, "phase 3a: reading double-encrypted data packet");
     connection_mut

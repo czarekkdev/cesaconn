@@ -1,0 +1,150 @@
+# Network / protocol rules for CesaConn (TCP, UDP, IPC, handshake code).
+# severity ERROR   = critical -> fails CI / blocks push
+# severity WARNING = reported, does not block
+#
+# Threat model: everything read from a socket is attacker-controlled - even
+# after authentication (a paired device can be compromised, and a bug before
+# the auth check is reachable by anyone on the network).
+
+rules:
+  # ------------------------------------------------------------ critical
+  - id: cesa.net.unbounded-alloc-from-wire
+    severity: ERROR
+    languages: [rust]
+    message: >-
+      A length decoded from peer-supplied bytes (`from_le/be_bytes`, flagged
+      line) is later used as an allocation size (vec!/with_capacity/resize/
+      reserve/take) with no `if` bound check or `.min()` in between. A peer
+      sending 0xFFFF... makes this allocate exabytes -> abort (remote DoS).
+      Check it first: `if size > MAX_PACKET_LEN { return Err(...) }`.
+    patterns:
+      - pattern-regex: 'let\s+(?:mut\s+)?(\w+)\s*=\s*\w+::from_(?:le|be|ne)_bytes\b[^;]*;(?:(?!\bif\b[^{;]*\b\1\b\s*(?:>|<)|\bif\b[^{;]*(?:>|<)=?\s*\1\b|\b\1\s*\.\s*min\(|min\(\s*\1\b|\bfn\s)[\s\S])*?(?:vec!\[[^\];]*;\s*\1\b|with_capacity\(\s*\1\b|\.resize\(\s*\1\b|\.reserve(?:_exact)?\(\s*\1\b|\.take\(\s*\1\b)'
+      - pattern-not-inside: |
+          mod tests { ... }
+    metadata:
+      category: network
+
+  - id: cesa.net.non-constant-time-compare
+    severity: ERROR
+    languages: [rust]
+    message: >-
+      Secret-looking value compared with `==`/`!=`. Slice equality returns at
+      the first differing byte, so the response time leaks how many bytes of
+      the MAC/key/confirmation matched. Use `subtle::ConstantTimeEq`
+      (`a.ct_eq(&b).into()`).
+    patterns:
+      - pattern-either:
+          - patterns:
+              - pattern-either:
+                  - pattern: $A == $B
+                  - pattern: $A != $B
+              - metavariable-regex:
+                  metavariable: $A
+                  regex: '(?is)^(?!.*(pub|public|verif|len|size|count|idx|::|tags?\b)).*(mac|hmac|tag_bytes|auth_tag|digest|confirm|secret|psk|password|pswd|shared|session_key|a_key|d_key|auth_key|token|signature|_hash)'
+          - patterns:
+              - pattern-either:
+                  - pattern: $A == $B
+                  - pattern: $A != $B
+              - metavariable-regex:
+                  metavariable: $B
+                  regex: '(?is)^(?!.*(pub|public|verif|len|size|count|idx|::|tags?\b)).*(mac|hmac|tag_bytes|auth_tag|digest|confirm|secret|psk|password|pswd|shared|session_key|a_key|d_key|auth_key|token|signature|_hash)'
+      - metavariable-regex:
+          metavariable: $B
+          regex: '^(?![0-9]|true$|false$|None$|Some\(|b?"|\[\]$)'
+      - pattern-not-inside: |
+          mod tests { ... }
+    metadata:
+      category: network
+
+  - id: cesa.net.static-aead-nonce
+    severity: ERROR
+    languages: [rust]
+    message: >-
+      Fixed/zero AEAD nonce. Re-using a nonce with the same AES-GCM key breaks
+      confidentiality AND authenticity. Generate a fresh random nonce per
+      message (or use a strictly increasing counter).
+    pattern-either:
+      - pattern: Nonce::from_slice(&[$V; $N])
+      - pattern: Nonce::from_slice(b"...")
+      - pattern: Nonce::default()
+      - pattern: "Nonce::from([$V; $N])"
+      - pattern: "Nonce::<$T>::default()"
+    metadata:
+      category: network
+
+  # ------------------------------------------------------------ report
+  - id: cesa.net.read-without-timeout
+    severity: WARNING
+    languages: [rust]
+    message: >-
+      Network read awaited without a timeout. A peer that connects and then
+      sends nothing (or one byte per minute) pins this task and its socket
+      forever (slowloris). Wrap it: `timeout(Duration::from_secs(T), $S.$M(...)).await`.
+    patterns:
+      - pattern: $S.$M(...).await
+      - metavariable-regex:
+          metavariable: $M
+          regex: ^(read_exact|read|read_buf|read_to_end|read_to_string|read_u8|read_u16|read_u32|read_u64|read_line|recv|recv_from|peek)$
+      - pattern-not-inside: timeout($D, ...)
+      - pattern-not-inside: tokio::time::timeout($D, ...)
+      - pattern-not-inside: time::timeout($D, ...)
+      - pattern-not-inside: $L.read().await
+      - pattern-not-inside: |
+          mod tests { ... }
+    metadata:
+      category: network
+
+  - id: cesa.net.bind-all-interfaces
+    severity: WARNING
+    languages: [rust]
+    message: >-
+      Socket bound to every interface (`$ADDR`): reachable from any network the
+      machine joins (public Wi-Fi, VPN, ...). Make sure that is intended and that
+      nothing is processed before authentication.
+    patterns:
+      - pattern: $X::bind("$ADDR")
+      - metavariable-regex:
+          metavariable: $ADDR
+          regex: ^(0\.0\.0\.0|\[::\]|::):\d+$
+      - pattern-not-inside: |
+          mod tests { ... }
+    metadata:
+      category: network
+
+  - id: cesa.net.wire-length-cast
+    severity: WARNING
+    languages: [rust]
+    message: >-
+      A u64 length from the wire is cast with `as usize`: on 32-bit targets it
+      silently truncates, so the bound check and the allocation can disagree.
+      Use `usize::try_from(len)` and reject on error.
+    patterns:
+      - pattern-regex: 'let\s+(?:mut\s+)?(\w+)\s*=\s*u64::from_(?:le|be)_bytes\b[^;]*;(?:(?!\bfn\s)[\s\S])*?\b\1\s+as\s+usize\b|let\s+(?:mut\s+)?\w+\s*=\s*u64::from_(?:le|be)_bytes\([^;]*\)\s+as\s+usize\b'
+      - pattern-not-inside: |
+          mod tests { ... }
+    metadata:
+      category: network
+
+  - id: cesa.net.unwrap-on-io
+    severity: WARNING
+    languages: [rust]
+    message: >-
+      `.$U()` on a network/crypto result in non-test code: a malformed packet or
+      a dropped connection panics the task (remote crash). Propagate the error.
+    patterns:
+      - pattern-either:
+          - pattern: $S.$M(...).await.$U()
+          - pattern: $S.$M(...).$U()
+          - pattern: $M(...).$U()
+      - metavariable-regex:
+          metavariable: $U
+          regex: ^(unwrap|expect)$
+      - metavariable-regex:
+          metavariable: $M
+          regex: ^(read_exact|read|write_all|write|recv|recv_from|send|send_to|accept|connect|decrypt|decrypt_tunnel|read_message|write_message|finish|verify)$
+      - pattern-not-inside: |
+          mod tests { ... }
+      - pattern-not-inside: "fn main() { ... }"
+      - pattern-not-inside: "async fn main() { ... }"
+    metadata:
+      category: network

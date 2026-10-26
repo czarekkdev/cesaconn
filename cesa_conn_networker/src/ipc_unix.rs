@@ -55,6 +55,9 @@ use tokio_util::future::FutureExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+/// Max size of the trusted-address list received over IPC (4096 IPv4 addresses).
+const MAX_TRUSTED_ADDRS_LEN: u64 = 4096 * 4;
+
 /// Action types for IPC messages
 ///
 /// Each action type represents a different operation that can be requested
@@ -846,11 +849,11 @@ pub async fn ipc_action(
                 .read_exact(&mut size_buffer)
                 .map_err(|_| IpcErrors::FailedToReadDataFromStream)?;
 
-            let size = u64::from_le_bytes(size_buffer) as usize;
+            let size = u64::from_le_bytes(size_buffer);
 
-            // Validate that size is a clean multiple of 4 (each IPv4 address is 4 bytes).
+            // Validate that size is bounded and a clean multiple of 4 (each IPv4 address is 4 bytes).
             // Send 0x00 to reject or 0x01 to accept before the daemon sends the list.
-            if size % size_of::<Ipv4Addr>() != 0 {
+            if size > MAX_TRUSTED_ADDRS_LEN || size % size_of::<Ipv4Addr>() as u64 != 0 {
                 stream
                     .write_all(&[0u8])
                     .map_err(|_| IpcErrors::FailedToWriteToStream)?;
@@ -862,6 +865,8 @@ pub async fn ipc_action(
             }
 
             // Step 4: Read the packed address list and parse into SocketAddrs.
+            // Bounded by MAX_TRUSTED_ADDRS_LEN above, so this cannot truncate.
+            let size = usize::try_from(size).map_err(|_| IpcErrors::DataTooLarge)?;
             let mut addrs_buffer = vec![0u8; size];
 
             stream
