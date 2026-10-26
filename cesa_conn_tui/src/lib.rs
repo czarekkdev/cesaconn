@@ -10,7 +10,9 @@
 
 mod daemon_link;
 
-use cesa_conn_system::ipc::{IpcErrors, PasswordUpdate, PeerInfo, Status};
+use cesa_conn_system::ipc::{
+    DaemonError, IpcErrors, MIN_NEW_PASSWORD_LEN, PasswordUpdate, PeerInfo, Status,
+};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
@@ -30,6 +32,7 @@ use daemon_link::{Command, DaemonLink, KeyKind, LinkEvent};
 /* setting labels the daemon link reads or writes */
 const AUTH_KEY_LABEL: &str = "Auth key";
 const DATA_KEY_LABEL: &str = "Data key";
+const AUTO_LOGIN_LABEL: &str = "Automatic login";
 
 /// How often the daemon's status is asked for (seconds).
 const REFRESH_INTERVAL: u64 = 2;
@@ -51,7 +54,11 @@ pub struct Device {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SettingKind {
-    Secret { configured: bool },
+    Secret {
+        configured: bool,
+    },
+    /// A secret saved in the locked vault: editing it unlocks instead.
+    Locked,
     Bool(bool),
     Text,
 }
@@ -71,6 +78,7 @@ impl Setting {
         match &self.kind {
             SettingKind::Secret { configured: true } => ("[configured]", Color::Green),
             SettingKind::Secret { configured: false } => ("[not configured]", Color::DarkGray),
+            SettingKind::Locked => ("[locked: Enter to unlock]", Color::Yellow),
             SettingKind::Bool(true) => ("on", Color::Green),
             SettingKind::Bool(false) => ("off", Color::DarkGray),
             SettingKind::Text => {
@@ -177,13 +185,14 @@ impl App {
                     warn_message: None,
                 },
                 Setting {
-                    label: "Key persistence",
+                    label: AUTO_LOGIN_LABEL,
                     kind: SettingKind::Bool(false),
                     value: String::new(),
                     warn_message: Some(
-                        "Keys will be stored in the system keyring.\n\
-                         Persistent keys are reused across sessions,\n\
-                         which reduces forward secrecy.",
+                        "Your data key will be stored in the OS keychain.\n\
+                         Its security then depends on your OS and account:\n\
+                         anyone who can unlock your session can use it.\n\
+                         We can't vouch for that.",
                     ),
                 },
                 Setting {
@@ -437,6 +446,10 @@ fn handle_settings_enter(app: &mut App) {
     if is_bool {
         if !currently_on && has_warning {
             app.active_popup = ActivePopup::SecurityWarning { section, idx };
+        } else if is_auto_login(app, section, idx) {
+            // turning it off: the daemon deletes d_key from the keychain
+            app.outbox.push(Command::SetAutoLogin(false));
+            app.push_log("[ INFO] Turning automatic login off");
         } else if let Some(s) = app.active_settings_mut().get_mut(idx) {
             if let SettingKind::Bool(ref mut v) = s.kind {
                 *v = !*v;
@@ -557,6 +570,28 @@ fn send_password_from_input(app: &mut App) {
         KeyKind::Data => "data",
     };
 
+    let locked = matches!(&app.daemon, DaemonState::Up(status) if status.locked);
+
+    if locked {
+        if kind == KeyKind::Data {
+            app.outbox.push(Command::Unlock(PasswordUpdate {
+                password: Zeroizing::new(app.input_buf.as_bytes().to_vec()),
+            }));
+            app.push_log("[ INFO] Unlocking the saved keys (takes a moment)");
+        } else {
+            app.push_log("[ WARN] Saved keys are locked: unlock with the data password first");
+        }
+        return;
+    }
+
+    // the daemon checks this too; this only saves a round trip
+    if app.input_buf.chars().count() < MIN_NEW_PASSWORD_LEN {
+        app.push_log(format!(
+            "[ WARN] Use at least {MIN_NEW_PASSWORD_LEN} characters, nothing sent"
+        ));
+        return;
+    }
+
     app.outbox.push(Command::SetPassword {
         kind,
         update: PasswordUpdate {
@@ -578,7 +613,24 @@ fn handle_link_event(app: &mut App, event: LinkEvent) {
                 app.push_log("[ INFO] Connected to the daemon");
             }
 
+            let was_locked = matches!(&app.daemon, DaemonState::Up(s) if s.locked);
+            if status.locked && !was_locked {
+                app.push_log(
+                    "[ WARN] Saved keys are locked: enter the data password (Settings > Data key)",
+                );
+            }
+
             set_key_flags(app, status.auth_key_set, status.data_key_set);
+            if status.locked {
+                for label in [AUTH_KEY_LABEL, DATA_KEY_LABEL] {
+                    if let Some(s) = app.setting_mut(label) {
+                        s.kind = SettingKind::Locked;
+                    }
+                }
+            }
+            if let Some(s) = app.setting_mut(AUTO_LOGIN_LABEL) {
+                s.kind = SettingKind::Bool(status.auto_login);
+            }
             app.peers = peers;
             app.daemon = DaemonState::Up(status);
         }
@@ -608,6 +660,30 @@ fn handle_link_event(app: &mut App, event: LinkEvent) {
 
             app.request_refresh();
         }
+        LinkEvent::Unlocked(result) => {
+            match result {
+                Ok(()) => app.push_log("[ INFO] Saved keys unlocked"),
+                Err(IpcErrors::Daemon(DaemonError::WrongPassword)) => {
+                    app.push_log("[ERROR] Wrong data password")
+                }
+                Err(e) => app.push_log(format!("[ERROR] Unlocking failed: {e}")),
+            }
+            app.request_refresh();
+        }
+        LinkEvent::AutoLoginSet { on, result } => {
+            match (on, result) {
+                (true, Ok(())) => {
+                    app.push_log("[ WARN] Automatic login on: the data key is in the OS keychain")
+                }
+                (false, Ok(())) => {
+                    app.push_log("[ INFO] Automatic login off: data key removed from the keychain")
+                }
+                (_, Err(e)) => {
+                    app.push_log(format!("[ERROR] Changing automatic login failed: {e}"))
+                }
+            }
+            app.request_refresh();
+        }
         LinkEvent::WorkerStopped => {
             if app.daemon != DaemonState::NoLink {
                 app.push_log("[ERROR] The daemon link stopped, restart the UI");
@@ -628,6 +704,15 @@ fn set_key_flags(app: &mut App, auth: bool, data: bool) {
     }
 }
 
+/// Whether `idx` in `section` is the automatic-login switch.
+fn is_auto_login(app: &App, section: SettingsSection, idx: usize) -> bool {
+    let settings = match section {
+        SettingsSection::Basic => &app.settings_basic,
+        SettingsSection::Advanced => &app.settings_advanced,
+    };
+    matches!(settings.get(idx).map(|s| s.label), Some(AUTO_LOGIN_LABEL))
+}
+
 fn handle_security_warning_input(
     app: &mut App,
     code: KeyCode,
@@ -635,6 +720,14 @@ fn handle_security_warning_input(
     idx: usize,
 ) {
     match code {
+        KeyCode::Char('y') | KeyCode::Char('Y') if is_auto_login(app, section, idx) => {
+            // the daemon decides; the switch follows its status
+            app.outbox.push(Command::SetAutoLogin(true));
+            app.push_log(
+                "[ WARN] Turning automatic login on: your data key goes to the OS keychain",
+            );
+            app.active_popup = ActivePopup::None;
+        }
         KeyCode::Char('y') | KeyCode::Char('Y') => {
             let settings = match section {
                 SettingsSection::Basic => &mut app.settings_basic,
@@ -936,10 +1029,19 @@ fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
 
     let (daemon_str, daemon_color) = match &app.daemon {
         DaemonState::Unknown => ("daemon: …".to_owned(), Color::DarkGray),
+        DaemonState::Up(s) if s.locked => (
+            "daemon: locked, enter the data password".to_owned(),
+            Color::Yellow,
+        ),
         DaemonState::Up(s) => (
             format!(
-                "daemon: keys {}/2, network {}, {} paired",
+                "daemon: keys {}/2 {}, network {}, {} paired",
                 u8::from(s.auth_key_set).saturating_add(u8::from(s.data_key_set)),
+                if s.saved {
+                    "(saved, encrypted)"
+                } else {
+                    "(memory only)"
+                },
                 if s.network_running { "on" } else { "off" },
                 s.trusted_peers
             ),
@@ -1000,7 +1102,10 @@ fn render_edit_setting_popup(frame: &mut Frame, area: Rect, app: &App) {
         return;
     };
 
-    let is_secret = matches!(setting.kind, SettingKind::Secret { .. });
+    let is_secret = matches!(
+        setting.kind,
+        SettingKind::Secret { .. } | SettingKind::Locked
+    );
     let display_input = if is_secret {
         // one star per character, the byte length would leak more than the length
         "*".repeat(app.input_buf.chars().count())
@@ -1257,7 +1362,7 @@ mod tests {
         let labels: Vec<_> = app.settings_basic.iter().map(|s| s.label).collect();
         assert!(labels.contains(&"Auth key"));
         assert!(labels.contains(&"Data key"));
-        assert!(labels.contains(&"Key persistence"));
+        assert!(labels.contains(&AUTO_LOGIN_LABEL));
     }
 
     #[test]
@@ -1352,6 +1457,7 @@ mod tests {
                 data_key_set: data,
                 network_running: false,
                 trusted_peers: 1,
+                ..Status::default()
             },
             vec![PeerInfo {
                 fingerprint: [0xab; 8],
@@ -1376,13 +1482,13 @@ mod tests {
         let mut app = App::new();
         select(&mut app, SettingsSection::Basic, AUTH_KEY_LABEL);
 
-        type_and_enter(&mut app, " hunter 2 ");
+        type_and_enter(&mut app, " hunter two 2 ");
 
         let [Command::SetPassword { kind, update }] = app.outbox.as_slice() else {
             panic!("expected one SetPassword command");
         };
         assert_eq!(*kind, KeyKind::Auth);
-        assert_eq!(update.password.as_slice(), b" hunter 2 ");
+        assert_eq!(update.password.as_slice(), b" hunter two 2 ");
 
         assert!(app.input_buf.is_empty());
         assert!(!app.logs.iter().any(|l| l.contains("hunter")));
@@ -1407,7 +1513,7 @@ mod tests {
         type_and_enter(&mut app, "");
         assert!(app.outbox.is_empty());
 
-        type_and_enter(&mut app, "pw");
+        type_and_enter(&mut app, "data password 1");
         assert!(matches!(
             app.outbox.as_slice(),
             [Command::SetPassword {
@@ -1415,6 +1521,120 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    fn up_locked(locked: bool, auto_login: bool) -> LinkEvent {
+        LinkEvent::Refreshed(Ok((
+            Status {
+                locked,
+                saved: true,
+                auto_login,
+                auth_key_set: !locked,
+                data_key_set: !locked,
+                ..Status::default()
+            },
+            Vec::new(),
+        )))
+    }
+
+    /// Test that a new password below the minimum is not sent at all
+    #[test]
+    fn test_short_new_password_not_sent() {
+        let mut app = App::new();
+        select(&mut app, SettingsSection::Basic, DATA_KEY_LABEL);
+
+        type_and_enter(&mut app, &"a".repeat(MIN_NEW_PASSWORD_LEN - 1));
+
+        assert!(app.outbox.is_empty());
+        assert!(app.input_buf.is_empty());
+        assert!(app.logs.iter().any(|l| l.contains("at least")));
+    }
+
+    /// Test that while the vault is locked the data key field unlocks (any
+    /// length: it must accept the existing password), the auth key sends nothing
+    #[test]
+    fn test_locked_unlocks_with_data_password() {
+        let mut app = App::new();
+        handle_link_event(&mut app, up_locked(true, false));
+
+        assert_eq!(
+            app.setting_mut(DATA_KEY_LABEL).unwrap().kind,
+            SettingKind::Locked
+        );
+        assert!(app.logs.iter().any(|l| l.contains("locked")));
+
+        select(&mut app, SettingsSection::Basic, AUTH_KEY_LABEL);
+        type_and_enter(&mut app, "auth password 1");
+        assert!(app.outbox.is_empty());
+
+        select(&mut app, SettingsSection::Basic, DATA_KEY_LABEL);
+        type_and_enter(&mut app, "data password 1");
+        let [Command::Unlock(update)] = app.outbox.as_slice() else {
+            panic!("expected one Unlock command");
+        };
+        assert_eq!(update.password.as_slice(), b"data password 1");
+        assert!(app.input_buf.is_empty());
+        assert!(!app.logs.iter().any(|l| l.contains("data password 1")));
+    }
+
+    /// Test that automatic login is asked of the daemon (after the warning),
+    /// and the switch shows only what the daemon reports
+    #[test]
+    fn test_auto_login_goes_through_daemon() {
+        let mut app = App::new();
+        handle_link_event(&mut app, up_locked(false, false));
+        select(&mut app, SettingsSection::Basic, AUTO_LOGIN_LABEL);
+        let idx = app.settings_selected;
+
+        // turning on shows the warning first
+        handle_settings_enter(&mut app);
+        assert_eq!(
+            app.active_popup,
+            ActivePopup::SecurityWarning {
+                section: SettingsSection::Basic,
+                idx
+            }
+        );
+        handle_security_warning_input(&mut app, KeyCode::Char('n'), SettingsSection::Basic, idx);
+        assert!(app.outbox.is_empty());
+
+        handle_settings_enter(&mut app);
+        handle_security_warning_input(&mut app, KeyCode::Char('y'), SettingsSection::Basic, idx);
+        assert!(matches!(
+            app.outbox.as_slice(),
+            [Command::SetAutoLogin(true)]
+        ));
+        // not on until the daemon says so
+        assert_eq!(
+            app.setting_mut(AUTO_LOGIN_LABEL).unwrap().kind,
+            SettingKind::Bool(false)
+        );
+
+        app.outbox.clear();
+        handle_link_event(&mut app, up_locked(false, true));
+        assert_eq!(
+            app.setting_mut(AUTO_LOGIN_LABEL).unwrap().kind,
+            SettingKind::Bool(true)
+        );
+
+        // turning off: no warning, straight to the daemon
+        handle_settings_enter(&mut app);
+        assert!(matches!(
+            app.outbox.as_slice(),
+            [Command::SetAutoLogin(false)]
+        ));
+    }
+
+    /// Test that a wrong data password on unlock is reported clearly
+    #[test]
+    fn test_wrong_unlock_password_reported() {
+        let mut app = App::new();
+        handle_link_event(
+            &mut app,
+            LinkEvent::Unlocked(Err(IpcErrors::Daemon(DaemonError::WrongPassword))),
+        );
+        assert!(app.logs.iter().any(|l| l.contains("Wrong data password")));
+        assert!(matches!(app.outbox.as_slice(), [Command::Refresh]));
     }
 
     /// Test that ordinary text settings are still trimmed and stored

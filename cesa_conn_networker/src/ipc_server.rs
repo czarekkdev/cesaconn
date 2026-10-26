@@ -273,6 +273,7 @@ mod tests {
             data_key_set: false,
             network_running: false,
             trusted_peers: 2,
+            ..Status::default()
         })
         .encode()
     }
