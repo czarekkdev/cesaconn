@@ -399,6 +399,22 @@ def check_tsan() -> ToolResult:
 
 
 # ---- report -----------------------------------------------------------------
+GAP_RULES = {"does-not-compile", "not-tested", "tool-failed", "timeout"}
+
+
+def coverage_gaps(results: list[ToolResult]) -> list[str]:
+    """Everything that was NOT actually analysed: skipped tools, crates that did not
+    build, checkers that crashed or timed out. A green result must not hide these."""
+    gaps = []
+    for r in results:
+        if r.status == "skipped":
+            gaps.append(f"{r.name}: skipped ({r.note})")
+        for f in r.findings:
+            if f.rule in GAP_RULES and f.severity == "info":
+                gaps.append(f"{r.name}: {f.message.splitlines()[0]}")
+    return gaps
+
+
 def write_report(results: list[ToolResult], mode: str) -> tuple[int, str]:
     allf = [f for r in results for f in r.findings]
     allf.sort(key=lambda f: (SEV_ORDER[f.severity], f.tool, f.path, f.line))
@@ -407,8 +423,15 @@ def write_report(results: list[ToolResult], mode: str) -> tuple[int, str]:
     info = sum(f.severity == "info" for f in allf)
 
     sha = run(["git", "rev-parse", "--short", "HEAD"])[1].strip()
+    gaps = coverage_gaps(results)
+    verdict = "❌ BLOCKED" if crit else ("⚠️ PASSED - PARTIAL COVERAGE" if gaps else "✅ PASSED")
     lines = [f"# CesaConn security report ({mode}) - `{sha}`", "",
-             f"**{'❌ BLOCKED' if crit else '✅ PASSED'}** - {crit} critical, {warn} warnings, {info} notes", "",
+             f"**{verdict}** - {crit} critical, {warn} warnings, {info} notes", ""]
+    if gaps:
+        lines += ["> [!WARNING]",
+                  "> **Not everything was analysed.** A pass only covers what actually ran:",
+                  *[f"> - {g}" for g in gaps], ""]
+    lines += [
              "| Tool | Status | Critical | Warnings | Time |", "|---|---|---|---|---|"]
     for r in results:
         c = sum(f.severity == "critical" for f in r.findings)
@@ -501,9 +524,23 @@ def main() -> int:
     for f in [f for r in results for f in r.findings if f.severity == "critical"]:
         loc = f"{f.path}:{f.line}" if f.line else f.path
         print(f"  CRITICAL  {f.tool}/{f.rule}  {loc}\n            {f.message[:220]}")
+    gaps = coverage_gaps(results)
+    for g in gaps:
+        print(f"  NOT ANALYSED  {g}")
+        if os.environ.get("GITHUB_ACTIONS"):
+            # shows up as a yellow annotation on the run and in the PR checks
+            msg = g.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+            print(f"::warning title=Security gate - partial coverage::{msg}")
+    strict = os.environ.get("CESA_REQUIRE_FULL_COVERAGE") == "1"
     print(f"\nReport: {OUT / 'report.md'}")
-    print("RESULT:", "BLOCKED" if crit else "PASSED", f"({crit} critical)")
-    return 1 if crit else 0
+    if crit:
+        print("RESULT: BLOCKED", f"({crit} critical)")
+        return 1
+    if gaps:
+        print("RESULT: PASSED - PARTIAL COVERAGE", f"({len(gaps)} gaps{', strict mode -> failing' if strict else ''})")
+        return 1 if strict else 0
+    print("RESULT: PASSED (0 critical, full coverage)")
+    return 0
 
 
 if __name__ == "__main__":
