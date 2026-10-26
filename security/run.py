@@ -21,7 +21,8 @@ Checks
 Severity
   critical  -> blocks (exit 1)
   warning   -> reported only
-  info      -> a tool could not run / partial analysis (reported, never blocks)
+  info      -> a tool could not run / partial analysis, or a reviewed dependency
+               exception from security/accepted.json (reported, never blocks)
 """
 
 from __future__ import annotations
@@ -398,6 +399,62 @@ def check_tsan() -> ToolResult:
     return r
 
 
+# ---- reviewed dependency exceptions -----------------------------------------
+ACCEPTED = ROOT / "security" / "accepted.json"
+
+
+def lock_versions() -> dict[str, set[str]]:
+    """crate name -> every version of it in Cargo.lock"""
+    out: dict[str, set[str]] = {}
+    lock = (ROOT / "Cargo.lock").read_text()
+    for m in re.finditer(r'^name = "([^"]+)"\nversion = "([^"]+)"', lock, re.M):
+        out.setdefault(m.group(1), set()).add(m.group(2))
+    return out
+
+
+def apply_accepted(results: list[ToolResult]) -> None:
+    """Downgrades reviewed, unfixable dependency findings (security/accepted.json)
+    to notes. Exact match only - a new version or package makes it a warning
+    again. Never applies to critical findings or first-party code. Stale entries
+    are reported so the list can't silently rot."""
+    if not ACCEPTED.exists():
+        return
+    acc = json.loads(ACCEPTED.read_text())
+    dups, advs = acc.get("duplicates", {}), acc.get("advisories", {})
+    versions = lock_versions()
+    used: set[str] = set()
+
+    for r in results:
+        for f in r.findings:
+            if f.severity != "warning" or f.path != "Cargo.lock":
+                continue
+            m = re.search(r"duplicate entries for crate '([^']+)'", f.message)
+            if r.name == "cargo-deny" and f.rule == "bans:duplicate" and m:
+                name = m.group(1)
+                e = dups.get(name)
+                if e and set(e["versions"]) == versions.get(name, set()):
+                    f.severity, f.rule = "info", "accepted:duplicate"
+                    f.message = f"{name} {', '.join(sorted(versions[name]))} - {e['reason']}"
+                    used.add(f"dup:{name}")
+            elif r.name == "cargo-audit":
+                adv_id = f.rule.split(":")[-1]
+                e = advs.get(adv_id)
+                pkg = f.message.split(":")[0].replace(" ", "@")
+                if e and e["package"] == pkg:
+                    f.severity, f.rule = "info", f"accepted:{adv_id}"
+                    f.message = f"{pkg} - {e['reason']}"
+                    used.add(f"adv:{adv_id}")
+
+    stale = [f"duplicate {n}" for n in dups if f"dup:{n}" not in used] + \
+            [f"advisory {i}" for i in advs if f"adv:{i}" not in used]
+    ran = {r.name for r in results}
+    if stale and {"cargo-deny", "cargo-audit"} <= ran:
+        results.append(ToolResult("accepted", "findings", findings=[
+            Finding("accepted", "stale-exception", "info",
+                    f"{x} in security/accepted.json no longer matches (fixed or version changed) - remove it",
+                    "security/accepted.json") for x in stale]))
+
+
 # ---- report -----------------------------------------------------------------
 GAP_RULES = {"does-not-compile", "not-tested", "tool-failed", "timeout"}
 
@@ -516,6 +573,7 @@ def main() -> int:
               f"in {res.seconds:.0f}s", flush=True)
         results.append(res)
 
+    apply_accepted(results)
     crit, md = write_report(results, "fast" if a.fast else "full")
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:

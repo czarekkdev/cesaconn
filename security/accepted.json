@@ -1,0 +1,35 @@
+{
+  "_comment": [
+    "Reviewed dependency findings that can't be fixed in this repository.",
+    "security/run.py turns a matching finding into a NOTE (still listed in the report, with the reason).",
+    "Matching is exact: a duplicate is accepted only while Cargo.lock has exactly these versions,",
+    "an advisory only for this package version. Any change -> it's a warning again.",
+    "Entries that no longer match anything are reported as stale, remove them.",
+    "Re-review on every dependency bump; never add first-party code here."
+  ],
+  "duplicates": {
+    "chacha20": { "versions": ["0.9.1", "0.10.2"], "reason": "snow 0.10 -> chacha20poly1305 0.10 (0.9); rand 0.10 StdRng (0.10)" },
+    "cpufeatures": { "versions": ["0.2.17", "0.3.1"], "reason": "RustCrypto stable line (aes, sha2, argon2) vs chacha20 0.10 from rand 0.10" },
+    "dashmap": { "versions": ["5.5.3", "6.2.1"], "reason": "btleplug: jni-utils pins dashmap 5, btleplug itself uses 6" },
+    "getrandom": { "versions": ["0.2.17", "0.3.4", "0.4.3"], "reason": "rand_core 0.6 (RustCrypto/dalek), snow 0.10 (0.3), rand 0.10 (0.4)" },
+    "hashbrown": { "versions": ["0.14.5", "0.17.1"], "reason": "dashmap 5 via btleplug jni-utils" },
+    "hax-lib": { "versions": ["0.3.7", "0.4.2"], "reason": "libcrux 0.0.11: core-models uses hax-lib 0.3, libcrux-intrinsics 0.4 (verification annotations, no runtime code)" },
+    "hax-lib-macros": { "versions": ["0.3.7", "0.4.2"], "reason": "same as hax-lib" },
+    "hax-lib-macros-types": { "versions": ["0.3.7", "0.4.2"], "reason": "same as hax-lib" },
+    "itertools": { "versions": ["0.13.0", "0.14.0"], "reason": "build-time: bindgen (libcrux-secrets -> crabgrind) vs bluez-async (btleplug)" },
+    "r-efi": { "versions": ["5.3.0", "6.0.0"], "reason": "UEFI target only, via getrandom 0.3 / 0.4" },
+    "rand_core": { "versions": ["0.6.4", "0.10.1"], "reason": "RustCrypto stable + dalek use rand_core 0.6, libcrux/rand 0.10 use 0.10" },
+    "shlex": { "versions": ["1.3.0", "2.0.1"], "reason": "build-time only: bindgen vs cc (crabgrind)" },
+    "syn": { "versions": ["1.0.109", "2.0.119", "3.0.9"], "reason": "proc-macros only (compile time): syn 1 from wezterm-dynamic-derive (ratatui termwiz backend, all-features graph), syn 3 from async-trait (btleplug), the rest on syn 2" },
+    "thiserror": { "versions": ["1.0.69", "2.0.21"], "reason": "btleplug -> jni 0.19 uses thiserror 1" },
+    "thiserror-impl": { "versions": ["1.0.69", "2.0.21"], "reason": "same as thiserror" },
+    "windows-link": { "versions": ["0.1.3", "0.2.1"], "reason": "Windows only: btleplug -> windows 0.61" },
+    "windows-sys": { "versions": ["0.52.0", "0.61.2"], "reason": "Windows only: ring (snow default resolver) pins 0.52" }
+  },
+  "advisories": {
+    "RUSTSEC-2026-0173": {
+      "package": "proc-macro-error2@2.0.1",
+      "reason": "unmaintained, not a vulnerability; compile-time proc-macro only (libcrux -> hax-lib-macros 0.3), no runtime code, no fixed version upstream"
+    }
+  }
+}

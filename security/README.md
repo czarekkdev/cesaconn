@@ -50,3 +50,20 @@ Suppress one line after review, with a reason:
 
 or `#[allow(clippy::<lint>)] // reason`. New rule? Add it to `security/semgrep/*.yml`
 with a `// ruleid:` / `// ok:` case in the matching `.rs` fixture.
+
+## Dependency exceptions (`security/accepted.json`)
+
+Some dependency warnings can't be fixed in this repo: duplicate versions that
+come from upstream crates (btleplug, libcrux, snow, RustCrypto) and
+unmaintained-but-not-vulnerable advisories with no fixed version. After review
+they go into `security/accepted.json`, with a reason for each:
+
+- an accepted finding is shown as a **note** with its reason, never hidden
+- matching is exact: a duplicate only while `Cargo.lock` has exactly the listed
+  versions, an advisory only for the listed `package@version`; any change
+  makes it a warning again
+- entries that no longer match are reported as `stale-exception`, remove them
+- only `Cargo.lock` warnings can be accepted; critical findings
+  (vulnerabilities, unsound crates, foreign sources) and first-party code can't
+
+Re-check the list whenever dependencies change.
