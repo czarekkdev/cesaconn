@@ -127,6 +127,9 @@ enum ActivePopup {
         section: SettingsSection,
         idx: usize,
     },
+    /// "Are you sure?" before changing a password that is already set.
+    /// Asked before typing, so no password waits for the answer.
+    ConfirmPasswordChange(KeyKind),
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -371,6 +374,10 @@ fn handle_input(app: &mut App) -> io::Result<()> {
             handle_security_warning_input(app, key.code, section, idx);
             return Ok(());
         }
+        ActivePopup::ConfirmPasswordChange(_) => {
+            handle_confirm_change_input(app, key.code);
+            return Ok(());
+        }
         ActivePopup::None => {}
     }
 
@@ -455,9 +462,31 @@ fn handle_settings_enter(app: &mut App) {
                 *v = !*v;
             }
         }
+    } else if let Some(kind) = selected_key_kind(app)
+        && matches!(
+            app.active_settings().get(idx).map(|s| &s.kind),
+            Some(SettingKind::Secret { configured: true })
+        )
+    {
+        // changing a password that is already set: ask first
+        app.active_popup = ActivePopup::ConfirmPasswordChange(kind);
     } else {
         clear_input(app);
         app.active_popup = ActivePopup::EditSetting;
+    }
+}
+
+/// y: go on to typing the new password; anything that cancels: nothing changes.
+fn handle_confirm_change_input(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            clear_input(app);
+            app.active_popup = ActivePopup::EditSetting;
+        }
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+            app.active_popup = ActivePopup::None;
+        }
+        _ => {}
     }
 }
 
@@ -769,6 +798,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
         ActivePopup::SecurityWarning { section, idx } => {
             render_security_warning_popup(frame, area, section, idx, app)
         }
+        ActivePopup::ConfirmPasswordChange(kind) => render_confirm_change_popup(frame, area, kind),
         ActivePopup::None => {}
     }
 }
@@ -1140,6 +1170,60 @@ fn render_edit_setting_popup(frame: &mut Frame, area: Rect, app: &App) {
             .saturating_add(to_u16(display_input.len())),
         popup.y.saturating_add(1),
     ));
+}
+
+fn render_confirm_change_popup(frame: &mut Frame, area: Rect, kind: KeyKind) {
+    let name = match kind {
+        KeyKind::Auth => "auth",
+        KeyKind::Data => "data",
+    };
+
+    let w = 60u16.min(area.width);
+    let h = 9u16.min(area.height);
+    let popup = centered_rect(area, w, h);
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  Change the {name} password?"),
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(Span::styled(
+            "  Every paired device must use the same new password,",
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(Span::styled(
+            "  or it stops syncing with this one.",
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "  y",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(": yes, change it   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "Esc/n",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(": cancel", Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" Are you sure? ")
+                .title_alignment(Alignment::Center)
+                .border_type(BorderType::Double)
+                .style(Style::default().fg(Color::Yellow)),
+        ),
+        popup,
+    );
 }
 
 fn render_security_warning_popup(
@@ -1635,6 +1719,48 @@ mod tests {
         );
         assert!(app.logs.iter().any(|l| l.contains("Wrong data password")));
         assert!(matches!(app.outbox.as_slice(), [Command::Refresh]));
+    }
+
+    /// Test that changing a password that is already set asks first, before
+    /// anything is typed; n cancels, y opens the password field
+    #[test]
+    fn test_password_change_asks_first() {
+        let mut app = App::new();
+        handle_link_event(&mut app, up(true, true));
+        select(&mut app, SettingsSection::Basic, DATA_KEY_LABEL);
+
+        handle_settings_enter(&mut app);
+        assert_eq!(
+            app.active_popup,
+            ActivePopup::ConfirmPasswordChange(KeyKind::Data)
+        );
+
+        // typing while asked goes nowhere
+        handle_confirm_change_input(&mut app, KeyCode::Char('x'));
+        assert!(app.input_buf.is_empty());
+
+        handle_confirm_change_input(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.active_popup, ActivePopup::None);
+        assert!(app.outbox.is_empty());
+
+        handle_settings_enter(&mut app);
+        handle_confirm_change_input(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.active_popup, ActivePopup::EditSetting);
+    }
+
+    /// Test that first-time setup and unlocking don't ask
+    #[test]
+    fn test_setup_and_unlock_dont_ask() {
+        let mut app = App::new();
+        select(&mut app, SettingsSection::Basic, AUTH_KEY_LABEL);
+        handle_settings_enter(&mut app);
+        assert_eq!(app.active_popup, ActivePopup::EditSetting);
+
+        let mut app = App::new();
+        handle_link_event(&mut app, up_locked(true, false));
+        select(&mut app, SettingsSection::Basic, DATA_KEY_LABEL);
+        handle_settings_enter(&mut app);
+        assert_eq!(app.active_popup, ActivePopup::EditSetting);
     }
 
     /// Test that ordinary text settings are still trimmed and stored
