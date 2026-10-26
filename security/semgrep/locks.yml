@@ -1,0 +1,260 @@
+# Lock / guard / race rules for CesaConn (tokio::sync::RwLock & friends).
+# severity ERROR   = critical -> fails CI / blocks push
+# severity WARNING = reported, does not block
+#
+# Background: tokio's RwLock is fair and write-preferring and is NOT
+# re-entrant. A task that holds a guard and asks for the same lock again
+# (read->write, write->read, write->write, and even read->read when a writer
+# is queued) deadlocks forever.
+
+rules:
+  # ------------------------------------------------------------ critical
+  - id: cesa.lock.reacquire-same-lock
+    severity: ERROR
+    languages: [rust]
+    message: >-
+      `$L` is locked again while guard `$G` from `$L.$M1()` is still alive.
+      tokio RwLock is not re-entrant: this deadlocks (read->read too, once a
+      writer is queued). Drop `$G` first or reuse it.
+    patterns:
+      - pattern-either:
+          - pattern-inside: |
+              let $G = $L.$M1().await;
+              ...
+          - pattern-inside: |
+              let mut $G = $L.$M1().await;
+              ...
+          - pattern-inside: |
+              let $G = $L.$M1();
+              ...
+          - pattern-inside: |
+              let mut $G = $L.$M1();
+              ...
+      - metavariable-regex:
+          metavariable: $M1
+          regex: ^(read|write|lock|read_owned|write_owned|lock_owned|blocking_read|blocking_write|blocking_lock)$
+      - pattern-either:
+          - pattern: $L.$M2().await
+          - pattern: $L.$M2()
+      - metavariable-regex:
+          metavariable: $M2
+          regex: ^(read|write|lock|read_owned|write_owned|lock_owned|blocking_read|blocking_write|blocking_lock|try_read|try_write|try_lock)$
+      - pattern-not-inside: |
+          let $G = $L.$M1().await;
+      - pattern-not-inside: |
+          let mut $G = $L.$M1().await;
+      - pattern-not-inside: |
+          let $G = $L.$M1();
+      - pattern-not-inside: |
+          let mut $G = $L.$M1();
+      - pattern-not-inside: |
+          drop($G);
+          ...
+      - pattern-not-inside: |
+          std::mem::drop($G);
+          ...
+    metadata:
+      category: locks
+
+  - id: cesa.lock.blocking-lock-in-async
+    severity: ERROR
+    languages: [rust]
+    message: >-
+      `$L.$M()` inside an async context blocks the executor thread and panics
+      when called from within a tokio runtime. Use `.$M` -> `.read().await` /
+      `.write().await` / `.lock().await`.
+    patterns:
+      - pattern-either:
+          - pattern-inside: "async fn $F(...) { ... }"
+          - pattern-inside: "async fn $F(...) -> $R { ... }"
+          - pattern-inside: "async move { ... }"
+          - pattern-inside: "async { ... }"
+      - pattern: $L.$M()
+      - metavariable-regex:
+          metavariable: $M
+          regex: ^(blocking_read|blocking_write|blocking_lock)$
+    metadata:
+      category: locks
+
+  - id: cesa.lock.std-lock-in-async
+    severity: ERROR
+    languages: [rust]
+    message: >-
+      `std::sync::Mutex/RwLock` used in async code: a guard held across `.await` blocks the
+      worker thread and can deadlock the runtime; poisoning turns panics into
+      cascading failures. Use the `tokio::sync` equivalent (or keep the critical section
+      synchronous and tiny, and justify it with `// nosemgrep`).
+    pattern-regex: 'std::sync::(?:\{[^}]*\b(?:Mutex|RwLock)\b|(?:Mutex|RwLock)\b)'
+    paths:
+      include:
+        - "cesa_conn_networker/**"
+    metadata:
+      category: locks
+
+  # ------------------------------------------------------------ report
+  - id: cesa.lock.guard-held-across-await
+    severity: WARNING
+    languages: [rust]
+    message: >-
+      Guard `$G` (from `$L.$M()`) is held across this `.await`. Every other
+      task touching `$L` stalls until it completes - with network I/O this is a
+      remote-triggerable DoS and a deadlock risk. Copy what you need, `drop($G)`
+      before awaiting, or scope the guard in its own block.
+    patterns:
+      - pattern-not-inside: |
+          mod tests { ... }
+      - pattern-either:
+          - pattern-inside: |
+              let $G = $L.$M().await;
+              ...
+          - pattern-inside: |
+              let mut $G = $L.$M().await;
+              ...
+      - metavariable-regex:
+          metavariable: $M
+          regex: ^(read|write|lock|read_owned|write_owned|lock_owned)$
+      - pattern: $E.await
+      - pattern-not: $L.$M().await
+      - pattern-not-inside: |
+          drop($G);
+          ...
+      - pattern-not-inside: |
+          let $G = $L.$M().await;
+      - pattern-not-inside: |
+          let mut $G = $L.$M().await;
+    metadata:
+      category: locks
+
+  - id: cesa.lock.nested-different-locks
+    severity: WARNING
+    languages: [rust]
+    message: >-
+      Lock `$B` is acquired while still holding guard `$G` on `$A`. Make sure
+      every code path takes these locks in the SAME order (document it), or a
+      second task taking `$B` then `$A` deadlocks with this one.
+    patterns:
+      - pattern-not-inside: |
+          mod tests { ... }
+      - pattern-either:
+          - pattern-inside: |
+              let $G = $A.$M1().await;
+              ...
+          - pattern-inside: |
+              let mut $G = $A.$M1().await;
+              ...
+      - metavariable-regex:
+          metavariable: $M1
+          regex: ^(read|write|lock|read_owned|write_owned|lock_owned)$
+      - pattern: $B.$M2().await
+      - metavariable-regex:
+          metavariable: $M2
+          regex: ^(read|write|lock|read_owned|write_owned|lock_owned)$
+      - metavariable-comparison:
+          comparison: str($A) != str($B)
+      - pattern-not-inside: |
+          drop($G);
+          ...
+    metadata:
+      category: locks
+
+  - id: cesa.lock.guard-in-scrutinee
+    severity: WARNING
+    languages: [rust]
+    message: >-
+      A lock guard created in a `match` / `if let` / `while let` / `for`
+      header lives until the END of the whole block, not just the
+      expression. Bind the needed value first (e.g. `let v = lock.read().await.clone();`).
+    patterns:
+      - pattern-not-inside: |
+          mod tests { ... }
+      - pattern-either:
+          - pattern: "match $S {}"
+          - pattern: "if let $P = $S { ... }"
+          - pattern: "while let $P = $S { ... }"
+          - pattern: "for $P in $S { ... }"
+      - metavariable-pattern:
+          metavariable: $S
+          patterns:
+            - pattern: $L.$M().await
+            - metavariable-regex:
+                metavariable: $M
+                regex: ^(read|write|lock)$
+    metadata:
+      category: locks
+
+  - id: cesa.race.check-then-act
+    severity: WARNING
+    languages: [rust]
+    message: >-
+      Check-then-act / lost-update race: `$L` is read under one guard and then
+      written under a SEPARATE guard. Another task can change `$L` in between
+      (duplicates, overwritten updates, revoked peer re-added). Do the read and
+      the write under a single `$L.write().await` guard.
+    patterns:
+      - pattern-not-inside: |
+          mod tests { ... }
+      - pattern-either:
+          - pattern: |
+              if <... $L.read().await ...> { ... <... $L.write().await ...>; ... }
+          - pattern: |
+              if <... $L.read().await ...> { ... } else { ... <... $L.write().await ...>; ... }
+          - pattern: |
+              let $X = <... $L.read().await ...>;
+              ...
+              <... $L.write().await ...>;
+    metadata:
+      category: races
+
+  - id: cesa.lock.try-lock-unwrap
+    severity: WARNING
+    languages: [rust]
+    message: >-
+      `$L.$M().unwrap()` panics whenever the lock is contended. Handle the
+      error or await the lock.
+    patterns:
+      - pattern-either:
+          - pattern: $L.$M().unwrap()
+          - pattern: $L.$M().expect(...)
+      - metavariable-regex:
+          metavariable: $M
+          regex: ^(try_read|try_write|try_lock)$
+    metadata:
+      category: locks
+
+  # ------------------------------------------------------------ races
+  - id: cesa.race.static-mut
+    severity: ERROR
+    languages: [rust]
+    message: "`static mut` is a data race waiting to happen. Use an atomic, OnceLock, or a lock."
+    pattern-either:
+      - pattern: "static mut $X: $T = $E;"
+      - pattern: "pub static mut $X: $T = $E;"
+    metadata:
+      category: races
+
+  - id: cesa.race.unsafe-send-sync
+    severity: ERROR
+    languages: [rust]
+    message: >-
+      Manual `unsafe impl $TR` disables the compiler's data-race checking for
+      `$T`. Requires a written safety proof and review.
+    pattern-either:
+      - pattern: "unsafe impl Send for $T {}"
+      - pattern: "unsafe impl Sync for $T {}"
+      - pattern: "unsafe impl<$...G> Send for $T {}"
+      - pattern: "unsafe impl<$...G> Sync for $T {}"
+    metadata:
+      category: races
+
+  - id: cesa.race.relaxed-atomic
+    severity: WARNING
+    languages: [rust]
+    message: >-
+      `Ordering::Relaxed` gives no happens-before. Fine for pure counters, wrong
+      for flags that publish data (shutdown, "key ready", etc.). Use
+      Acquire/Release or SeqCst unless you can justify Relaxed.
+    pattern-either:
+      - pattern: Ordering::Relaxed
+      - pattern: std::sync::atomic::Ordering::Relaxed
+    metadata:
+      category: races

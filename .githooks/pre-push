@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# CesaConn pre-push security gate.
+# Checks EXACTLY the commits being pushed (in a temporary worktree, so your
+# uncommitted changes don't influence the result) and refuses the push on any
+# CRITICAL finding. Warnings are printed but don't block.
+#
+# Install:  security/install-hooks.sh
+# Bypass (emergency only):  git push --no-verify
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+ZERO="0000000000000000000000000000000000000000"
+remote="${1:-origin}"
+status=0
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -z "${local_sha:-}" ] && continue
+  [ "$local_sha" = "$ZERO" ] && continue # branch deletion
+
+  if [ "$remote_sha" = "$ZERO" ]; then
+    range="$local_sha --not --remotes=$remote"
+  else
+    range="$remote_sha..$local_sha"
+  fi
+
+  echo "[pre-push] security gate for $local_ref -> $remote_ref ($(git rev-parse --short "$local_sha"))"
+  wt="$(mktemp -d "${TMPDIR:-/tmp}/cesaconn-prepush.XXXXXX")"
+  git worktree add --quiet --detach "$wt" "$local_sha"
+  set +e
+  ( cd "$wt" && CARGO_TARGET_DIR="$ROOT/target/prepush" \
+      python3 security/run.py --fast --range "$range" </dev/null )
+  rc=$?
+  set -e
+  mkdir -p "$ROOT/target/security"
+  cp "$wt/target/security/report.md" "$ROOT/target/security/prepush-report.md" 2>/dev/null || true
+  git worktree remove --force "$wt"
+  if [ $rc -ne 0 ]; then
+    status=1
+    echo "[pre-push] BLOCKED: critical security findings in $local_ref (report: target/security/prepush-report.md)"
+  fi
+done
+
+exit $status

@@ -1,0 +1,8 @@
+# gitleaks config: default ruleset + ignore lockfile checksums
+# (Cargo.lock "checksum = ..." lines look like generic API keys).
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Cargo.lock package checksums"
+paths = ['''(^|/)Cargo\.lock$''']

@@ -1,0 +1,203 @@
+# Secret-handling rules for CesaConn.
+# severity ERROR   = critical -> fails CI / blocks push
+# severity WARNING = reported, does not block
+#
+# "Secret-like" names: key, secret, psk, seed, password/pswd/pwd, shared
+# secret (ss), private, token. Public keys / verification keys are excluded.
+
+rules:
+  - id: cesa.zeroize.raw-secret-buffer
+    severity: ERROR
+    languages: [rust]
+    message: >-
+      `$X` looks like secret material but lives in a plain `[u8; N]` / `Vec<u8>`.
+      It will NOT be wiped when it goes out of scope. Wrap it:
+      `let $X = Zeroizing::new(...)`.
+    patterns:
+      - pattern-either:
+          - pattern: "let $X: [u8; $N] = $E;"
+          - pattern: "let mut $X: [u8; $N] = $E;"
+          - pattern: "let $X: Vec<u8> = $E;"
+          - pattern: "let mut $X: Vec<u8> = $E;"
+          - pattern: "let $X = [$V; $N];"
+          - pattern: "let mut $X = [$V; $N];"
+          - pattern: "let $X = vec![...];"
+          - pattern: "let mut $X = vec![...];"
+          - pattern: "let $X = Vec::new();"
+          - pattern: "let mut $X = Vec::new();"
+          - pattern: "let $X = Vec::with_capacity($C);"
+          - pattern: "let mut $X = Vec::with_capacity($C);"
+          - pattern: "let $X = *$E;"
+          - pattern: "let mut $X = *$E;"
+      - metavariable-regex:
+          metavariable: $X
+          regex: '(?is)^(?!.*(pub|public|verif|vk_|_vk|len|size|idx|index|count|tag|id$|name)).*(key|secret|psk|seed|passw|pswd|pwd|shared|^ss$|^ss_|_ss$|_ss_|priv|token)'
+      - pattern-not-inside: |
+          mod tests { ... }
+    metadata:
+      category: zeroize
+
+  - id: cesa.zeroize.copy-out-of-zeroizing
+    severity: ERROR
+    languages: [rust]
+    message: >-
+      Dereferencing a key out of a lock/`Zeroizing` copies the raw bytes into an
+      un-wiped temporary. Borrow it (`&*guard.field`) or keep it in `Zeroizing`.
+    patterns:
+      - pattern-either:
+          - pattern: "*$L.read().await.$F"
+          - pattern: "*$L.write().await.$F"
+          - pattern: "*$G.$F"
+      - metavariable-regex:
+          metavariable: $F
+          regex: '(?is)^(?!.*(pub|public|verif)).*(key|secret|psk|seed|passw|pswd|shared|priv)'
+      - pattern-not-inside: "Zeroizing::new(...)"
+      - pattern-not-inside: "&*$X"
+      - pattern-not-inside: "*$DST = *$SRC;"
+      - pattern-not-inside: |
+          mod tests { ... }
+    metadata:
+      category: zeroize
+
+  - id: cesa.zeroize.secret-to-vec
+    severity: WARNING
+    languages: [rust]
+    message: >-
+      `.to_vec()` / `.to_owned()` on secret `$X` creates a new heap copy that is
+      not zeroized. Use `Zeroizing::new($X.to_vec())`.
+    patterns:
+      - pattern-either:
+          - pattern: "$X.to_vec()"
+          - pattern: "$X.to_owned()"
+          - pattern: "$Y.$X.to_vec()"
+          - pattern: "$Y.$X.to_owned()"
+      - metavariable-regex:
+          metavariable: $X
+          regex: '(?is)^(?!.*(pub|public|verif)).*(key|secret|psk|seed|passw|pswd|shared|^ss$|_ss$|priv)'
+      - metavariable-regex:
+          metavariable: $X
+          regex: '^[\w.\s]+$'
+      - pattern-not-inside: "Zeroizing::new(...)"
+      - pattern-not-inside: "let $Z: Zeroizing<$T> = ...;"
+    metadata:
+      category: zeroize
+
+  - id: cesa.zeroize.secret-in-log
+    severity: ERROR
+    languages: [rust]
+    message: >-
+      Secret-looking value passed to a print/log/format macro. Never log key
+      material, even at debug/trace level.
+    patterns:
+      - pattern-not-inside: |
+          mod tests { ... }
+      - pattern-either:
+          - pattern-regex: '\b(?:println|eprintln|print|eprint|format|write|writeln|panic|dbg|trace|debug|info|warn|error|event|assert|assert_eq|assert_ne)!\s*\((?:[^;"]|"(?:[^"\\]|\\.)*")*?,\s*&?\*?\s*(?![\w.]*(?:pub|public|verif|len))[\w.]*(?:key|secret|psk|seed|passw|pswd|shared_secret|priv)[\w.]*\s*(?:[,)]|\.(?:as_ref|as_slice|deref)\(\))'
+          - pattern-regex: '\b(?:println|eprintln|print|eprint|format|write|writeln|panic|dbg|trace|debug|info|warn|error|event|assert|assert_eq|assert_ne)!\s*\((?:[^;"]|"(?:[^"\\]|\\.)*")*?"(?:[^"\\{]|\\.|\{\{)*?\{(?![\w.]*(?:pub|public|verif|len))[\w.]*(?:key|secret|psk|seed|passw|pswd|shared_secret|priv)[\w.]*(?::[^}]*)?\}'
+    paths:
+      exclude:
+        - "**/tests/**"
+    metadata:
+      category: zeroize
+
+  - id: cesa.zeroize.debug-derive-on-secret
+    severity: WARNING
+    languages: [rust]
+    message: >-
+      `$S` derives Debug and holds secret material: `{:?}` would print the key
+      bytes (Zeroizing<T> forwards Debug). Implement Debug manually and redact.
+    patterns:
+      - pattern-either:
+          - pattern: |
+              #[derive(..., Debug, ...)]
+              struct $S { ..., $F: Zeroizing<$T>, ... }
+          - pattern: |
+              #[derive(..., Debug, ...)]
+              pub struct $S { ..., $F: Zeroizing<$T>, ... }
+          - pattern: |
+              #[derive(..., Debug, ...)]
+              pub struct $S { ..., pub $F: Zeroizing<$T>, ... }
+          - pattern: |
+              #[derive(..., Debug, ...)]
+              struct $S { ..., pub $F: Zeroizing<$T>, ... }
+    metadata:
+      category: zeroize
+
+  - id: cesa.zeroize.secret-struct-field-plain
+    severity: ERROR
+    languages: [rust]
+    message: >-
+      Struct field `$F` looks like secret material but is a plain byte buffer.
+      Use `Zeroizing<...>` or derive `ZeroizeOnDrop` on the struct.
+    patterns:
+      - pattern-either:
+          - pattern: "struct $S { ..., $F: [u8; $N], ... }"
+          - pattern: "struct $S { ..., pub $F: [u8; $N], ... }"
+          - pattern: "struct $S { ..., $F: Vec<u8>, ... }"
+          - pattern: "struct $S { ..., pub $F: Vec<u8>, ... }"
+          - pattern: "pub struct $S { ..., $F: [u8; $N], ... }"
+          - pattern: "pub struct $S { ..., pub $F: [u8; $N], ... }"
+          - pattern: "pub struct $S { ..., $F: Vec<u8>, ... }"
+          - pattern: "pub struct $S { ..., pub $F: Vec<u8>, ... }"
+      - metavariable-regex:
+          metavariable: $F
+          regex: '(?is)^(?!.*(pub|public|verif|len|size|tag|id$|name)).*(key|secret|psk|seed|passw|pswd|shared|^ss$|_ss$|priv|token)'
+      - focus-metavariable: $F
+      - pattern-not-inside: |
+          #[derive(..., ZeroizeOnDrop, ...)]
+          struct $S2 { ... }
+      - pattern-not-inside: |
+          #[derive(..., ZeroizeOnDrop, ...)]
+          pub struct $S2 { ... }
+    metadata:
+      category: zeroize
+
+  - id: cesa.zeroize.mem-forget
+    severity: ERROR
+    languages: [rust]
+    message: >-
+      `mem::forget` / `Box::leak` skip Drop, so Zeroizing/ZeroizeOnDrop never wipe
+      the memory. Not allowed in this codebase.
+    pattern-either:
+      - pattern: std::mem::forget(...)
+      - pattern: mem::forget(...)
+      - pattern: core::mem::forget(...)
+      - pattern: Box::leak(...)
+      - pattern: Vec::leak(...)
+      - pattern: $X.leak()
+    metadata:
+      category: zeroize
+
+  - id: cesa.zeroize.manually-drop
+    severity: WARNING
+    languages: [rust]
+    message: >-
+      `ManuallyDrop` suppresses Drop; if it wraps secret material it is never
+      wiped. Verify it is zeroized explicitly.
+    pattern-either:
+      - pattern: ManuallyDrop::new(...)
+      - pattern: std::mem::ManuallyDrop::new(...)
+    metadata:
+      category: zeroize
+
+  - id: cesa.zeroize.secret-param-by-value
+    severity: WARNING
+    languages: [rust]
+    message: >-
+      Parameter `$X` takes secret bytes BY VALUE as a plain array: every call
+      leaves an un-wiped copy on the caller's and callee's stack. Take
+      `Zeroizing<[u8; N]>` or `&[u8; N]` instead.
+    patterns:
+      - pattern-either:
+          - pattern: "fn $F(..., $X: [u8; $N], ...) { ... }"
+          - pattern: "fn $F(..., $X: [u8; $N], ...) -> $R { ... }"
+          - pattern: "fn $F(..., $X: Vec<u8>, ...) { ... }"
+          - pattern: "fn $F(..., $X: Vec<u8>, ...) -> $R { ... }"
+      - metavariable-regex:
+          metavariable: $X
+          regex: '(?is)^(?!.*(pub|public|verif|len|size|tag|name)).*(key|secret|psk|seed|passw|pswd|shared|^ss$|_ss$|priv)'
+      - focus-metavariable: $X
+      - pattern-not-inside: |
+          mod tests { ... }
+    metadata:
+      category: zeroize
