@@ -19,28 +19,79 @@ GET RID OF STORING KEYS IN RAM
 
  */
 
-mod auth_old;
 mod ipc_unix;
 mod tcp_networker;
 mod udp_networker;
 mod auth_snow;
 mod spake2;
 mod hybrid_kex;
-use std::{env, net::SocketAddr, sync::Arc};
+use std::{
+    env,
+    io::{self, BufRead, Write},
+    net::SocketAddr,
+    sync::Arc,
+};
 use tracing::{error, warn};
 use tracing_subscriber::EnvFilter;
 
 use cesa_conn_crypto::pswd_manager::derive_key;
 use tokio::{net::TcpListener, sync::RwLock};
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroizing;
 
 use crate::{
-    auth_old::Keys,
-    tcp_networker::{ActionType, connect, recv},
+    auth_snow::{DeviceKeypairs, Keys},
+    tcp_networker::{ActionType, NetworkerContext, connect, recv},
     udp_networker::{
         BROADCAST_NAME, UdpNetworkerErrors, udp_broadcast_presence, udp_find_broadcaster,
     },
 };
+
+/// Asks on the terminal whether to pair with a new device.
+///
+/// Shows the first 8 bytes of the handshake hash, the user compares them with
+/// the other device before accepting (they only match without a MITM).
+fn pair_prompt(name: &String, handshake_hash: &[u8; 32]) -> bool {
+    let code: String = handshake_hash
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    print!("Pair with {name}? Check that the other device shows: {code}  [y/N] ");
+
+    if io::stdout().flush().is_err() {
+        return false;
+    }
+
+    let mut answer = String::new();
+
+    if io::stdin().lock().read_line(&mut answer).is_err() {
+        return false;
+    }
+
+    matches!(answer.trim(), "y" | "Y" | "yes")
+}
+
+/// Shared networker state for the test subcommands.
+/// TODO: load the device identity from storage instead of generating it per run.
+fn make_context(keys: Arc<RwLock<Keys>>) -> Option<NetworkerContext> {
+    let device_keypairs = match DeviceKeypairs::generate() {
+        Ok(device_keypairs) => device_keypairs,
+        Err(e) => {
+            error!(error = %e, "failed to generate device keys");
+            return None;
+        }
+    };
+
+    Some(NetworkerContext {
+        keys,
+        device_keypairs: Arc::new(device_keypairs),
+        trusted_peers: Arc::new(RwLock::new(Vec::new())),
+        pair_fallback: pair_prompt,
+    })
+}
 
 #[tokio::main]
 async fn main() {
@@ -87,7 +138,6 @@ async fn main() {
                 // authenticated before any data is processed.
                 // nosemgrep: cesa.net.bind-all-interfaces
                 let listener = TcpListener::bind("0.0.0.0:3232").await.unwrap();
-                let trusted_addrs: Arc<RwLock<Vec<SocketAddr>>> = Arc::new(RwLock::new(Vec::new()));
                 let cancellation_token = CancellationToken::new();
                 let keys_clone = keys.clone();
 
@@ -120,14 +170,13 @@ async fn main() {
                     }
                 });
 
-                recv(
-                    &listener,
-                    keys,
-                    trusted_addrs.clone(),
-                    cancellation_token.clone(),
-                )
-                .await
-                .unwrap();
+                let Some(context) = make_context(keys) else {
+                    return;
+                };
+
+                recv(&listener, context, cancellation_token.clone())
+                    .await
+                    .unwrap();
             }
 
             // clienttest <message> <password>
@@ -146,8 +195,6 @@ async fn main() {
 
                 let raw_key = derive_key(test_psw, salt).unwrap(); // Zeroizing: wiped on drop
                 let keys = Arc::new(RwLock::new(Keys::new(&raw_key, &raw_key)));
-
-                let trusted_addrs = Arc::new(RwLock::new(Vec::new()));
 
                 // UDP discovery: listen for a broadcaster first, then announce ourselves
                 // so the server adds us to its trusted list before we attempt TCP.
@@ -173,21 +220,21 @@ async fn main() {
                     break incoming_addr;
                 };
 
-                let write_g = trusted_addrs.write();
-                write_g.await.push(incoming_addr);
-
                 let cancellation_token = CancellationToken::new();
 
-                let message = args[2].as_bytes().to_vec();
+                let message = Zeroizing::new(args[2].as_bytes().to_vec());
 
                 // Server always listens on port 3232 — only the IP comes from UDP discovery
                 let connect_addr = SocketAddr::new(incoming_addr.ip(), 3232);
 
                 let action_type = ActionType::Debug;
 
+                let Some(context) = make_context(keys) else {
+                    return;
+                };
+
                 connect(
-                    keys,
-                    trusted_addrs,
+                    context,
                     cancellation_token,
                     connect_addr,
                     action_type,
@@ -196,8 +243,9 @@ async fn main() {
                 .await
                 .unwrap();
 
-                // Keep the process alive long enough for the spawned connect_handler task to finish
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                // keep the process alive long enough for the spawned connect_handler
+                // task to finish, including a first-time pairing prompt
+                tokio::time::sleep(tokio::time::Duration::from_secs(70)).await;
             }
             unknown => {
                 error!(

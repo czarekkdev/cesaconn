@@ -29,8 +29,8 @@
 /// could lead to security vulnerabilities.
 const TRUSTED_PROCESSES: &[&str] = &["cesa_conn_tui", "cesa_conn_gui"];
 
-use crate::auth_old::Keys;
-use crate::auth_old::Salts;
+use crate::auth_snow::Keys;
+use crate::auth_snow::Salts;
 use std::fmt;
 use std::net::IpAddr;
 use std::os::unix::net::UnixStream;
@@ -1380,7 +1380,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_ipc_action_default_is_noop() {
-        use crate::auth_old::{Keys, Salts};
+        use crate::auth_snow::{Keys, Salts};
         use std::os::unix::net::UnixStream as StdUnixStream;
         let (mut client, _server) = StdUnixStream::pair().unwrap();
         let keys = Arc::new(RwLock::new(Keys::new(&[0u8; 32], &[0u8; 32])));
@@ -1393,7 +1393,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_ipc_action_add_trusted_device_is_noop() {
-        use crate::auth_old::{Keys, Salts};
+        use crate::auth_snow::{Keys, Salts};
         use std::os::unix::net::UnixStream as StdUnixStream;
         let (mut client, _server) = StdUnixStream::pair().unwrap();
         let keys = Arc::new(RwLock::new(Keys::new(&[0u8; 32], &[0u8; 32])));
@@ -1408,7 +1408,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_ipc_action_update_auth_password_is_noop() {
-        use crate::auth_old::{Keys, Salts};
+        use crate::auth_snow::{Keys, Salts};
         use std::os::unix::net::UnixStream as StdUnixStream;
         let (mut client, _server) = StdUnixStream::pair().unwrap();
         let keys = Arc::new(RwLock::new(Keys::new(&[0u8; 32], &[0u8; 32])));
@@ -1423,7 +1423,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_ipc_action_update_data_password_is_noop() {
-        use crate::auth_old::{Keys, Salts};
+        use crate::auth_snow::{Keys, Salts};
         use std::os::unix::net::UnixStream as StdUnixStream;
         let (mut client, _server) = StdUnixStream::pair().unwrap();
         let keys = Arc::new(RwLock::new(Keys::new(&[0u8; 32], &[0u8; 32])));
