@@ -1,0 +1,68 @@
+# cargo-deny policy (used by security/run.py)
+# sources  -> critical: only crates.io, no unknown registries / git deps
+# licenses -> report:   everything must be compatible with AGPL-3.0 + commercial
+# bans     -> report:   duplicate versions / wildcard deps
+
+[graph]
+all-features = true
+
+[advisories]
+# RustSec advisories are handled by cargo-audit; keep these as extra signal.
+version = 2
+yanked = "warn"
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "CC0-1.0",
+    "Unlicense",
+    "BSL-1.0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CDLA-Permissive-2.0",
+    "AGPL-3.0-only",
+    "AGPL-3.0-or-later",
+]
+unused-allowed-license = "allow"
+
+# Workspace crates inherit the repository LICENSE (AGPL-3.0).
+[[licenses.clarify]]
+crate = "cesa_conn_crypto"
+expression = "AGPL-3.0-only"
+license-files = []
+
+[[licenses.clarify]]
+crate = "cesa_conn_networker"
+expression = "AGPL-3.0-only"
+license-files = []
+
+[[licenses.clarify]]
+crate = "cesa_conn_system"
+expression = "AGPL-3.0-only"
+license-files = []
+
+[[licenses.clarify]]
+crate = "cesa_conn_tui"
+expression = "AGPL-3.0-only"
+license-files = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

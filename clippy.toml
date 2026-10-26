@@ -1,0 +1,17 @@
+# Clippy config used by security/run.py (and by your editor).
+# Flags any tokio lock guard that is kept alive across an `.await`
+# (lint: clippy::await_holding_invalid_type).
+await-holding-invalid-types = [
+    { path = "tokio::sync::RwLockReadGuard", reason = "tokio RwLock read guard held across .await: stalls writers / DoS / deadlock risk" },
+    { path = "tokio::sync::RwLockWriteGuard", reason = "tokio RwLock write guard held across .await: stalls every task using this lock" },
+    { path = "tokio::sync::MutexGuard", reason = "tokio Mutex guard held across .await: stalls every task using this lock" },
+    { path = "tokio::sync::OwnedRwLockReadGuard", reason = "owned tokio read guard held across .await" },
+    { path = "tokio::sync::OwnedRwLockWriteGuard", reason = "owned tokio write guard held across .await" },
+    { path = "tokio::sync::OwnedMutexGuard", reason = "owned tokio Mutex guard held across .await" },
+]
+
+# Panicking helpers are fine inside #[test] code; flagged everywhere else.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
