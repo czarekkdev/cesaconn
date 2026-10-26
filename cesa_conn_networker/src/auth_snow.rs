@@ -608,78 +608,9 @@ pub struct Keys {
 }
 
 impl Keys {
-    /// Splits a packed 64-byte buffer into the two keys (`a_key` = bytes 0–31, `d_key` = bytes 32–63).
-    pub fn from_ref(data: &[u8; 64]) -> Self {
-        let mut a_key_bytes = Zeroizing::new([0u8; 32]);
-        let mut d_key_bytes = Zeroizing::new([0u8; 32]);
-
-        a_key_bytes.copy_from_slice(&data[..32]);
-        d_key_bytes.copy_from_slice(&data[32..]);
-
-        Self {
-            a_key: AuthKey::new(a_key_bytes),
-            d_key: DataKey::new(d_key_bytes),
-        }
-    }
-
-    /// Packs both keys into `data` (`a_key` in bytes 0–31, `d_key` in bytes 32–63). Inverse of `from_ref`.
-    pub fn to_ref(&self, data: &mut [u8; 64]) {
-        data[..32].copy_from_slice(self.a_key.expose().as_slice());
-        data[32..].copy_from_slice(self.d_key.expose().as_slice());
-    }
-
-    /// Replaces both keys with the ones from `data`.
-    pub fn update(&mut self, data: Self) {
-        self.a_key = data.a_key;
-        self.d_key = data.d_key;
-    }
-
     /// Bundles both keys; the types make it impossible to swap them.
     pub fn new(a_key: AuthKey, d_key: DataKey) -> Self {
         Self { a_key, d_key }
-    }
-}
-
-/// Holds the two 32-byte Argon2 salts used to derive `a_key` and `d_key` from
-/// their passwords. Salts are not secret, but all devices must use the same ones.
-pub struct Salts {
-    pub a_salt: Zeroizing<[u8; 32]>,
-    pub d_salt: Zeroizing<[u8; 32]>,
-}
-
-impl Salts {
-    /// Splits a packed 64-byte buffer into the two salts (`a_salt` = bytes 0–31, `d_salt` = bytes 32–63).
-    pub fn from_ref(data: &[u8; 64]) -> Self {
-        let mut a_salt_bytes = Zeroizing::new([0u8; 32]);
-        let mut d_salt_bytes = Zeroizing::new([0u8; 32]);
-
-        a_salt_bytes.copy_from_slice(&data[..32]);
-        d_salt_bytes.copy_from_slice(&data[32..]);
-
-        Self {
-            a_salt: a_salt_bytes,
-            d_salt: d_salt_bytes,
-        }
-    }
-
-    /// Packs both salts into `data` (`a_salt` in bytes 0–31, `d_salt` in bytes 32–63). Inverse of `from_ref`.
-    pub fn to_ref(&self, data: &mut [u8; 64]) {
-        data[..32].copy_from_slice(&*self.a_salt);
-        data[32..].copy_from_slice(&*self.d_salt);
-    }
-
-    /// Replaces both salts with the ones from `data`.
-    pub fn update(&mut self, data: Self) {
-        *self.a_salt = *data.a_salt;
-        *self.d_salt = *data.d_salt;
-    }
-
-    /// Wraps two raw 32-byte arrays in `Zeroizing`.
-    pub fn new(a_salt: [u8; 32], d_salt: [u8; 32]) -> Self {
-        Self {
-            a_salt: Zeroizing::new(a_salt),
-            d_salt: Zeroizing::new(d_salt),
-        }
     }
 }
 
@@ -724,6 +655,17 @@ impl TrustedPeer {
     /// Human-readable device name shown to the user.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// First 8 bytes of the Noise static public key, shown to tell devices apart.
+    pub fn fingerprint(&self) -> [u8; 8] {
+        let mut fingerprint = [0u8; 8];
+
+        for (dst, src) in fingerprint.iter_mut().zip(self.x25519_pub_key.iter()) {
+            *dst = *src;
+        }
+
+        fingerprint
     }
 }
 

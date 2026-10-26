@@ -5,3 +5,12 @@ edition = "2024"
 publish = false
 
 [dependencies]
+tokio = { version = "1.50.0", features = ["io-util", "net", "time"] }
+zeroize = "1.8.2"
+
+[target.'cfg(unix)'.dependencies]
+# geteuid() without unsafe
+nix = { version = "0.31", features = ["user"] }
+
+[dev-dependencies]
+tokio = { version = "1.50.0", features = ["io-util", "net", "time", "macros", "rt", "test-util"] }
