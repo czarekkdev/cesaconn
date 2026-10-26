@@ -8,6 +8,10 @@ publish = false
 name = "cesa_conn_networker"
 path = "src/cesa_conn_networker.rs"
 
+[features]
+# servertest / clienttest manual end-to-end commands; never in release builds
+test-commands = []
+
 [dependencies]
 btleplug = "0.11.8"
 tokio = { version = "1.50.0", features = ["full"] }
@@ -24,3 +28,7 @@ hkdf = "0.12.4"
 blake2 = "0.10.6"
 subtle = "2.6.1"
 libcrux-ml-dsa = "0.0.11"
+
+[dev-dependencies]
+# paused clock for lockout tests
+tokio = { version = "1.50.0", features = ["full", "test-util"] }

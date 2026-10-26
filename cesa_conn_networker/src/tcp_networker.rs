@@ -15,6 +15,7 @@ use crate::auth_snow::{
     AuthSnowErrors, DATA_LAYER_OVERHEAD, DeviceKeypairs, Keys, SecureConnection, Tags, TrustedPeer,
     TrustedPeers, auth_incoming, auth_outgoing,
 };
+use crate::guess_limiter::GuessLimiter;
 
 /// Identifies what kind of action/data is being sent in a packet.
 /// Encoded as a single byte at position [0] of the init header.
@@ -92,6 +93,8 @@ pub struct NetworkerContext {
     pub trusted_peers: TrustedPeers,
     /// Asks the user to confirm a new device (name, handshake hash).
     pub pair_fallback: fn(&String, &[u8; 32]) -> bool,
+    /// Counts wrong passwords per source and locks guessers out.
+    pub guess_limiter: Arc<GuessLimiter>,
 }
 
 /// One packet received from an authenticated peer.
@@ -124,6 +127,8 @@ pub enum TcpNetworkerErrors {
     DataTooLarge,
     /// The payload failed the `d_key` layer: the peer uses a different data password.
     FailedToDecryptData,
+    /// The peer is locked out after too many wrong passwords ([`GuessLimiter`]).
+    LockedOut,
 }
 
 impl fmt::Display for TcpNetworkerErrors {
@@ -140,6 +145,9 @@ impl fmt::Display for TcpNetworkerErrors {
             TcpNetworkerErrors::DataTooLarge => write!(f, "declared data packet is too large"),
             TcpNetworkerErrors::FailedToDecryptData => {
                 write!(f, "failed to decrypt data (different d_key?)")
+            }
+            TcpNetworkerErrors::LockedOut => {
+                write!(f, "peer is locked out after too many wrong passwords")
             }
         }
     }
@@ -184,6 +192,12 @@ pub async fn recv_handler(
 ) -> Result<Option<ReceivedPacket>, TcpNetworkerErrors> {
     let (stream, peer_addr) = incoming_connection;
 
+    // locked out for guessing the password: no handshake at all
+    if context.guess_limiter.is_locked(peer_addr.ip()).await {
+        warn!(%peer_addr, "peer is locked out after wrong passwords, closing");
+        return Err(TcpNetworkerErrors::LockedOut);
+    }
+
     debug!(%peer_addr, "recv_handler started, authenticating peer");
 
     let context_keys = context.keys.clone();
@@ -202,9 +216,13 @@ pub async fn recv_handler(
         TcpNetworkerErrors::FailedToAuthenticate
     })?
     else {
+        // the peer sent a wrong confirmation value: one password guess
         warn!(%peer_addr, "peer failed SPAKE2 confirmation (wrong a_key), closing");
+        context.guess_limiter.record_failure(peer_addr.ip()).await;
         return Ok(None);
     };
+
+    context.guess_limiter.record_success(peer_addr.ip()).await;
 
     debug!(%peer_addr, peer = %peer.name(), "peer authenticated, reading init header");
 
@@ -374,23 +392,48 @@ pub async fn connect_handler(
     // cloned, so the read lock is released before any network I/O
     let d_key = context.keys.read().await.d_key.clone();
 
+    // a fake server gets one password guess from our confirmation value per
+    // connection, so servers that keep failing are locked out as well
+    if context.guess_limiter.is_locked(connect_addr.ip()).await {
+        warn!(%connect_addr, "server is locked out after failed confirmations, not connecting");
+        return Err(TcpNetworkerErrors::LockedOut);
+    }
+
+    let guess_limiter = context.guess_limiter.clone();
+
     // 1. authentication
-    let Some((mut secure_connection, peer)) = auth_outgoing(
+    let authenticated = auth_outgoing(
         context.keys,
         &context.device_keypairs,
         context.trusted_peers,
         IncomingConnection::new(outgoing_connection, connect_addr),
         context.pair_fallback,
     )
-    .await
-    .map_err(|e| {
-        warn!(%connect_addr, error = %e, "authentication of outgoing connection failed");
-        TcpNetworkerErrors::FailedToAuthenticate
-    })?
-    else {
+    .await;
+
+    let authenticated = match authenticated {
+        Ok(authenticated) => authenticated,
+        Err(e) => {
+            // after we sent our confirmation value, any failure (wrong value,
+            // the server hanging up or stalling) may have been a guess against it
+            if matches!(
+                e,
+                AuthSnowErrors::FailedToConfirmMutualAuthSpake2 | AuthSnowErrors::HandshakeTimeout
+            ) {
+                guess_limiter.record_failure(connect_addr.ip()).await;
+            }
+            warn!(%connect_addr, error = %e, "authentication of outgoing connection failed");
+            return Err(TcpNetworkerErrors::FailedToAuthenticate);
+        }
+    };
+
+    let Some((mut secure_connection, peer)) = authenticated else {
         warn!(%connect_addr, "server failed SPAKE2 confirmation (wrong a_key), closing");
+        guess_limiter.record_failure(connect_addr.ip()).await;
         return Err(TcpNetworkerErrors::FailedToAuthenticate);
     };
+
+    guess_limiter.record_success(connect_addr.ip()).await;
 
     debug!(%connect_addr, peer = %peer.name(), "peer authenticated, sending init header");
 
@@ -487,6 +530,7 @@ pub async fn connect(
 }
 
 #[cfg(test)]
+#[allow(clippy::large_futures)] // full handshakes in tests, stack size doesn't matter
 mod tests {
     use super::*;
     use crate::auth_snow::{AuthKey, DataKey};
@@ -526,6 +570,7 @@ mod tests {
             device_keypairs: Arc::new(DeviceKeypairs::generate().unwrap()),
             trusted_peers: Arc::new(RwLock::new(Vec::new())),
             pair_fallback,
+            guess_limiter: Arc::new(GuessLimiter::new()),
         }
     }
 
@@ -592,6 +637,7 @@ mod tests {
             TcpNetworkerErrors::FailedToWriteToStream,
             TcpNetworkerErrors::DataTooLarge,
             TcpNetworkerErrors::FailedToDecryptData,
+            TcpNetworkerErrors::LockedOut,
         ];
 
         for e in errors {
@@ -785,6 +831,63 @@ mod tests {
 
         token.cancel();
         assert!(server.await.unwrap().is_ok());
+    }
+
+    /// Test that a client guessing wrong passwords is locked out after MAX_FAILURES
+    #[tokio::test]
+    async fn test_wrong_passwords_lock_out_the_source() {
+        use crate::guess_limiter::MAX_FAILURES;
+
+        let server = make_context(TEST_A_KEY, accept_all);
+
+        for _ in 0..MAX_FAILURES {
+            let (server_result, _) = exchange(
+                server.clone(),
+                make_context([0x11; 32], accept_all),
+                ActionType::Debug,
+                b"guess",
+            )
+            .await;
+            assert!(server_result.unwrap().is_none());
+        }
+
+        // even the right password is refused now, before any handshake
+        let (server_result, client_result) = exchange(
+            server.clone(),
+            make_context(TEST_A_KEY, accept_all),
+            ActionType::Debug,
+            b"hi",
+        )
+        .await;
+
+        assert_eq!(server_result.err(), Some(TcpNetworkerErrors::LockedOut));
+        assert!(client_result.is_err());
+    }
+
+    /// Test that a server failing our confirmation is locked out on the client too
+    #[tokio::test]
+    async fn test_client_locks_out_failing_server() {
+        use crate::guess_limiter::MAX_FAILURES;
+
+        let client = make_context([0x11; 32], accept_all);
+
+        for _ in 0..MAX_FAILURES {
+            let (_, client_result) = exchange(
+                make_context(TEST_A_KEY, accept_all),
+                client.clone(),
+                ActionType::Debug,
+                b"x",
+            )
+            .await;
+            assert!(client_result.is_err());
+        }
+
+        assert!(
+            client
+                .guess_limiter
+                .is_locked("127.0.0.1".parse().unwrap())
+                .await
+        );
     }
 
     /// Test that cancelling before connect() returns Ok(()) without connecting

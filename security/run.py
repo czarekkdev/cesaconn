@@ -185,7 +185,9 @@ def check_clippy() -> ToolResult:
         flags += ["-D", l]
     broken = []
     for crate in CRATES:
-        code, out, err = run(["cargo", "clippy", "-p", crate, "--all-targets", "--message-format=json",
+        # --all-features: feature-gated code (e.g. test-commands) must be analysed too
+        code, out, err = run(["cargo", "clippy", "-p", crate, "--all-targets", "--all-features",
+                              "--message-format=json",
                               "--", *flags], timeout=1800)
         build_errors = 0
         seen = set()
@@ -367,7 +369,7 @@ def check_tsan() -> ToolResult:
     broken = []
     for crate in CRATES:
         code, out, err = run(["cargo", "+nightly", "test", "-Zbuild-std", "--target", target, "-p", crate,
-                              "--all-targets"], env=env,
+                              "--all-targets", "--all-features"], env=env,
                              timeout=int(os.environ.get("CESA_TSAN_TIMEOUT", "1800")))
         text = out + err
         if code != 0 and not PASSED_RE.search(text):
