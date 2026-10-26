@@ -1,7 +1,6 @@
 /*
 TODO:
 add tests
-add chunking to SecureConnection read/write
 persist DeviceKeypairs (private keys encrypted / in the OS keychain)
 sync the trusted peer list between devices, allow revoking one device
 add encrypting/decrypting data with aes256 in SecureConnection with d_key
@@ -389,6 +388,55 @@ impl SecureConnection {
             .await
             .map_err(|_| AuthSnowErrors::ReadTimeout)?
             .map_err(|_| AuthSnowErrors::FailedToReadFromSecureConnection)
+    }
+
+    /// Sends `data` of any length as a series of messages, each carrying at
+    /// most [`SECURE_MSG_MAX_PAYLOAD`] bytes and tagged with `tag`.
+    ///
+    /// The length is NOT sent: the receiver must already know it (e.g. from a
+    /// header) and call [`Self::read_chunked`] with the same length. Noise
+    /// nonces make the chunks impossible to reorder, drop or replay unnoticed.
+    /// Every chunk is bounded by [`TIMEOUT`].
+    pub async fn write_chunked(&mut self, data: &[u8], tag: Tags) -> Result<(), AuthSnowErrors> {
+        // one reusable buffer, +1 for the tag byte write() appends
+        let mut chunk_buf = Zeroizing::new(Vec::with_capacity(SECURE_MSG_MAX_PAYLOAD + 1));
+
+        for chunk in data.chunks(SECURE_MSG_MAX_PAYLOAD) {
+            chunk_buf.clear();
+            chunk_buf.extend_from_slice(chunk);
+
+            self.write_timeout(&mut chunk_buf, tag).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Receives exactly `len` bytes sent with [`Self::write_chunked`].
+    ///
+    /// `len` comes from the peer in the end, so the CALLER must bound it before
+    /// calling this; the buffer is allocated once with that capacity.
+    /// Every chunk is bounded by [`TIMEOUT`].
+    pub async fn read_chunked(
+        &mut self,
+        len: usize,
+        tag: Tags,
+    ) -> Result<Zeroizing<Vec<u8>>, AuthSnowErrors> {
+        let mut data = Zeroizing::new(Vec::with_capacity(len));
+        // +1 for the tag byte read() removes
+        let mut chunk_buf = Zeroizing::new(Vec::with_capacity(SECURE_MSG_MAX_PAYLOAD + 1));
+
+        while data.len() < len {
+            let chunk_len = len.saturating_sub(data.len()).min(SECURE_MSG_MAX_PAYLOAD);
+
+            chunk_buf.clear();
+            chunk_buf.resize(chunk_len.saturating_add(1), 0);
+
+            self.read_timeout(&mut chunk_buf, tag).await?;
+
+            data.extend_from_slice(&chunk_buf);
+        }
+
+        Ok(data)
     }
 }
 
@@ -1636,6 +1684,77 @@ mod tests {
             server_conn.read(&mut buf, Tags::Regular).await.err(),
             Some(AuthSnowErrors::WrongTag)
         );
+    }
+
+    /// Test that payloads of every size around the chunk boundary arrive intact
+    #[tokio::test]
+    async fn test_chunked_roundtrip_sizes() {
+        let server = Device::new(TEST_A_KEY);
+        let client = Device::new(TEST_A_KEY);
+
+        let (s, c) = handshake(&server, &client, accept_all, accept_all).await;
+        let (mut server_conn, _) = s.unwrap().unwrap();
+        let (mut client_conn, _) = c.unwrap().unwrap();
+
+        for len in [
+            0,
+            1,
+            SECURE_MSG_MAX_PAYLOAD - 1,
+            SECURE_MSG_MAX_PAYLOAD,
+            SECURE_MSG_MAX_PAYLOAD + 1,
+            3 * SECURE_MSG_MAX_PAYLOAD + 7,
+        ] {
+            let data: Vec<u8> = (0..=250u8).cycle().take(len).collect();
+
+            let send = client_conn.write_chunked(&data, Tags::Regular);
+            let recv = server_conn.read_chunked(len, Tags::Regular);
+            let (sent, received) = tokio::join!(send, recv);
+
+            sent.unwrap();
+            assert_eq!(received.unwrap().as_slice(), data.as_slice(), "len {len}");
+        }
+    }
+
+    /// Test that a chunk with the wrong tag stops the transfer
+    #[tokio::test]
+    async fn test_chunked_wrong_tag_rejected() {
+        let server = Device::new(TEST_A_KEY);
+        let client = Device::new(TEST_A_KEY);
+
+        let (s, c) = handshake(&server, &client, accept_all, accept_all).await;
+        let (mut server_conn, _) = s.unwrap().unwrap();
+        let (mut client_conn, _) = c.unwrap().unwrap();
+
+        let data = vec![1u8; SECURE_MSG_MAX_PAYLOAD + 10];
+
+        let send = client_conn.write_chunked(&data, Tags::IsSavedTag);
+        let recv = server_conn.read_chunked(data.len(), Tags::Regular);
+        let (_, received) = tokio::join!(send, recv);
+
+        assert_eq!(
+            received.err(),
+            Some(AuthSnowErrors::FailedToReadFromSecureConnection)
+        );
+    }
+
+    /// Test that a sender stopping early makes read_chunked fail instead of hang
+    #[tokio::test]
+    async fn test_chunked_truncated_transfer_fails() {
+        let server = Device::new(TEST_A_KEY);
+        let client = Device::new(TEST_A_KEY);
+
+        let (s, c) = handshake(&server, &client, accept_all, accept_all).await;
+        let (mut server_conn, _) = s.unwrap().unwrap();
+        let (mut client_conn, _) = c.unwrap().unwrap();
+
+        // announce more than we send, then hang up
+        client_conn
+            .write_chunked(&[7u8; 100], Tags::Regular)
+            .await
+            .unwrap();
+        drop(client_conn);
+
+        assert!(server_conn.read_chunked(200, Tags::Regular).await.is_err());
     }
 
     /// Test that both roles derive the same PSK from the same inputs

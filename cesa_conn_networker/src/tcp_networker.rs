@@ -12,8 +12,8 @@ use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
 
 use crate::auth_snow::{
-    DeviceKeypairs, Keys, SECURE_MSG_MAX_PAYLOAD, SecureConnection, Tags, TrustedPeer,
-    TrustedPeers, auth_incoming, auth_outgoing,
+    DeviceKeypairs, Keys, SecureConnection, Tags, TrustedPeer, TrustedPeers, auth_incoming,
+    auth_outgoing,
 };
 
 /// Identifies what kind of action/data is being sent in a packet.
@@ -54,10 +54,9 @@ impl ActionType {
 /// Init header: action type (1) + payload length as little-endian u64 (8).
 const INIT_HEADER_LEN: usize = 9;
 
-/// Upper bound for one data payload declared in the init header.
-/// A payload has to fit into a single [`SecureConnection`] message until
-/// chunking lands (see the chunking TODO in auth_snow).
-pub const MAX_DATA_PACKET_LEN: u64 = SECURE_MSG_MAX_PAYLOAD as u64;
+/// Upper bound for one data payload declared in the init header (16 MiB).
+/// Checked before allocating, the payload itself is sent in chunks.
+pub const MAX_DATA_PACKET_LEN: u64 = 16 * 1024 * 1024;
 
 /// A connection that is being authenticated, incoming or outgoing.
 pub struct IncomingConnection {
@@ -161,7 +160,7 @@ async fn read_secure(
 /// 1. authentication ([`auth_incoming`]): SPAKE2 + hybrid KEX + Noise +
 ///    ML-DSA signatures; unknown devices are paired only if both users confirm
 /// 2. <- init header (9 bytes): [0] = ActionType, [1..9] = payload length (u64 LE)
-/// 3. <- payload (only if the length is not 0)
+/// 3. <- payload in chunks ([`SecureConnection::read_chunked`]), if the length is not 0
 ///
 /// Everything after step 1 is encrypted and authenticated by the Noise transport.
 ///
@@ -218,12 +217,14 @@ pub async fn recv_handler(
     // unknown values fall back to Default, so newer peers stay compatible
     let action_type = ActionType::from_u8(*action_byte).unwrap_or(ActionType::Default);
 
-    // 3. payload
-    let data = if size == 0 {
-        Zeroizing::new(Vec::new())
-    } else {
-        read_secure(&mut secure_connection, size, peer_addr).await?
-    };
+    // 3. payload (size bounded above)
+    let data = secure_connection
+        .read_chunked(size, Tags::Regular)
+        .await
+        .map_err(|e| {
+            warn!(%peer_addr, error = %e, "failed to read data packet from peer");
+            TcpNetworkerErrors::FailedToReadFromStream
+        })?;
 
     info!(
         %peer_addr,
@@ -310,7 +311,7 @@ pub async fn recv(
 ///
 /// 1. authentication ([`auth_outgoing`]), pairs the device if needed
 /// 2. -> init header (9 bytes): [0] = ActionType, [1..9] = payload length (u64 LE)
-/// 3. -> payload (only if not empty)
+/// 3. -> payload in chunks ([`SecureConnection::write_chunked`]), if not empty
 ///
 /// `ConnectNewDevice` only pairs: it sends a header with length 0 and no payload.
 pub async fn connect_handler(
@@ -372,12 +373,8 @@ pub async fn connect_handler(
 
     // 3. payload
     if size > 0 {
-        let mut payload = Zeroizing::new(Vec::with_capacity(data.len().saturating_add(1))); // + tag
-
-        payload.extend_from_slice(&data);
-
         secure_connection
-            .write_timeout(&mut payload, Tags::Regular)
+            .write_chunked(&data, Tags::Regular)
             .await
             .map_err(|e| {
                 error!(%connect_addr, error = %e, "failed to send data packet");
@@ -565,10 +562,10 @@ mod tests {
         assert_eq!(client_peers.read().await.len(), 1);
     }
 
-    /// Test that a payload of exactly MAX_DATA_PACKET_LEN bytes arrives intact
+    /// Test that a multi-chunk payload (1 MiB) arrives intact
     #[tokio::test]
-    async fn test_max_size_payload() {
-        let data = vec![0x5A; SECURE_MSG_MAX_PAYLOAD];
+    async fn test_large_payload_chunked() {
+        let data: Vec<u8> = (0..=250u8).cycle().take(1024 * 1024).collect();
 
         let (server_result, client_result) = exchange(
             make_context(TEST_A_KEY, accept_all),
@@ -597,7 +594,12 @@ mod tests {
             addr,
             stream,
             ActionType::ClipboardSync,
-            Zeroizing::new(vec![0u8; SECURE_MSG_MAX_PAYLOAD + 1]),
+            Zeroizing::new(vec![
+                0u8;
+                usize::try_from(MAX_DATA_PACKET_LEN)
+                    .unwrap()
+                    .saturating_add(1)
+            ]),
         )
         .await;
 
