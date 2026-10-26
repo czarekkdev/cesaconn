@@ -15,3 +15,4 @@ path = "src/main.rs"
 [dependencies]
 ratatui = "0.30"
 crossterm = "0.29"
+zeroize = "1.8.2"

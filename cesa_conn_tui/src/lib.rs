@@ -11,6 +11,7 @@ use ratatui::{
     widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Tabs},
 };
 use std::{io, time::Duration};
+use zeroize::{Zeroize, Zeroizing};
 
 // ── Data types ────────────────────────────────────────────────────────────────
 
@@ -104,7 +105,9 @@ pub struct App {
     log_follow: bool,
 
     active_popup: ActivePopup,
-    input_buf: String,
+    /// Text typed into a popup. Can hold a password, so it is pre-sized
+    /// (never reallocates, which would leave un-wiped copies) and wiped on clear.
+    input_buf: Zeroizing<String>,
 
     pub should_quit: bool,
 }
@@ -180,7 +183,7 @@ impl App {
             log_scroll: 0,
             log_follow: true,
             active_popup: ActivePopup::None,
-            input_buf: String::new(),
+            input_buf: Zeroizing::new(String::with_capacity(INPUT_CAPACITY)),
             should_quit: false,
         }
     }
@@ -379,7 +382,7 @@ fn handle_settings_enter(app: &mut App) {
             }
         }
     } else {
-        app.input_buf.clear();
+        clear_input(app);
         app.active_popup = ActivePopup::EditSetting;
     }
 }
@@ -388,7 +391,7 @@ fn handle_add_device_input(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Esc => {
             app.active_popup = ActivePopup::None;
-            app.input_buf.clear();
+            clear_input(app);
         }
         KeyCode::Enter => {
             let addr_str = app.input_buf.trim().to_string();
@@ -403,12 +406,12 @@ fn handle_add_device_input(app: &mut App, code: KeyCode) {
                 }
             }
             app.active_popup = ActivePopup::None;
-            app.input_buf.clear();
+            clear_input(app);
         }
         KeyCode::Backspace => {
             app.input_buf.pop();
         }
-        KeyCode::Char(c) => app.input_buf.push(c),
+        KeyCode::Char(c) => push_input(app, c),
         _ => {}
     }
 }
@@ -417,25 +420,42 @@ fn handle_edit_setting_input(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Esc => {
             app.active_popup = ActivePopup::None;
-            app.input_buf.clear();
+            clear_input(app);
         }
         KeyCode::Enter => {
-            let new_value = app.input_buf.trim().to_string();
+            // may be a password: the copy is zeroizing too
+            let new_value = Zeroizing::new(app.input_buf.trim().to_owned());
             if !new_value.is_empty() {
-                apply_setting_edit(app, new_value);
+                apply_setting_edit(app, &new_value);
             }
             app.active_popup = ActivePopup::None;
-            app.input_buf.clear();
+            clear_input(app);
         }
         KeyCode::Backspace => {
             app.input_buf.pop();
         }
-        KeyCode::Char(c) => app.input_buf.push(c),
+        KeyCode::Char(c) => push_input(app, c),
         _ => {}
     }
 }
 
-fn apply_setting_edit(app: &mut App, new_value: String) {
+/// Most bytes a popup input can hold (passwords included).
+const INPUT_CAPACITY: usize = 512;
+
+/// Appends `c` unless it would outgrow [`INPUT_CAPACITY`]: growing the
+/// buffer reallocates and leaves the old copy (maybe a password) un-wiped.
+fn push_input(app: &mut App, c: char) {
+    if app.input_buf.len().saturating_add(c.len_utf8()) <= INPUT_CAPACITY {
+        app.input_buf.push(c);
+    }
+}
+
+/// Wipes the whole input buffer (spare capacity too), keeping its allocation.
+fn clear_input(app: &mut App) {
+    app.input_buf.zeroize();
+}
+
+fn apply_setting_edit(app: &mut App, new_value: &str) {
     let idx = app.settings_selected;
 
     let (is_secret, is_text) = app
@@ -455,7 +475,7 @@ fn apply_setting_edit(app: &mut App, new_value: String) {
         }
     } else if is_text {
         if let Some(s) = app.active_settings_mut().get_mut(idx) {
-            s.value = new_value;
+            s.value = new_value.to_owned();
         }
     }
 }
@@ -758,7 +778,7 @@ fn render_add_popup(frame: &mut Frame, area: Rect, app: &App) {
 
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(format!(" {}", app.input_buf)).block(
+        Paragraph::new(format!(" {}", app.input_buf.as_str())).block(
             Block::bordered()
                 .title(" Add Device — IP:port ")
                 .title_alignment(Alignment::Center)
@@ -772,7 +792,7 @@ fn render_add_popup(frame: &mut Frame, area: Rect, app: &App) {
         popup
             .x
             .saturating_add(2)
-            .saturating_add(to_u16(app.input_buf.len())),
+            .saturating_add(to_u16(app.input_buf.chars().count())),
         popup.y.saturating_add(1),
     ));
 }
@@ -784,9 +804,10 @@ fn render_edit_setting_popup(frame: &mut Frame, area: Rect, app: &App) {
 
     let is_secret = matches!(setting.kind, SettingKind::Secret { .. });
     let display_input = if is_secret {
-        "*".repeat(app.input_buf.len())
+        // one star per character, the byte length would leak more than the length
+        "*".repeat(app.input_buf.chars().count())
     } else {
-        app.input_buf.clone()
+        app.input_buf.to_string()
     };
 
     let title = format!(" Edit: {} ", setting.label);
@@ -925,6 +946,35 @@ fn centered_rect(area: Rect, w: u16, h: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test that input stops at INPUT_CAPACITY, so the buffer never reallocates
+    #[test]
+    fn test_input_never_outgrows_its_buffer() {
+        let mut app = App::new();
+        let capacity = app.input_buf.capacity();
+
+        for _ in 0..(INPUT_CAPACITY * 2) {
+            push_input(&mut app, 'ą'); // 2 bytes in UTF-8
+        }
+
+        assert!(app.input_buf.len() <= INPUT_CAPACITY);
+        assert_eq!(app.input_buf.capacity(), capacity);
+    }
+
+    /// Test that clearing wipes the input and keeps the allocation
+    #[test]
+    fn test_clear_input_wipes() {
+        let mut app = App::new();
+        let capacity = app.input_buf.capacity();
+
+        for c in "hunter2".chars() {
+            push_input(&mut app, c);
+        }
+        clear_input(&mut app);
+
+        assert!(app.input_buf.is_empty());
+        assert_eq!(app.input_buf.capacity(), capacity);
+    }
 
     // ── App::new ──────────────────────────────────────────────────────────
 
