@@ -19,10 +19,8 @@ GET RID OF STORING KEYS IN RAM
 
  */
 
-// the IPC daemon isn't wired into main yet (see TODO NOW)
 mod auth_snow;
 mod hybrid_kex;
-#[allow(dead_code)]
 mod ipc_unix;
 mod spake2;
 mod tcp_networker;

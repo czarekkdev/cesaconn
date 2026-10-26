@@ -1,0 +1,14 @@
+# Code-hygiene rules that matter for security review.
+# severity ERROR   = critical -> fails CI / blocks push
+# severity WARNING = reported, does not block
+
+rules:
+  - id: cesa.hygiene.allow-dead-code
+    severity: WARNING
+    languages: [rust]
+    message: >-
+      `#[allow(dead_code)]` / `#[allow(unused...)]` hides code nobody calls.
+      Unused code is unreviewed, untested code - and a security check that
+      silently stopped being called looks exactly like this. Delete it, wire
+      it in, or let the compiler warning stay visible until it is.
+    pattern-regex: '#!?\[\s*(allow|expect)\s*\([^\]]*\b(dead_code|unused[a-z_]*)\b'

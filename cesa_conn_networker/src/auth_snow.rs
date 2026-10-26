@@ -27,6 +27,11 @@ pub const TIMEOUT: u64 = 5;
 /// how long the user has to confirm a new device during pairing (seconds)
 pub const PAIRING_TIMEOUT: u64 = 60;
 
+/// deadline for the whole handshake up to the verified signatures (seconds);
+/// per-message timeouts alone would let a peer drip one message every
+/// TIMEOUT - 1 seconds and hold the connection for minutes
+pub const HANDSHAKE_DEADLINE: u64 = 20;
+
 use crate::{
     auth_snow::Tags::ServerAcceptTag,
     auth_snow::Tags::{
@@ -136,6 +141,8 @@ pub enum AuthSnowErrors {
     FailedToEncryptData,
     /// The `d_key` data layer failed to decrypt: wrong `d_key` or tampered data.
     FailedToDecryptData,
+    /// The handshake didn't finish within [`HANDSHAKE_DEADLINE`] seconds.
+    HandshakeTimeout,
 }
 
 impl fmt::Display for AuthSnowErrors {
@@ -242,6 +249,9 @@ impl fmt::Display for AuthSnowErrors {
             AuthSnowErrors::FailedToEncryptData => {
                 write!(f, "failed to encrypt data with d_key")
             }
+            AuthSnowErrors::HandshakeTimeout => {
+                write!(f, "handshake did not finish in time")
+            }
             AuthSnowErrors::FailedToDecryptData => {
                 write!(
                     f,
@@ -277,12 +287,6 @@ impl Tags {
         packet.push(self as u8);
     }
 
-    /// Returns `true` if `packet` ends with this tag.
-    #[allow(dead_code)] // API for callers outside the PoC binary (daemon, tests)
-    pub fn check_tag(self, packet: &[u8]) -> bool {
-        packet.ends_with(&[self as u8])
-    }
-
     /// Removes the tag from the end of `packet`.
     /// Returns `false` (and leaves `packet` untouched) if the tag doesn't match.
     pub fn untag(self, packet: &mut Vec<u8>) -> bool {
@@ -299,11 +303,14 @@ impl Tags {
 pub type TrustedPeers = Arc<RwLock<Vec<TrustedPeer>>>;
 
 /// An authenticated, encrypted channel to a peer after a completed Noise handshake.
+///
+/// Only the timed, tagged operations are public: the raw stream and the Noise
+/// state stay private, so nothing can bypass tags, size limits or timeouts.
 pub struct SecureConnection {
     /// Underlying TCP stream carrying the ciphertext.
-    pub connection: IncomingConnection,
+    connection: IncomingConnection,
     /// Noise transport state holding the send/receive cipher keys and nonces.
-    pub ts: TransportState,
+    ts: TransportState,
     /// Noise handshake hash, unique per connection; salts the `d_key` data keys.
     handshake_hash: Zeroizing<[u8; 32]>,
     /// `true` if we opened the connection (client), picks the data key direction.
@@ -315,7 +322,7 @@ pub const DATA_LAYER_OVERHEAD: usize = 12 + 16;
 
 impl SecureConnection {
     /// Wraps an already-handshaken stream and its transport state.
-    pub fn new(
+    fn new(
         connection: IncomingConnection,
         ts: TransportState,
         handshake_hash: Zeroizing<[u8; 32]>,
@@ -408,22 +415,27 @@ impl SecureConnection {
         ))
     }
 
-    /// Tags `src`, encrypts it and sends it to the peer.
-    ///
-    /// Note: `src` is modified (the tag byte is appended).
+    /// Tags a copy of `src`, encrypts it and sends it to the peer.
     /// At most [`SECURE_MSG_MAX_PAYLOAD`] bytes fit into one message.
-    pub async fn write(&mut self, src: &mut Vec<u8>, tag: Tags) -> Result<(), AuthSnowErrors> {
+    ///
+    /// No timeout of its own: only called through [`Self::write_timeout`].
+    async fn write(&mut self, src: &[u8], tag: Tags) -> Result<(), AuthSnowErrors> {
         if src.len() > SECURE_MSG_MAX_PAYLOAD {
             return Err(AuthSnowErrors::MessageTooLarge);
         }
 
-        tag.tag(src);
+        // own buffer sized for the tag up front: the caller's data is never
+        // modified and the push can't reallocate (old copies aren't wiped)
+        let mut plaintext = Zeroizing::new(Vec::with_capacity(src.len().saturating_add(1)));
+
+        plaintext.extend_from_slice(src);
+        tag.tag(&mut plaintext);
 
         // ciphertext = plaintext + AEAD tag
-        let mut buffer = Zeroizing::new(vec![0u8; src.len().saturating_add(SNOW_TAG_LEN)]);
+        let mut buffer = Zeroizing::new(vec![0u8; plaintext.len().saturating_add(SNOW_TAG_LEN)]);
 
         self.ts
-            .write_message(src, &mut buffer)
+            .write_message(&plaintext, &mut buffer)
             .map_err(|_| AuthSnowErrors::FailedToWriteSnowMessage)?;
 
         self.connection
@@ -442,7 +454,10 @@ impl SecureConnection {
     /// is shortened by 1, so resize it before reusing it for the next read.
     ///
     /// Returns the payload length (decrypted bytes without the tag byte).
-    pub async fn read(&mut self, buffer: &mut Vec<u8>, tag: Tags) -> Result<usize, AuthSnowErrors> {
+    ///
+    /// No timeout of its own: only called through [`Self::read_timeout`] /
+    /// [`recv_secure`], which bound it.
+    async fn read(&mut self, buffer: &mut Vec<u8>, tag: Tags) -> Result<usize, AuthSnowErrors> {
         // +1 is the tag byte inside the payload
         if buffer.len() > SECURE_MSG_MAX_PAYLOAD + 1 {
             return Err(AuthSnowErrors::MessageTooLarge);
@@ -450,8 +465,7 @@ impl SecureConnection {
 
         let mut message = Zeroizing::new(vec![0u8; buffer.len().saturating_add(SNOW_TAG_LEN)]);
 
-        // Every caller wraps `SecureConnection::read` in `timeout(...)` (TIMEOUT /
-        // PAIRING_TIMEOUT), so this low-level read deliberately has none of its own.
+        // private, every caller bounds it with timeout(...) (TIMEOUT / PAIRING_TIMEOUT)
         // nosemgrep: cesa.net.read-without-timeout
         self.connection
             .stream
@@ -473,11 +487,7 @@ impl SecureConnection {
     }
 
     /// [`Self::write`] bounded by [`TIMEOUT`].
-    pub async fn write_timeout(
-        &mut self,
-        src: &mut Vec<u8>,
-        tag: Tags,
-    ) -> Result<(), AuthSnowErrors> {
+    pub async fn write_timeout(&mut self, src: &[u8], tag: Tags) -> Result<(), AuthSnowErrors> {
         send_secure(self, src, tag, TIMEOUT).await
     }
 
@@ -503,14 +513,8 @@ impl SecureConnection {
     /// nonces make the chunks impossible to reorder, drop or replay unnoticed.
     /// Every chunk is bounded by [`TIMEOUT`].
     pub async fn write_chunked(&mut self, data: &[u8], tag: Tags) -> Result<(), AuthSnowErrors> {
-        // one reusable buffer, +1 for the tag byte write() appends
-        let mut chunk_buf = Zeroizing::new(Vec::with_capacity(SECURE_MSG_MAX_PAYLOAD + 1));
-
         for chunk in data.chunks(SECURE_MSG_MAX_PAYLOAD) {
-            chunk_buf.clear();
-            chunk_buf.extend_from_slice(chunk);
-
-            self.write_timeout(&mut chunk_buf, tag).await?;
+            self.write_timeout(chunk, tag).await?;
         }
 
         Ok(())
@@ -628,7 +632,6 @@ impl Salts {
     }
 
     /// Wraps two raw 32-byte arrays in `Zeroizing`.
-    #[allow(dead_code)] // API for callers outside the PoC binary (daemon, tests)
     pub fn new(a_salt: [u8; 32], d_salt: [u8; 32]) -> Self {
         Self {
             a_salt: Zeroizing::new(a_salt),
@@ -661,15 +664,6 @@ impl DeviceKeypairs {
             ),
         })
     }
-
-    /// Wraps already existing key pairs, e.g. loaded from storage.
-    #[allow(dead_code)] // API for callers outside the PoC binary (daemon, tests)
-    pub fn new(x25519_kep: X25519KeyPair, mldsa_kep: MLDSA87KeyPair) -> Self {
-        Self {
-            x25519_kep,
-            mldsa_kep,
-        }
-    }
 }
 
 /// A device we have paired with, identified by both of its public keys.
@@ -684,25 +678,9 @@ pub struct TrustedPeer {
 }
 
 impl TrustedPeer {
-    /// Creates a trusted peer entry from its two public keys and name.
-    #[allow(dead_code)] // API for callers outside the PoC binary (daemon, tests)
-    pub fn new(x25519_pub_key: [u8; 32], mldsa_verification_key: [u8; 2592], name: String) -> Self {
-        Self {
-            x25519_pub_key,
-            mldsa_verification_key,
-            name,
-        }
-    }
-
     /// Human-readable device name shown to the user.
     pub fn name(&self) -> &str {
         &self.name
-    }
-
-    /// The peer's Noise static public key.
-    #[allow(dead_code)] // API for callers outside the PoC binary (daemon, tests)
-    pub fn x25519_pub_key(&self) -> &[u8; 32] {
-        &self.x25519_pub_key
     }
 }
 
@@ -747,7 +725,7 @@ const MLDSA87_SIG_LEN: usize = MLDSA87Signature::len();
 /// Tags and sends `data` over `secure_connection`, bounded by `secs` seconds.
 async fn send_secure(
     secure_connection: &mut SecureConnection,
-    data: &mut Vec<u8>,
+    data: &[u8],
     tag: Tags,
     secs: u64,
 ) -> Result<(), AuthSnowErrors> {
@@ -792,16 +770,16 @@ async fn exchange_is_saved(
     role: Role,
     we_have_peer: bool,
 ) -> Result<bool, AuthSnowErrors> {
-    let mut ours = vec![u8::from(we_have_peer)];
+    let ours = [u8::from(we_have_peer)];
 
     let theirs = match role {
         Role::Client => {
-            send_secure(secure_connection, &mut ours, IsSavedTag, TIMEOUT).await?;
+            send_secure(secure_connection, &ours, IsSavedTag, TIMEOUT).await?;
             recv_secure(secure_connection, 1, IsSavedTag, TIMEOUT).await?
         }
         Role::Server => {
             let theirs = recv_secure(secure_connection, 1, IsSavedTag, TIMEOUT).await?;
-            send_secure(secure_connection, &mut ours, IsSavedTag, TIMEOUT).await?;
+            send_secure(secure_connection, &ours, IsSavedTag, TIMEOUT).await?;
             theirs
         }
     };
@@ -858,39 +836,30 @@ async fn exchange_signatures(
     device_keypairs: &DeviceKeypairs,
     transcript: &mut Zeroizing<Vec<u8>>,
 ) -> Result<[u8; MLDSA87_VK_LEN], AuthSnowErrors> {
-    let mut our_key = device_keypairs
-        .mldsa_kep
-        .verification_key
-        .as_slice()
-        .to_vec();
+    let our_key = device_keypairs.mldsa_kep.verification_key.as_slice();
 
-    let mut our_signature = sign(
+    let our_signature = sign(
         &device_keypairs.mldsa_kep.signing_key,
         handshake_hash.as_slice(),
         role.own_context(),
         *random_array::<32>().map_err(|_| AuthSnowErrors::FailedToSignData)?,
     )
-    .map_err(|_| AuthSnowErrors::FailedToSignData)?
-    .as_slice()
-    .to_vec();
-
-    // kept before send_secure() appends the tag byte to our buffers
-    let our_key_wire = our_key.clone();
-    let our_signature_wire = our_signature.clone();
+    .map_err(|_| AuthSnowErrors::FailedToSignData)?;
+    let our_signature = our_signature.as_slice();
 
     let (peer_key, peer_signature) = match role {
         Role::Client => {
             // 1. + 2.
             send_secure(
                 secure_connection,
-                &mut our_key,
+                our_key,
                 MLDSA87VerificationKeyTag,
                 TIMEOUT,
             )
             .await?;
             send_secure(
                 secure_connection,
-                &mut our_signature,
+                our_signature,
                 MLDSA87SignatureTag,
                 TIMEOUT,
             )
@@ -912,8 +881,8 @@ async fn exchange_signatures(
             )
             .await?;
 
-            transcript.extend_from_slice(&our_key_wire);
-            transcript.extend_from_slice(&our_signature_wire);
+            transcript.extend_from_slice(our_key);
+            transcript.extend_from_slice(our_signature);
             transcript.extend_from_slice(&peer_key);
             transcript.extend_from_slice(&peer_signature);
 
@@ -938,8 +907,8 @@ async fn exchange_signatures(
 
             transcript.extend_from_slice(&peer_key);
             transcript.extend_from_slice(&peer_signature);
-            transcript.extend_from_slice(&our_key_wire);
-            transcript.extend_from_slice(&our_signature_wire);
+            transcript.extend_from_slice(our_key);
+            transcript.extend_from_slice(our_signature);
 
             (peer_key, peer_signature)
         }
@@ -967,14 +936,14 @@ async fn exchange_signatures(
         // 3. + 4. only after the client proved itself
         send_secure(
             secure_connection,
-            &mut our_key,
+            our_key,
             MLDSA87VerificationKeyTag,
             TIMEOUT,
         )
         .await?;
         send_secure(
             secure_connection,
-            &mut our_signature,
+            our_signature,
             MLDSA87SignatureTag,
             TIMEOUT,
         )
@@ -1029,9 +998,9 @@ async fn confirm_pairing(
     };
 
     // 1. our decision
-    let mut decision = vec![u8::from(accept)];
+    let decision = [u8::from(accept)];
 
-    send_secure(secure_connection, &mut decision, our_tag, TIMEOUT).await?;
+    send_secure(secure_connection, &decision, our_tag, TIMEOUT).await?;
 
     if !accept {
         return Err(AuthSnowErrors::FailedToPairNewDevice);
@@ -1062,25 +1031,22 @@ async fn save_peer(trusted_peers: &TrustedPeers, peer: &TrustedPeer) {
     }
 }
 
-/// Everything after the Noise handshake, the same for both roles.
+/// Identifies the peer after the Noise handshake, the same for both roles.
 ///
 /// 1. tell each other whether we have the peer saved ([`exchange_is_saved`])
 /// 2. mutual ML-DSA signatures over the handshake hash ([`exchange_signatures`])
-/// 3. only if the devices don't both know each other: both users confirm
-///    ([`confirm_pairing`]), then the peer is saved
 ///
-/// Returns the secure connection and the authenticated peer.
-#[allow(clippy::too_many_arguments)] // one call per role, a struct would only move the list
-async fn authenticate_peer(
-    mut secure_connection: SecureConnection,
+/// Returns the authenticated peer and whether BOTH devices already know each
+/// other; if not, the caller must run [`confirm_pairing`] before trusting it.
+async fn identify_peer(
+    secure_connection: &mut SecureConnection,
     role: Role,
     peer_static: [u8; 32],
-    handshake_hash: Zeroizing<[u8; 32]>,
+    handshake_hash: &Zeroizing<[u8; 32]>,
     device_keypairs: &DeviceKeypairs,
-    trusted_peers: TrustedPeers,
-    pair_fallback: fn(&String, &[u8; 32]) -> bool,
+    trusted_peers: &TrustedPeers,
     transcript: &mut Zeroizing<Vec<u8>>,
-) -> Result<(SecureConnection, TrustedPeer), AuthSnowErrors> {
+) -> Result<(TrustedPeer, bool), AuthSnowErrors> {
     // cloned, so the read lock is released before any network I/O
     let stored_peer = trusted_peers
         .read()
@@ -1090,13 +1056,13 @@ async fn authenticate_peer(
         .cloned();
 
     // 1.
-    let both_saved = exchange_is_saved(&mut secure_connection, role, stored_peer.is_some()).await?;
+    let both_saved = exchange_is_saved(secure_connection, role, stored_peer.is_some()).await?;
 
     // 2.
     let peer_key = exchange_signatures(
-        &mut secure_connection,
+        secure_connection,
         role,
-        &handshake_hash,
+        handshake_hash,
         stored_peer
             .as_ref()
             .map(|peer| &peer.mldsa_verification_key),
@@ -1114,14 +1080,12 @@ async fn authenticate_peer(
         },
     };
 
-    // 3.
-    if !both_saved {
-        confirm_pairing(&mut secure_connection, role, &handshake_hash, pair_fallback).await?;
-        save_peer(&trusted_peers, &peer).await;
-    }
-
-    Ok((secure_connection, peer))
+    Ok((peer, both_saved))
 }
+
+/// Result of a Noise handshake: the transport, the peer's static key and the
+/// handshake hash (snow only exposes it before switching to transport mode).
+type NoiseResult = (SecureConnection, [u8; 32], Zeroizing<[u8; 32]>);
 
 /// Noise protocol used for the final handshake.
 const NOISE_PARAMS: &str = "Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s";
@@ -1129,27 +1093,17 @@ const NOISE_PARAMS: &str = "Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s";
 /// Runs the responder side of a `Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s` handshake.
 ///
 /// * `secure_psk` - key derived from SPAKE2 + hybrid KEX, mixed in at message 3
-/// * `device_keypairs` - our own long-term keys (X25519 static key, ML-DSA key pair)
-/// * `trusted_peers` - devices we already paired with
-/// * `pair_fallback` - asks the user to confirm an unknown device; gets its name
-///   and the handshake hash (to show as words). Runs on a blocking thread.
-/// * `transcript` - the signature exchange is appended to it
-///
-/// After the handshake both sides authenticate each other with ML-DSA
-/// signatures; devices that don't both know each other are only accepted after
-/// both users confirm ([`authenticate_peer`]).
+/// * `device_keypairs` - our own long-term keys (X25519 static key)
 ///
 /// Every network read/write is bounded by [`TIMEOUT`].
 ///
-/// Returns the secure connection and the authenticated peer.
+/// Returns the transport, the peer's static key and the handshake hash; the
+/// peer is NOT authenticated yet ([`identify_peer`]).
 async fn snow_handshake_server(
     mut incoming_connection: IncomingConnection,
     secure_psk: Zeroizing<[u8; 32]>,
     device_keypairs: &DeviceKeypairs,
-    trusted_peers: TrustedPeers,
-    pair_fallback: fn(&String, &[u8; 32]) -> bool,
-    transcript: &mut Zeroizing<Vec<u8>>,
-) -> Result<(SecureConnection, TrustedPeer), AuthSnowErrors> {
+) -> Result<NoiseResult, AuthSnowErrors> {
     let stream = &mut incoming_connection.stream;
 
     // psk3: the PSK is mixed in at the end of the third handshake message
@@ -1258,17 +1212,7 @@ async fn snow_handshake_server(
         false,
     );
 
-    authenticate_peer(
-        secure_connection,
-        Role::Server,
-        peer_static,
-        handshake_hash,
-        device_keypairs,
-        trusted_peers,
-        pair_fallback,
-        transcript,
-    )
-    .await
+    Ok((secure_connection, peer_static, handshake_hash))
 }
 
 /// Runs the initiator side of a `Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s` handshake.
@@ -1282,10 +1226,7 @@ async fn snow_handshake_client(
     mut outgoing_connection: IncomingConnection,
     secure_psk: Zeroizing<[u8; 32]>,
     device_keypairs: &DeviceKeypairs,
-    trusted_peers: TrustedPeers,
-    pair_fallback: fn(&String, &[u8; 32]) -> bool,
-    transcript: &mut Zeroizing<Vec<u8>>,
-) -> Result<(SecureConnection, TrustedPeer), AuthSnowErrors> {
+) -> Result<NoiseResult, AuthSnowErrors> {
     let stream = &mut outgoing_connection.stream;
 
     let mut noise = Builder::new(
@@ -1381,17 +1322,7 @@ async fn snow_handshake_client(
     let secure_connection =
         SecureConnection::new(outgoing_connection, transport, handshake_hash.clone(), true);
 
-    authenticate_peer(
-        secure_connection,
-        Role::Client,
-        peer_static,
-        handshake_hash,
-        device_keypairs,
-        trusted_peers,
-        pair_fallback,
-        transcript,
-    )
-    .await
+    Ok((secure_connection, peer_static, handshake_hash))
 }
 
 /// PSK = HKDF(key1 || x25519_ss || mlkem_ss || HKDF(transcript)), label `CPQHA-psk`.
@@ -1426,35 +1357,33 @@ fn derive_secure_psk(
     Ok(secure_psk)
 }
 
-/// Authenticates an incoming connection (server side).
+/// A connection that finished every automatic step: SPAKE2, KEX, Noise and
+/// the verified signatures. `bool` = both devices already know each other.
+type Identified = (SecureConnection, TrustedPeer, Zeroizing<[u8; 32]>, bool);
+
+/// Server side of everything up to the verified signatures.
 ///
-/// Steps:
 /// 1. SPAKE2 exchange + mutual key confirmation using the shared `a_key`
 /// 2. hybrid X25519 + ML-KEM key exchange
 /// 3. derive a PSK from the SPAKE2 key, both KEX shared secrets and the transcript hash
 /// 4. Noise XXpsk3 handshake using that PSK and our device's static key
-/// 5. mutual ML-DSA signatures over the handshake hash; devices that don't both
-///    know each other are only accepted after both users confirm (pairing)
+/// 5. mutual ML-DSA signatures over the handshake hash ([`identify_peer`])
 ///
-/// Returns `Ok(None)` if the peer failed SPAKE2 confirmation
-/// (i.e. doesn't know the shared key), `Ok(Some(_))` with the secure
-/// connection and the authenticated peer on success.
-pub async fn auth_incoming(
-    keys: Arc<RwLock<Keys>>,
-    device_keypairs: &DeviceKeypairs,
-    trusted_peers: TrustedPeers,
+/// Returns `Ok(None)` if the peer failed SPAKE2 confirmation.
+async fn handshake_server(
     mut incoming_connection: IncomingConnection,
-    pair_fallback: fn(&String, &[u8; 32]) -> bool,
-) -> Result<Option<(SecureConnection, TrustedPeer)>, AuthSnowErrors> {
+    a_key: &Zeroizing<[u8; 32]>,
+    device_keypairs: &DeviceKeypairs,
+    trusted_peers: &TrustedPeers,
+) -> Result<Option<Identified>, AuthSnowErrors> {
     let mut stream = &mut incoming_connection.stream;
-    let a_key = keys.read().await.a_key.clone();
     // every message exchanged before Noise is appended here so the
     // derived PSK is bound to the whole pre-handshake conversation;
     // the signature exchange after Noise is appended too
     let mut transcript = Zeroizing::new(Vec::new());
 
     // 1. SPAKE2
-    let key1 = spake2_exchange_server(&mut stream, &a_key, &mut transcript)
+    let key1 = spake2_exchange_server(&mut stream, a_key, &mut transcript)
         .await
         .map_err(|_| AuthSnowErrors::FailedToExchangeSpake2)?;
 
@@ -1473,38 +1402,40 @@ pub async fn auth_incoming(
     // 3. PSK
     let secure_psk = derive_secure_psk(&key1, &hybrid_kep, &transcript)?;
 
-    // 4. + 5. Noise handshake, then signatures / pairing
-    snow_handshake_server(
-        incoming_connection,
-        secure_psk,
+    // 4. Noise
+    let (mut secure_connection, peer_static, handshake_hash) =
+        snow_handshake_server(incoming_connection, secure_psk, device_keypairs).await?;
+
+    // 5. signatures
+    let (peer, both_saved) = identify_peer(
+        &mut secure_connection,
+        Role::Server,
+        peer_static,
+        &handshake_hash,
         device_keypairs,
         trusted_peers,
-        pair_fallback,
         &mut transcript,
     )
-    .await
-    .map(Some)
+    .await?;
+
+    Ok(Some((secure_connection, peer, handshake_hash, both_saved)))
 }
 
-/// Authenticates an outgoing connection (client side). Mirrors [`auth_incoming`]
-/// step by step, with the client sending first wherever both sides send.
+/// Client side of everything up to the verified signatures. Mirrors
+/// [`handshake_server`] step by step, the client sends first wherever both do.
 ///
-/// Returns `Ok(None)` if the server's SPAKE2 confirmation was wrong (it doesn't
-/// know the shared key), `Ok(Some(_))` with the secure connection and the
-/// authenticated peer on success.
-pub async fn auth_outgoing(
-    keys: Arc<RwLock<Keys>>,
-    device_keypairs: &DeviceKeypairs,
-    trusted_peers: TrustedPeers,
+/// Returns `Ok(None)` if the server's SPAKE2 confirmation was wrong.
+async fn handshake_client(
     mut outgoing_connection: IncomingConnection,
-    pair_fallback: fn(&String, &[u8; 32]) -> bool,
-) -> Result<Option<(SecureConnection, TrustedPeer)>, AuthSnowErrors> {
+    a_key: &Zeroizing<[u8; 32]>,
+    device_keypairs: &DeviceKeypairs,
+    trusted_peers: &TrustedPeers,
+) -> Result<Option<Identified>, AuthSnowErrors> {
     let mut stream = &mut outgoing_connection.stream;
-    let a_key = keys.read().await.a_key.clone();
     let mut transcript = Zeroizing::new(Vec::new());
 
     // 1. SPAKE2
-    let key1 = spake2_exchange_client(&mut stream, &a_key, &mut transcript)
+    let key1 = spake2_exchange_client(&mut stream, a_key, &mut transcript)
         .await
         .map_err(|_| AuthSnowErrors::FailedToExchangeSpake2)?;
 
@@ -1523,17 +1454,100 @@ pub async fn auth_outgoing(
     // 3. PSK
     let secure_psk = derive_secure_psk(&key1, &hybrid_kep, &transcript)?;
 
-    // 4. + 5. Noise handshake, then signatures / pairing
-    snow_handshake_client(
-        outgoing_connection,
-        secure_psk,
+    // 4. Noise
+    let (mut secure_connection, peer_static, handshake_hash) =
+        snow_handshake_client(outgoing_connection, secure_psk, device_keypairs).await?;
+
+    // 5. signatures
+    let (peer, both_saved) = identify_peer(
+        &mut secure_connection,
+        Role::Client,
+        peer_static,
+        &handshake_hash,
         device_keypairs,
         trusted_peers,
-        pair_fallback,
         &mut transcript,
     )
-    .await
-    .map(Some)
+    .await?;
+
+    Ok(Some((secure_connection, peer, handshake_hash, both_saved)))
+}
+
+/// Runs the automatic part under [`HANDSHAKE_DEADLINE`], then pairing if needed.
+///
+/// Pairing waits for a human ([`PAIRING_TIMEOUT`]), so it runs after the
+/// deadline, and only for a peer whose signature is already verified.
+async fn finish_auth(
+    identified: Result<Result<Option<Identified>, AuthSnowErrors>, tokio::time::error::Elapsed>,
+    role: Role,
+    trusted_peers: &TrustedPeers,
+    pair_fallback: fn(&String, &[u8; 32]) -> bool,
+) -> Result<Option<(SecureConnection, TrustedPeer)>, AuthSnowErrors> {
+    let Some((mut secure_connection, peer, handshake_hash, both_saved)) =
+        identified.map_err(|_| AuthSnowErrors::HandshakeTimeout)??
+    else {
+        return Ok(None);
+    };
+
+    if !both_saved {
+        confirm_pairing(&mut secure_connection, role, &handshake_hash, pair_fallback).await?;
+        save_peer(trusted_peers, &peer).await;
+    }
+
+    Ok(Some((secure_connection, peer)))
+}
+
+/// Authenticates an incoming connection (server side).
+///
+/// SPAKE2, hybrid KEX, Noise and the ML-DSA signatures ([`handshake_server`])
+/// must finish within [`HANDSHAKE_DEADLINE`]; devices that don't both know
+/// each other are only accepted after both users confirm (pairing).
+///
+/// Returns `Ok(None)` if the peer failed SPAKE2 confirmation
+/// (i.e. doesn't know the shared key), `Ok(Some(_))` with the secure
+/// connection and the authenticated peer on success.
+pub async fn auth_incoming(
+    keys: Arc<RwLock<Keys>>,
+    device_keypairs: &DeviceKeypairs,
+    trusted_peers: TrustedPeers,
+    incoming_connection: IncomingConnection,
+    pair_fallback: fn(&String, &[u8; 32]) -> bool,
+) -> Result<Option<(SecureConnection, TrustedPeer)>, AuthSnowErrors> {
+    // cloned, so the read lock is released before any network I/O
+    let a_key = keys.read().await.a_key.clone();
+
+    // one deadline for all automatic steps, see HANDSHAKE_DEADLINE
+    let identified = timeout(
+        Duration::from_secs(HANDSHAKE_DEADLINE),
+        handshake_server(incoming_connection, &a_key, device_keypairs, &trusted_peers),
+    )
+    .await;
+
+    finish_auth(identified, Role::Server, &trusted_peers, pair_fallback).await
+}
+
+/// Authenticates an outgoing connection (client side). Mirrors [`auth_incoming`].
+///
+/// Returns `Ok(None)` if the server's SPAKE2 confirmation was wrong (it doesn't
+/// know the shared key), `Ok(Some(_))` with the secure connection and the
+/// authenticated peer on success.
+pub async fn auth_outgoing(
+    keys: Arc<RwLock<Keys>>,
+    device_keypairs: &DeviceKeypairs,
+    trusted_peers: TrustedPeers,
+    outgoing_connection: IncomingConnection,
+    pair_fallback: fn(&String, &[u8; 32]) -> bool,
+) -> Result<Option<(SecureConnection, TrustedPeer)>, AuthSnowErrors> {
+    let a_key = keys.read().await.a_key.clone();
+
+    // one deadline for all automatic steps, see HANDSHAKE_DEADLINE
+    let identified = timeout(
+        Duration::from_secs(HANDSHAKE_DEADLINE),
+        handshake_client(outgoing_connection, &a_key, device_keypairs, &trusted_peers),
+    )
+    .await;
+
+    finish_auth(identified, Role::Client, &trusted_peers, pair_fallback).await
 }
 
 #[cfg(test)]
@@ -1626,11 +1640,11 @@ mod tests {
 
         // each side identified the other by its real static key
         assert_eq!(
-            client_as_seen.x25519_pub_key(),
+            &client_as_seen.x25519_pub_key,
             &*client.keypairs.x25519_kep.public
         );
         assert_eq!(
-            server_as_seen.x25519_pub_key(),
+            &server_as_seen.x25519_pub_key,
             &*server.keypairs.x25519_kep.public
         );
         assert_eq!(server.peers.read().await.len(), 1);
@@ -1715,10 +1729,10 @@ mod tests {
         assert!(s.unwrap().is_some() && c.unwrap().is_some());
 
         // same Noise static key, new ML-DSA identity
-        client.keypairs = DeviceKeypairs::new(
-            generate_new_key_pair(*client.keypairs.x25519_kep.private),
-            generate_key_pair(*random_array::<32>().unwrap()),
-        );
+        client.keypairs = DeviceKeypairs {
+            x25519_kep: generate_new_key_pair(*client.keypairs.x25519_kep.private),
+            mldsa_kep: generate_key_pair(*random_array::<32>().unwrap()),
+        };
 
         let (s, c) = handshake(&server, &client, accept_all, accept_all).await;
 
@@ -1938,6 +1952,45 @@ mod tests {
         let (_s2, c2) = handshake(&server, &client, accept_all, accept_all).await;
         let (client_conn2, _) = c2.unwrap().unwrap();
         assert_ne!(*client_conn2.data_key(&d_key, true).unwrap(), *c2s_client);
+    }
+
+    /// Test that a handshake past HANDSHAKE_DEADLINE is reported as HandshakeTimeout
+    #[tokio::test]
+    async fn test_handshake_deadline_maps_to_timeout() {
+        let elapsed = timeout(Duration::ZERO, std::future::pending::<()>())
+            .await
+            .unwrap_err();
+        let peers: TrustedPeers = Arc::new(RwLock::new(Vec::new()));
+
+        let result = finish_auth(Err(elapsed), Role::Server, &peers, accept_all).await;
+
+        assert_eq!(result.err(), Some(AuthSnowErrors::HandshakeTimeout));
+        assert!(peers.read().await.is_empty());
+    }
+
+    /// Test that a peer which connects and goes silent is dropped, not held forever
+    #[tokio::test]
+    async fn test_silent_peer_times_out() {
+        let server = Device::new(TEST_A_KEY);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // connected, but never sends anything
+        let _silent = TcpStream::connect(addr).await.unwrap();
+        let (stream, peer_addr) = listener.accept().await.unwrap();
+
+        let started = tokio::time::Instant::now();
+        let result = auth_incoming(
+            server.keys.clone(),
+            &server.keypairs,
+            server.peers.clone(),
+            IncomingConnection::new(stream, peer_addr),
+            accept_all,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(started.elapsed() <= Duration::from_secs(HANDSHAKE_DEADLINE));
     }
 
     /// Test that both roles derive the same PSK from the same inputs

@@ -6,7 +6,7 @@ use std::fmt;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
@@ -57,6 +57,11 @@ const INIT_HEADER_LEN: usize = 9;
 /// Upper bound for one data payload declared in the init header (16 MiB).
 /// Checked before allocating, the payload itself is sent in chunks.
 pub const MAX_DATA_PACKET_LEN: u64 = 16 * 1024 * 1024;
+
+/// How many incoming connections may be handled at the same time.
+/// Each one costs SPAKE2 + ML-KEM work before the peer is authenticated,
+/// so without a cap a connection flood exhausts CPU, memory and tasks.
+pub const MAX_CONCURRENT_CONNECTIONS: usize = 16;
 
 /// A connection that is being authenticated, incoming or outgoing.
 pub struct IncomingConnection {
@@ -279,6 +284,8 @@ pub async fn recv(
 
     info!(%local_addr, "TCP listener started, waiting for incoming connections");
 
+    let connection_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+
     loop {
         let cloned_token = cancellation_token.clone();
         let context_clone = context.clone();
@@ -298,9 +305,21 @@ pub async fn recv(
         };
 
         let peer_addr = incoming_connection.1;
+
+        // no free slot: close right away instead of queueing, so a flood
+        // can't pile up waiting tasks
+        let Ok(slot) = connection_slots.clone().try_acquire_owned() else {
+            warn!(%local_addr, %peer_addr, max = MAX_CONCURRENT_CONNECTIONS, "too many connections, dropping");
+            drop(incoming_connection);
+            continue;
+        };
+
         info!(%local_addr, %peer_addr, "accepted incoming TCP connection, spawning recv_handler");
 
         tokio::spawn(async move {
+            // held until the handler finishes, frees the slot on drop
+            let _slot = slot;
+
             select! {
                 _ = cloned_token.cancelled() => {
                     info!(%peer_addr, "cancellation token fired mid-handler, dropping recv_handler task");
@@ -383,13 +402,13 @@ pub async fn connect_handler(
     };
 
     // 2. init header
-    let mut init_data = Vec::with_capacity(INIT_HEADER_LEN + 1); // + tag
+    let mut init_data = Vec::with_capacity(INIT_HEADER_LEN);
 
     init_data.push(action_type as u8);
     init_data.extend_from_slice(&size.to_le_bytes());
 
     secure_connection
-        .write_timeout(&mut init_data, Tags::Regular)
+        .write_timeout(&init_data, Tags::Regular)
         .await
         .map_err(|e| {
             error!(%connect_addr, error = %e, "failed to send init header");
@@ -720,6 +739,48 @@ mod tests {
             server_result.err(),
             Some(TcpNetworkerErrors::FailedToDecryptData)
         );
+    }
+
+    /// Test that connections past MAX_CONCURRENT_CONNECTIONS are closed at once
+    #[tokio::test]
+    async fn test_connection_limit_drops_extra_connections() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let token = CancellationToken::new();
+        let server_token = token.clone();
+        let context = make_context(TEST_A_KEY, accept_all);
+
+        let server = tokio::spawn(async move { recv(&listener, context, server_token).await });
+
+        // occupy every slot: each handler is waiting for our SPAKE2 message
+        let mut held = Vec::new();
+
+        for _ in 0..MAX_CONCURRENT_CONNECTIONS {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let mut first = [0u8; 1];
+
+            // the server speaks first (SPAKE2), so this proves the slot is taken
+            stream.read_exact(&mut first).await.unwrap();
+            held.push(stream);
+        }
+
+        // one more: closed without a single byte
+        let mut extra = TcpStream::connect(addr).await.unwrap();
+        let mut buf = Vec::new();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            extra.read_to_end(&mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(read, 0);
+
+        token.cancel();
+        assert!(server.await.unwrap().is_ok());
     }
 
     /// Test that cancelling before connect() returns Ok(()) without connecting

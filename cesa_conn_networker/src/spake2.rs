@@ -29,12 +29,6 @@ impl Tags {
         packet.push(self as u8);
     }
 
-    /// Returns `true` if `packet` ends with this tag.
-    #[allow(dead_code)] // API for callers outside the PoC binary (daemon, tests)
-    pub fn check_tag(self, packet: &[u8]) -> bool {
-        packet.ends_with(&[self as u8])
-    }
-
     /// Removes the tag from the end of `packet`.
     /// Returns `false` (and leaves `packet` untouched) if the tag doesn't match.
     pub fn untag(self, packet: &mut Vec<u8>) -> bool {
