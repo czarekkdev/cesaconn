@@ -369,8 +369,12 @@ def check_tsan() -> ToolResult:
                               "--lib", "--bins", "--tests"], env=env,
                              timeout=int(os.environ.get("CESA_TSAN_TIMEOUT", "1800")))
         text = out + err
-        if "could not compile" in text:
+        if code != 0 and not PASSED_RE.search(text):
+            # nothing ran: build failure (e.g. crate does not compile) or toolchain problem
             broken.append(crate)
+            tail = "\n".join(l for l in text.splitlines() if l.startswith("error"))[-600:] or text[-600:]
+            r.findings.append(Finding("tsan", "not-tested", "info",
+                                      f"{crate} was NOT race-tested (exit {code}):\n{tail}"))
             continue
         r.note = (r.note + "; " if r.note else "") + f"{crate}: {count_tests(text)}"
         seen = set()
@@ -390,8 +394,7 @@ def check_tsan() -> ToolResult:
             r.findings.append(Finding("tsan", "timeout", "warning",
                                       f"{crate} tests timed out under TSan - possible deadlock or hang"))
     if broken:
-        r.findings.append(Finding("tsan", "does-not-compile", "info",
-                                  "Not race-tested (does not compile): " + ", ".join(broken)))
+        r.note = (r.note + "; " if r.note else "") + "NOT tested: " + ", ".join(broken)
     return r
 
 
