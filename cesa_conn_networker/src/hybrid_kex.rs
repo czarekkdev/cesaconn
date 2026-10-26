@@ -75,7 +75,7 @@ async fn x25519_kex_server(
 ) -> Result<SsKey, AuthSnowErrors> {
     // fresh ephemeral key pair for this connection
     let x25519_pair = x25519_cesa::generate_new_key_pair(
-        *random_array::<32>().map_err(|_| AuthSnowErrors::FailedToGenerateRandomData)?,
+        &random_array::<32>().map_err(|_| AuthSnowErrors::FailedToGenerateRandomData)?,
     );
 
     let mut x25519_pub = Zeroizing::new(x25519_pair.public.to_vec());
@@ -100,15 +100,13 @@ async fn x25519_kex_server(
     }
 
     // fails if the client sent a low-order point (all-zero shared secret)
-    let x25519_ss = Zeroizing::new(
-        calculate_shared_key(
-            &x25519_pair.private,
-            x25519_recv
-                .as_array()
-                .ok_or(AuthSnowErrors::FailedToConvertToArray)?,
-        )
-        .ok_or(AuthSnowErrors::FailedToCalculateSharedSecret)?,
-    );
+    let x25519_ss = calculate_shared_key(
+        &x25519_pair.private,
+        x25519_recv
+            .as_array()
+            .ok_or(AuthSnowErrors::FailedToConvertToArray)?,
+    )
+    .ok_or(AuthSnowErrors::FailedToCalculateSharedSecret)?;
 
     // 2. our public key
     let write = stream.write_all(&x25519_pub);
@@ -286,7 +284,7 @@ async fn x25519_kex_client(
 ) -> Result<SsKey, AuthSnowErrors> {
     // fresh ephemeral key pair for this connection
     let x25519_pair = x25519_cesa::generate_new_key_pair(
-        *random_array::<32>().map_err(|_| AuthSnowErrors::FailedToGenerateRandomData)?,
+        &random_array::<32>().map_err(|_| AuthSnowErrors::FailedToGenerateRandomData)?,
     );
 
     let mut x25519_pub = Zeroizing::new(x25519_pair.public.to_vec());
@@ -324,8 +322,7 @@ async fn x25519_kex_client(
         x25519_recv
             .as_array()
             .ok_or(AuthSnowErrors::FailedToConvertToArray)?,
-    )
-    .map(Zeroizing::new);
+    );
 
     // 3. our confirmation, tell the server why we stop instead of just closing
     send_confirm(stream, shared.is_some(), transcript).await?;

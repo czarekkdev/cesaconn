@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use crate::{
-    auth_snow::{AuthSnowErrors, TIMEOUT},
+    auth_snow::{AuthKey, AuthSnowErrors, TIMEOUT},
     spake2::Tags::OutboundMsg,
 };
 use blake2::Blake2s256;
@@ -51,12 +51,12 @@ impl Tags {
 /// see [`spake2_confirm_mutual_auth_server`].
 pub async fn spake2_exchange_server(
     stream: &mut TcpStream,
-    a_key: &Zeroizing<[u8; 32]>,
+    a_key: &AuthKey,
     transcript: &mut Zeroizing<Vec<u8>>,
 ) -> Result<Zeroizing<Vec<u8>>, AuthSnowErrors> {
     // identities must match the client's `start_a` call exactly
     let (s1, mut outbound_msg) = Spake2::<Ed25519Group>::start_b(
-        &Password::new(a_key),
+        &Password::new(a_key.expose().as_slice()),
         &Identity::new(b"client"),
         &Identity::new(b"server"),
     );
@@ -166,12 +166,12 @@ pub async fn spake2_confirm_mutual_auth_server(
 /// see [`spake2_confirm_mutual_auth_client`].
 pub async fn spake2_exchange_client(
     stream: &mut TcpStream,
-    a_key: &Zeroizing<[u8; 32]>,
+    a_key: &AuthKey,
     transcript: &mut Zeroizing<Vec<u8>>,
 ) -> Result<Zeroizing<Vec<u8>>, AuthSnowErrors> {
     // identities must match the server's `start_b` call exactly
     let (s1, mut outbound_msg) = Spake2::<Ed25519Group>::start_a(
-        &Password::new(a_key),
+        &Password::new(a_key.expose().as_slice()),
         &Identity::new(b"client"),
         &Identity::new(b"server"),
     );
@@ -291,7 +291,10 @@ mod tests {
         Zeroizing<Vec<u8>>,
     ) {
         let (mut s, mut c) = pair().await;
-        let (sk, ck) = (Zeroizing::new(server_key), Zeroizing::new(client_key));
+        let (sk, ck) = (
+            AuthKey::from_bytes(&server_key),
+            AuthKey::from_bytes(&client_key),
+        );
         let mut st = Zeroizing::new(Vec::new());
         let mut ct = Zeroizing::new(Vec::new());
 
@@ -336,7 +339,7 @@ mod tests {
 
         for _ in 0..2 {
             let (mut s, mut c) = pair().await;
-            let k = Zeroizing::new([7u8; 32]);
+            let k = AuthKey::from_bytes(&[7u8; 32]);
             let mut st = Zeroizing::new(Vec::new());
             let mut ct = Zeroizing::new(Vec::new());
 

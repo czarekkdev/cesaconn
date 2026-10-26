@@ -8,9 +8,11 @@ use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, sleep, timeout};
 use tracing::{debug, error, info, warn};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::auth_snow::Keys;
+#[cfg(test)]
+use crate::auth_snow::{AuthKey, DataKey};
 use cesa_conn_crypto::aes::{AESError, decrypt, encrypt};
 
 /// AES-GCM nonce length (bytes).
@@ -34,7 +36,10 @@ pub(crate) fn encrypt_tunnel(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>
 
 /// Inverse of [`encrypt_tunnel`]: splits off the nonce and decrypts the rest.
 /// Packets shorter than nonce + tag are rejected before touching AES.
-pub(crate) fn decrypt_tunnel(key: &[u8; 32], packet: &[u8]) -> Result<Vec<u8>, AESError> {
+pub(crate) fn decrypt_tunnel(
+    key: &[u8; 32],
+    packet: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, AESError> {
     if packet.len() < TUNNEL_NONCE_LEN + TUNNEL_TAG_LEN {
         return Err(AESError::DecryptionFailed);
     }
@@ -144,7 +149,7 @@ pub async fn udp_broadcast_presence(
     );
 
     for tick in 0..duration {
-        let e_msg = encrypt_tunnel(&keys.read().await.a_key, message).map_err(|e| {
+        let e_msg = encrypt_tunnel(keys.read().await.a_key.expose(), message).map_err(|e| {
             error!(error = %e, tick, "failed to encrypt broadcast message");
             UdpNetworkerErrors::FailedToEncryptTunnel
         })?;
@@ -267,7 +272,7 @@ pub async fn udp_find_broadcaster(
     debug!(%addr, "decrypting received UDP packet");
     // len < buf.len() checked above
     let received = buf.get(..len).ok_or(UdpNetworkerErrors::DataTooBig)?;
-    let name = decrypt_tunnel(&keys.read().await.a_key, received)
+    let name = decrypt_tunnel(keys.read().await.a_key.expose(), received)
         .map_err(|e| {
             warn!(%addr, error = %e, "failed to decrypt received UDP packet — wrong key or tampered data");
             UdpNetworkerErrors::FailedToDecryptTunnel
@@ -310,7 +315,10 @@ mod tests {
     /// Wraps a raw 32-byte key in `Keys` (d_key zeroed — UDP only uses a_key) and returns it
     /// behind `Arc<RwLock>` to match the signatures of `udp_broadcast_presence` / `udp_find_broadcaster`.
     fn make_test_key(key: [u8; 32]) -> Arc<RwLock<Keys>> {
-        Arc::new(RwLock::new(Keys::new(&key, &[0u8; 32])))
+        Arc::new(RwLock::new(Keys::new(
+            AuthKey::from_bytes(&key),
+            DataKey::from_bytes(&[0u8; 32]),
+        )))
     }
 
     /// `UdpSocket::bind` must succeed on any available port.
@@ -350,7 +358,7 @@ mod tests {
         // Bind to an ephemeral port — receiver only cares about the destination port (3636)
         let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
         // Encrypt with the correct key so decryption succeeds, but use a wrong device name
-        let raw_key: [u8; 32] = *key.read().await.a_key;
+        let raw_key: [u8; 32] = **key.read().await.a_key.expose();
         let encrypted = encrypt_tunnel(&raw_key, b"UnknownDevice").unwrap();
         socket.send_to(&encrypted, "127.0.0.1:3636").await.unwrap();
 
@@ -396,7 +404,7 @@ mod tests {
 
         // Bind to an ephemeral port — receiver only cares about the destination port (3636)
         let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
-        let raw_key: [u8; 32] = *key.read().await.a_key;
+        let raw_key: [u8; 32] = **key.read().await.a_key.expose();
         let encrypted = encrypt_tunnel(&raw_key, BROADCAST_NAME.as_bytes()).unwrap();
         socket.send_to(&encrypted, "127.0.0.1:3636").await.unwrap();
 
@@ -465,7 +473,7 @@ mod tests {
         let _ = udp_find_broadcaster(1, BROADCAST_NAME.as_bytes(), Arc::clone(&key)).await;
 
         let k = key.read().await;
-        assert_eq!(*k.a_key, TEST_KEY);
+        assert_eq!(**k.a_key.expose(), TEST_KEY);
     }
 
     /// All `UdpNetworkerErrors` variants must produce a non-empty `Display` string.

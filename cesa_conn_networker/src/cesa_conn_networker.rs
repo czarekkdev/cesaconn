@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 /* TODO NOW:
 
 
@@ -40,7 +42,7 @@ use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 use crate::{
-    auth_snow::{DeviceKeypairs, Keys},
+    auth_snow::{AuthKey, DataKey, DeviceKeypairs, Keys},
     tcp_networker::{ActionType, NetworkerContext, connect, recv},
     udp_networker::{
         BROADCAST_NAME, UdpNetworkerErrors, udp_broadcast_presence, udp_find_broadcaster,
@@ -104,9 +106,12 @@ fn test_keys(password: &str) -> Option<Arc<RwLock<Keys>>> {
         *s = *p;
     }
 
-    match derive_key(test_psw, salt) {
+    match derive_key(test_psw, &salt) {
         // Zeroizing: wiped on drop
-        Ok(raw_key) => Some(Arc::new(RwLock::new(Keys::new(&raw_key, &raw_key)))),
+        Ok(raw_key) => Some(Arc::new(RwLock::new(Keys::new(
+            AuthKey::from_bytes(&raw_key),
+            DataKey::new(raw_key),
+        )))),
         Err(e) => {
             error!(error = %e, "failed to derive the test key");
             None

@@ -489,6 +489,7 @@ pub async fn connect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth_snow::{AuthKey, DataKey};
 
     const TEST_A_KEY: [u8; 32] = [0xAB; 32];
     const TEST_D_KEY: [u8; 32] = [0xCD; 32];
@@ -518,7 +519,10 @@ mod tests {
         pair_fallback: fn(&String, &[u8; 32]) -> bool,
     ) -> NetworkerContext {
         NetworkerContext {
-            keys: Arc::new(RwLock::new(Keys::new(&a_key, &d_key))),
+            keys: Arc::new(RwLock::new(Keys::new(
+                AuthKey::from_bytes(&a_key),
+                DataKey::from_bytes(&d_key),
+            ))),
             device_keypairs: Arc::new(DeviceKeypairs::generate().unwrap()),
             trusted_peers: Arc::new(RwLock::new(Vec::new())),
             pair_fallback,

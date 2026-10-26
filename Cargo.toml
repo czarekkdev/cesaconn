@@ -5,3 +5,14 @@ members = [
     "cesa_conn_tui",
 ]
 resolver = "3"
+
+# integer overflow panics instead of wrapping silently, in release too
+[profile.release]
+overflow-checks = true
+
+# Argon2 (64 MiB, 3 passes) is far too slow unoptimised; keep tests usable
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

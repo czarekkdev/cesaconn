@@ -29,8 +29,8 @@
 /// could lead to security vulnerabilities.
 const TRUSTED_PROCESSES: &[&str] = &["cesa_conn_tui", "cesa_conn_gui"];
 
-use crate::auth_snow::Keys;
 use crate::auth_snow::Salts;
+use crate::auth_snow::{AuthKey, DataKey, Keys};
 use std::fmt;
 use std::net::IpAddr;
 use std::os::unix::net::UnixStream;
@@ -771,7 +771,8 @@ pub async fn handle_data_server(
 
             // bytes 1–32 → a_key, bytes 33–64 → a_salt
             let (key, salt) = payload.split_at(32);
-            keys.write().await.a_key.clone_from_slice(key);
+            let key: &[u8; 32] = key.try_into().map_err(|_| IpcErrors::WrongDataSize)?;
+            keys.write().await.a_key = AuthKey::from_bytes(key);
             salts.write().await.a_salt.clone_from_slice(salt);
         }
         Some(ActionType::UpdateDataPassword) => {
@@ -784,7 +785,8 @@ pub async fn handle_data_server(
 
             // bytes 1–32 → d_key, bytes 33–64 → d_salt
             let (key, salt) = payload.split_at(32);
-            keys.write().await.d_key.clone_from_slice(key);
+            let key: &[u8; 32] = key.try_into().map_err(|_| IpcErrors::WrongDataSize)?;
+            keys.write().await.d_key = DataKey::from_bytes(key);
             salts.write().await.d_salt.clone_from_slice(salt);
         }
         Some(ActionType::Default) => {
@@ -1389,7 +1391,10 @@ mod tests {
         use crate::auth_snow::{Keys, Salts};
         use std::os::unix::net::UnixStream as StdUnixStream;
         let (mut client, _server) = StdUnixStream::pair().unwrap();
-        let keys = Arc::new(RwLock::new(Keys::new(&[0u8; 32], &[0u8; 32])));
+        let keys = Arc::new(RwLock::new(Keys::new(
+            AuthKey::from_bytes(&[0u8; 32]),
+            DataKey::from_bytes(&[0u8; 32]),
+        )));
         let salts = Arc::new(RwLock::new(Salts::new([0u8; 32], [0u8; 32])));
         let trusted_addrs = Arc::new(RwLock::new(Vec::<std::net::SocketAddr>::new()));
         let result = ipc_action(
@@ -1410,7 +1415,10 @@ mod tests {
         use crate::auth_snow::{Keys, Salts};
         use std::os::unix::net::UnixStream as StdUnixStream;
         let (mut client, _server) = StdUnixStream::pair().unwrap();
-        let keys = Arc::new(RwLock::new(Keys::new(&[0u8; 32], &[0u8; 32])));
+        let keys = Arc::new(RwLock::new(Keys::new(
+            AuthKey::from_bytes(&[0u8; 32]),
+            DataKey::from_bytes(&[0u8; 32]),
+        )));
         let salts = Arc::new(RwLock::new(Salts::new([0u8; 32], [0u8; 32])));
         let trusted_addrs = Arc::new(RwLock::new(Vec::<std::net::SocketAddr>::new()));
         // payload: 4 bytes for IPv4 (action byte already stripped by caller)
@@ -1433,7 +1441,10 @@ mod tests {
         use crate::auth_snow::{Keys, Salts};
         use std::os::unix::net::UnixStream as StdUnixStream;
         let (mut client, _server) = StdUnixStream::pair().unwrap();
-        let keys = Arc::new(RwLock::new(Keys::new(&[0u8; 32], &[0u8; 32])));
+        let keys = Arc::new(RwLock::new(Keys::new(
+            AuthKey::from_bytes(&[0u8; 32]),
+            DataKey::from_bytes(&[0u8; 32]),
+        )));
         let salts = Arc::new(RwLock::new(Salts::new([0u8; 32], [0u8; 32])));
         let trusted_addrs = Arc::new(RwLock::new(Vec::<std::net::SocketAddr>::new()));
         // payload: 32 key bytes + 32 salt bytes
@@ -1456,7 +1467,10 @@ mod tests {
         use crate::auth_snow::{Keys, Salts};
         use std::os::unix::net::UnixStream as StdUnixStream;
         let (mut client, _server) = StdUnixStream::pair().unwrap();
-        let keys = Arc::new(RwLock::new(Keys::new(&[0u8; 32], &[0u8; 32])));
+        let keys = Arc::new(RwLock::new(Keys::new(
+            AuthKey::from_bytes(&[0u8; 32]),
+            DataKey::from_bytes(&[0u8; 32]),
+        )));
         let salts = Arc::new(RwLock::new(Salts::new([0u8; 32], [0u8; 32])));
         let trusted_addrs = Arc::new(RwLock::new(Vec::<std::net::SocketAddr>::new()));
         let payload = [0u8; 64];

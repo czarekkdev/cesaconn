@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! CesaConn terminal UI.
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};

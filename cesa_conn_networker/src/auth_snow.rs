@@ -343,7 +343,7 @@ impl SecureConnection {
     /// one, and each direction has its own key.
     fn data_key(
         &self,
-        d_key: &Zeroizing<[u8; 32]>,
+        d_key: &DataKey,
         sending: bool,
     ) -> Result<Zeroizing<[u8; 32]>, AuthSnowErrors> {
         let label: &[u8] = if sending == self.is_initiator {
@@ -354,9 +354,12 @@ impl SecureConnection {
 
         let mut key = Zeroizing::new([0u8; 32]);
 
-        SimpleHkdf::<Blake2s256>::new(Some(self.handshake_hash.as_slice()), d_key.as_slice())
-            .expand(label, key.as_mut_slice())
-            .map_err(|_| AuthSnowErrors::FailedToExpandHkdf)?;
+        SimpleHkdf::<Blake2s256>::new(
+            Some(self.handshake_hash.as_slice()),
+            d_key.expose().as_slice(),
+        )
+        .expand(label, key.as_mut_slice())
+        .map_err(|_| AuthSnowErrors::FailedToExpandHkdf)?;
 
         Ok(key)
     }
@@ -370,7 +373,7 @@ impl SecureConnection {
     pub async fn write_encrypted(
         &mut self,
         data: &[u8],
-        d_key: &Zeroizing<[u8; 32]>,
+        d_key: &DataKey,
         tag: Tags,
     ) -> Result<(), AuthSnowErrors> {
         let key = self.data_key(d_key, true)?;
@@ -394,7 +397,7 @@ impl SecureConnection {
     pub async fn read_encrypted(
         &mut self,
         len: usize,
-        d_key: &Zeroizing<[u8; 32]>,
+        d_key: &DataKey,
         tag: Tags,
     ) -> Result<Zeroizing<Vec<u8>>, AuthSnowErrors> {
         if len < DATA_LAYER_OVERHEAD {
@@ -410,9 +413,7 @@ impl SecureConnection {
             .map_err(|_| AuthSnowErrors::FailedToConvertToArray)?;
 
         // GCM tag check: wrong d_key or tampered data fails here
-        Ok(Zeroizing::new(
-            decrypt(&key, ciphertext, nonce).map_err(|_| AuthSnowErrors::FailedToDecryptData)?,
-        ))
+        decrypt(&key, ciphertext, nonce).map_err(|_| AuthSnowErrors::FailedToDecryptData)
     }
 
     /// Tags a copy of `src`, encrypts it and sends it to the peer.
@@ -549,6 +550,52 @@ impl SecureConnection {
     }
 }
 
+/// Authentication key (`a_key`): the SPAKE2 password every device shares.
+///
+/// A newtype, so it can't be passed where the data key is expected (or the
+/// other way round). No `Debug`/`Copy`; read it only through [`Self::expose`].
+#[derive(Clone)]
+pub struct AuthKey(Zeroizing<[u8; 32]>);
+
+/// Data key (`d_key`): input of the inner AES-256-GCM data layer.
+/// Same rules as [`AuthKey`].
+#[derive(Clone)]
+pub struct DataKey(Zeroizing<[u8; 32]>);
+
+impl AuthKey {
+    /// Takes ownership of an already zeroizing key (e.g. from `derive_key`).
+    pub fn new(key: Zeroizing<[u8; 32]>) -> Self {
+        Self(key)
+    }
+
+    /// Copies a key from a borrowed array.
+    pub fn from_bytes(key: &[u8; 32]) -> Self {
+        Self(Zeroizing::new(*key))
+    }
+
+    /// The raw key bytes.
+    pub fn expose(&self) -> &Zeroizing<[u8; 32]> {
+        &self.0
+    }
+}
+
+impl DataKey {
+    /// Takes ownership of an already zeroizing key (e.g. from `derive_key`).
+    pub fn new(key: Zeroizing<[u8; 32]>) -> Self {
+        Self(key)
+    }
+
+    /// Copies a key from a borrowed array.
+    pub fn from_bytes(key: &[u8; 32]) -> Self {
+        Self(Zeroizing::new(*key))
+    }
+
+    /// The raw key bytes.
+    pub fn expose(&self) -> &Zeroizing<[u8; 32]> {
+        &self.0
+    }
+}
+
 /// Holds the two pre-shared 32-byte keys used by the networker.
 ///
 /// * `a_key` — authentication key, used as the SPAKE2 password during pairing/connecting.
@@ -556,8 +603,8 @@ impl SecureConnection {
 ///
 /// Both fields are wrapped in `Zeroizing` so they are wiped from memory on drop.
 pub struct Keys {
-    pub a_key: Zeroizing<[u8; 32]>,
-    pub d_key: Zeroizing<[u8; 32]>,
+    pub a_key: AuthKey,
+    pub d_key: DataKey,
 }
 
 impl Keys {
@@ -570,30 +617,26 @@ impl Keys {
         d_key_bytes.copy_from_slice(&data[32..]);
 
         Self {
-            a_key: a_key_bytes,
-            d_key: d_key_bytes,
+            a_key: AuthKey::new(a_key_bytes),
+            d_key: DataKey::new(d_key_bytes),
         }
     }
 
     /// Packs both keys into `data` (`a_key` in bytes 0–31, `d_key` in bytes 32–63). Inverse of `from_ref`.
     pub fn to_ref(&self, data: &mut [u8; 64]) {
-        data[..32].copy_from_slice(&*self.a_key);
-        data[32..].copy_from_slice(&*self.d_key);
+        data[..32].copy_from_slice(self.a_key.expose().as_slice());
+        data[32..].copy_from_slice(self.d_key.expose().as_slice());
     }
 
     /// Replaces both keys with the ones from `data`.
     pub fn update(&mut self, data: Self) {
-        *self.a_key = *data.a_key;
-        *self.d_key = *data.d_key;
+        self.a_key = data.a_key;
+        self.d_key = data.d_key;
     }
 
-    /// Copies two 32-byte keys into `Zeroizing` so they are wiped from memory on drop.
-    /// Taken by reference so callers don't leave an extra un-wiped copy behind.
-    pub fn new(a_key: &[u8; 32], d_key: &[u8; 32]) -> Self {
-        Self {
-            a_key: Zeroizing::new(*a_key),
-            d_key: Zeroizing::new(*d_key),
-        }
+    /// Bundles both keys; the types make it impossible to swap them.
+    pub fn new(a_key: AuthKey, d_key: DataKey) -> Self {
+        Self { a_key, d_key }
     }
 }
 
@@ -657,7 +700,7 @@ impl DeviceKeypairs {
     pub fn generate() -> Result<Self, AuthSnowErrors> {
         Ok(Self {
             x25519_kep: generate_new_key_pair(
-                *random_array::<32>().map_err(|_| AuthSnowErrors::FailedToGenerateRandomData)?,
+                &random_array::<32>().map_err(|_| AuthSnowErrors::FailedToGenerateRandomData)?,
             ),
             mldsa_kep: generate_key_pair(
                 *random_array::<32>().map_err(|_| AuthSnowErrors::FailedToGenerateRandomData)?,
@@ -1372,7 +1415,7 @@ type Identified = (SecureConnection, TrustedPeer, Zeroizing<[u8; 32]>, bool);
 /// Returns `Ok(None)` if the peer failed SPAKE2 confirmation.
 async fn handshake_server(
     mut incoming_connection: IncomingConnection,
-    a_key: &Zeroizing<[u8; 32]>,
+    a_key: &AuthKey,
     device_keypairs: &DeviceKeypairs,
     trusted_peers: &TrustedPeers,
 ) -> Result<Option<Identified>, AuthSnowErrors> {
@@ -1427,7 +1470,7 @@ async fn handshake_server(
 /// Returns `Ok(None)` if the server's SPAKE2 confirmation was wrong.
 async fn handshake_client(
     mut outgoing_connection: IncomingConnection,
-    a_key: &Zeroizing<[u8; 32]>,
+    a_key: &AuthKey,
     device_keypairs: &DeviceKeypairs,
     trusted_peers: &TrustedPeers,
 ) -> Result<Option<Identified>, AuthSnowErrors> {
@@ -1580,7 +1623,10 @@ mod tests {
     impl Device {
         fn new(a_key: [u8; 32]) -> Self {
             Self {
-                keys: Arc::new(RwLock::new(Keys::new(&a_key, &[0xCD; 32]))),
+                keys: Arc::new(RwLock::new(Keys::new(
+                    AuthKey::from_bytes(&a_key),
+                    DataKey::from_bytes(&[0xCD; 32]),
+                ))),
                 keypairs: DeviceKeypairs::generate().unwrap(),
                 peers: Arc::new(RwLock::new(Vec::new())),
             }
@@ -1730,7 +1776,7 @@ mod tests {
 
         // same Noise static key, new ML-DSA identity
         client.keypairs = DeviceKeypairs {
-            x25519_kep: generate_new_key_pair(*client.keypairs.x25519_kep.private),
+            x25519_kep: generate_new_key_pair(&client.keypairs.x25519_kep.private),
             mldsa_kep: generate_key_pair(*random_array::<32>().unwrap()),
         };
 
@@ -1919,8 +1965,8 @@ mod tests {
         let (mut server_conn, _) = s.unwrap().unwrap();
         let (mut client_conn, _) = c.unwrap().unwrap();
 
-        let send_key = Zeroizing::new([1u8; 32]);
-        let recv_key = Zeroizing::new([2u8; 32]);
+        let send_key = DataKey::from_bytes(&[1u8; 32]);
+        let recv_key = DataKey::from_bytes(&[2u8; 32]);
 
         let send = client_conn.write_encrypted(b"clipboard", &send_key, Tags::Regular);
         let recv = server_conn.read_encrypted(9 + DATA_LAYER_OVERHEAD, &recv_key, Tags::Regular);
@@ -1934,7 +1980,7 @@ mod tests {
     async fn test_data_keys_bound_to_direction_and_connection() {
         let server = Device::new(TEST_A_KEY);
         let client = Device::new(TEST_A_KEY);
-        let d_key = Zeroizing::new([9u8; 32]);
+        let d_key = DataKey::from_bytes(&[9u8; 32]);
 
         let (s, c) = handshake(&server, &client, accept_all, accept_all).await;
         let (server_conn, _) = s.unwrap().unwrap();
