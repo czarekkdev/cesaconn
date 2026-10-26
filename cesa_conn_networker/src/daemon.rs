@@ -2,7 +2,7 @@
 TODO:
 start the networker once the vault is open (device identity + trusted peers go into the vault first)
 pairing prompt over IPC (UI command set is defined together with the UI)
-salt syncing between devices (docs/design/salt-sync-and-clipboard.md)
+salt syncing between devices (docs/design/daemon.md, section 11)
 Linux keychain backend (Secret Service): until then Linux keeps the keys in RAM only
 data-protection keychain (WhenUnlockedThisDeviceOnly) together with release signing
  */
