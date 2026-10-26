@@ -1,4 +1,5 @@
 // Fixtures for network.yml
+use crate::tcp_networker::recv;
 async fn recv(conn: &mut TcpStream, init_buf: &[u8]) -> Result<(), E> {
     let size_bytes = &mut [0u8; 8];
     size_bytes.copy_from_slice(&init_buf[1..9]);
@@ -113,4 +114,15 @@ fn upper_bound_ok(size_buffer: [u8; 8]) {
         return;
     }
     let b = vec![0u8; size as usize];
+}
+
+async fn free_fn_named_recv(listener: &TcpListener) {
+    // ok: cesa.net.read-without-timeout
+    // ruleid: cesa.net.unwrap-on-io
+    recv(
+        &listener,
+        keys,
+    )
+    .await
+    .unwrap();
 }

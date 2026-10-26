@@ -229,7 +229,7 @@ impl App {
         let i = self
             .device_list_state
             .selected()
-            .map(|i| (i + 1) % self.devices.len())
+            .map(|i| wrap_next(i, self.devices.len()))
             .unwrap_or(0);
         self.device_list_state.select(Some(i));
     }
@@ -241,13 +241,7 @@ impl App {
         let i = self
             .device_list_state
             .selected()
-            .map(|i| {
-                if i == 0 {
-                    self.devices.len() - 1
-                } else {
-                    i - 1
-                }
-            })
+            .map(|i| wrap_prev(i, self.devices.len()))
             .unwrap_or(0);
         self.device_list_state.select(Some(i));
     }
@@ -261,14 +255,14 @@ impl App {
     fn next_setting(&mut self) {
         let len = self.active_settings().len();
         if len > 0 {
-            self.settings_selected = (self.settings_selected + 1) % len;
+            self.settings_selected = wrap_next(self.settings_selected, len);
         }
     }
 
     fn prev_setting(&mut self) {
         let len = self.active_settings().len();
         if len > 0 {
-            self.settings_selected = self.settings_selected.checked_sub(1).unwrap_or(len - 1);
+            self.settings_selected = wrap_prev(self.settings_selected, len);
         }
     }
 }
@@ -318,13 +312,11 @@ fn handle_input(app: &mut App) -> io::Result<()> {
             KeyCode::Down | KeyCode::Char('j') => app.next_device(),
             KeyCode::Char('n') => app.active_popup = ActivePopup::AddDevice,
             KeyCode::Char('d') => {
-                let addr_str = app
-                    .device_list_state
-                    .selected()
+                let selected = app.device_list_state.selected();
+                let addr_str = selected
                     .and_then(|i| app.devices.get(i))
                     .map(|d| d.addr.clone());
-                if let Some(addr_str) = addr_str {
-                    let i = app.device_list_state.selected().unwrap();
+                if let (Some(addr_str), Some(i)) = (addr_str, selected) {
                     if let Some(dev) = app.devices.get_mut(i) {
                         dev.status = DeviceStatus::Disconnected;
                     }
@@ -351,7 +343,7 @@ fn handle_input(app: &mut App) -> io::Result<()> {
                 app.log_scroll = app.log_scroll.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                app.log_scroll += 1;
+                app.log_scroll = app.log_scroll.saturating_add(1);
             }
             KeyCode::Char('f') => {
                 app.log_follow = !app.log_follow;
@@ -686,7 +678,7 @@ fn render_logs(frame: &mut Frame, area: Rect, app: &mut App) {
     let inner_height = area.height.saturating_sub(2) as usize;
 
     if app.log_follow {
-        app.log_scroll = app.logs.len().saturating_sub(inner_height) as u16;
+        app.log_scroll = to_u16(app.logs.len().saturating_sub(inner_height));
     }
 
     let lines: Vec<Line> = app
@@ -741,7 +733,7 @@ fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
 
     let [help_area, right_area] = Layout::horizontal([
         Constraint::Min(0),
-        Constraint::Length(right_str.len() as u16),
+        Constraint::Length(to_u16(right_str.len())),
     ])
     .areas(area);
 
@@ -760,12 +752,7 @@ fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
 fn render_add_popup(frame: &mut Frame, area: Rect, app: &App) {
     let w = 52u16.min(area.width);
     let h = 5u16.min(area.height);
-    let popup = Rect::new(
-        area.x + (area.width - w) / 2,
-        area.y + (area.height - h) / 2,
-        w,
-        h,
-    );
+    let popup = centered_rect(area, w, h);
 
     frame.render_widget(Clear, popup);
     frame.render_widget(
@@ -779,7 +766,13 @@ fn render_add_popup(frame: &mut Frame, area: Rect, app: &App) {
         popup,
     );
 
-    frame.set_cursor_position((popup.x + 2 + app.input_buf.len() as u16, popup.y + 1));
+    frame.set_cursor_position((
+        popup
+            .x
+            .saturating_add(2)
+            .saturating_add(to_u16(app.input_buf.len())),
+        popup.y.saturating_add(1),
+    ));
 }
 
 fn render_edit_setting_popup(frame: &mut Frame, area: Rect, app: &App) {
@@ -795,14 +788,12 @@ fn render_edit_setting_popup(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     let title = format!(" Edit: {} ", setting.label);
-    let w = (title.len() as u16 + 10).max(52).min(area.width);
+    let w = to_u16(title.len())
+        .saturating_add(10)
+        .max(52)
+        .min(area.width);
     let h = 5u16.min(area.height);
-    let popup = Rect::new(
-        area.x + (area.width - w) / 2,
-        area.y + (area.height - h) / 2,
-        w,
-        h,
-    );
+    let popup = centered_rect(area, w, h);
 
     frame.render_widget(Clear, popup);
     frame.render_widget(
@@ -816,7 +807,13 @@ fn render_edit_setting_popup(frame: &mut Frame, area: Rect, app: &App) {
         popup,
     );
 
-    frame.set_cursor_position((popup.x + 2 + display_input.len() as u16, popup.y + 1));
+    frame.set_cursor_position((
+        popup
+            .x
+            .saturating_add(2)
+            .saturating_add(to_u16(display_input.len())),
+        popup.y.saturating_add(1),
+    ));
 }
 
 fn render_security_warning_popup(
@@ -839,12 +836,7 @@ fn render_security_warning_popup(
 
     let w = 60u16.min(area.width);
     let h = 11u16.min(area.height);
-    let popup = Rect::new(
-        area.x + (area.width - w) / 2,
-        area.y + (area.height - h) / 2,
-        w,
-        h,
-    );
+    let popup = centered_rect(area, w, h);
 
     let mut lines = vec![Line::from("")];
     for msg_line in warn_msg.lines() {
@@ -902,6 +894,31 @@ pub fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// Next index in a list of `len` items, wrapping to 0 (len 0 -> 0).
+fn wrap_next(i: usize, len: usize) -> usize {
+    i.saturating_add(1).checked_rem(len).unwrap_or(0)
+}
+
+/// Previous index in a list of `len` items, wrapping to the last one.
+fn wrap_prev(i: usize, len: usize) -> usize {
+    i.checked_sub(1).unwrap_or(len.saturating_sub(1))
+}
+
+/// usize -> u16 for terminal coordinates, clamped instead of truncated.
+fn to_u16(n: usize) -> u16 {
+    u16::try_from(n).unwrap_or(u16::MAX)
+}
+
+/// A `w` x `h` rect centered in `area` (no overflow/underflow).
+fn centered_rect(area: Rect, w: u16, h: u16) -> Rect {
+    Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(w) / 2),
+        area.y.saturating_add(area.height.saturating_sub(h) / 2),
+        w,
+        h,
+    )
+}
 
 #[cfg(test)]
 mod tests {

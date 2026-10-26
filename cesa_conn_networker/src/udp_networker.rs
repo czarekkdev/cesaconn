@@ -87,7 +87,9 @@ pub async fn udp_broadcast_presence(
         "udp_broadcast_presence started"
     );
 
-    // Bind to all interfaces on port 6363
+    // Bind to all interfaces on port 6363. Intentional: LAN broadcast discovery must
+    // work on whichever interface the peer is on; packets are encrypted with a_key.
+    // nosemgrep: cesa.net.bind-all-interfaces
     let socket = UdpSocket::bind("0.0.0.0:6363").await.map_err(|e| {
         error!(error = %e, addr = "0.0.0.0:6363", "failed to bind UDP socket for broadcast");
         UdpNetworkerErrors::FailedToBindSocket
@@ -173,7 +175,9 @@ pub async fn udp_find_broadcaster(
         "udp_find_broadcaster started, waiting for broadcast packets"
     );
 
-    // Bind to all interfaces on port 6363 — same port as broadcaster
+    // Bind to all interfaces on port 3636 to receive broadcasts. Intentional: broadcast
+    // packets only arrive on a wildcard bind; anything that fails decryption is dropped.
+    // nosemgrep: cesa.net.bind-all-interfaces
     let socket = UdpSocket::bind("0.0.0.0:3636").await.map_err(|e| {
         error!(error = %e, addr = "0.0.0.0:3636", "failed to bind UDP socket for discovery");
         UdpNetworkerErrors::FailedToBindSocket
@@ -267,7 +271,7 @@ mod tests {
     /// Wraps a raw 32-byte key in `Keys` (d_key zeroed — UDP only uses a_key) and returns it
     /// behind `Arc<RwLock>` to match the signatures of `udp_broadcast_presence` / `udp_find_broadcaster`.
     fn make_test_key(key: [u8; 32]) -> Arc<RwLock<Keys>> {
-        Arc::new(RwLock::new(Keys::new(key, [0u8; 32])))
+        Arc::new(RwLock::new(Keys::new(&key, &[0u8; 32])))
     }
 
     /// `UdpSocket::bind` must succeed on any available port.
