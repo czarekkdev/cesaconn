@@ -2,7 +2,6 @@
 TODO:
 
 add tests
-add client-side
 */
 
 use std::time::Duration;
@@ -163,6 +162,116 @@ pub async fn spake2_confirm_mutual_auth_server(
 
     transcript.extend_from_slice(&confirm_recieved);
     transcript.extend_from_slice(&confirm_send);
+
+    Ok(true)
+}
+
+/// Client side of the SPAKE2 exchange (role A) using `a_key` as the password.
+///
+/// 1. -> our SPAKE2 message
+/// 2. <- server's SPAKE2 message
+///
+/// Both messages (tags included) are appended to `transcript` in the same
+/// order as on the server: client's message, then the server's.
+/// Returns the SPAKE2 session key (`key1`), which is still unconfirmed,
+/// see [`spake2_confirm_mutual_auth_client`].
+pub async fn spake2_exchange_client(
+    stream: &mut TcpStream,
+    a_key: &Zeroizing<[u8; 32]>,
+    transcript: &mut Zeroizing<Vec<u8>>,
+) -> Result<Zeroizing<Vec<u8>>, AuthSnowErrors> {
+    // identities must match the server's `start_b` call exactly
+    let (s1, mut outbound_msg) = Spake2::<Ed25519Group>::start_a(
+        &Password::new(a_key),
+        &Identity::new(b"client"),
+        &Identity::new(b"server"),
+    );
+
+    OutboundMsg.tag(&mut outbound_msg);
+
+    // both sides' messages have the same length (side byte + point + tag)
+    let mut inbound_msg = Zeroizing::new(vec![0u8; outbound_msg.len()]);
+
+    // 1. our message
+    let write = stream.write_all(&outbound_msg);
+
+    timeout(Duration::from_secs(TIMEOUT), write)
+        .await
+        .map_err(|_| AuthSnowErrors::WriteTimeout)?
+        .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
+
+    // 2. server's message
+    let read = stream.read_exact(&mut inbound_msg);
+
+    timeout(Duration::from_secs(TIMEOUT), read)
+        .await
+        .map_err(|_| AuthSnowErrors::ReadTimeout)?
+        .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
+
+    // order: our message, then the server's (same as on the server)
+    transcript.extend_from_slice(&outbound_msg);
+    transcript.extend_from_slice(&inbound_msg);
+
+    if !OutboundMsg.untag(&mut inbound_msg) {
+        return Err(AuthSnowErrors::WrongTag);
+    }
+
+    Ok(Zeroizing::new(s1.finish(&inbound_msg).map_err(|_| {
+        AuthSnowErrors::FailedToFinishSpake2Exchange
+    })?))
+}
+
+/// Key confirmation for SPAKE2, client side.
+///
+/// 1. -> our confirmation value
+/// 2. <- server's confirmation value
+///
+/// The client proves first (see [`spake2_confirm_mutual_auth_server`]).
+/// Both values are appended to `transcript` on success.
+///
+/// Returns `Ok(false)` if the server's confirmation value is wrong.
+pub async fn spake2_confirm_mutual_auth_client(
+    stream: &mut TcpStream,
+    key1: &Zeroizing<Vec<u8>>,
+    transcript: &mut Zeroizing<Vec<u8>>,
+) -> Result<bool, AuthSnowErrors> {
+    let hk = SimpleHkdf::<Blake2s256>::new(None, key1);
+
+    let mut confirm_send = Zeroizing::new(vec![0u8; 32]);
+
+    hk.expand(b"CPQHA-confirm-client-to-server", &mut confirm_send)
+        .map_err(|_| AuthSnowErrors::FailedToExpandHkdf)?;
+
+    let mut confirm_expect = Zeroizing::new(vec![0u8; 32]);
+
+    hk.expand(b"CPQHA-confirm-server-to-client", &mut confirm_expect)
+        .map_err(|_| AuthSnowErrors::FailedToExpandHkdf)?;
+
+    // 1. our confirmation
+    let write = stream.write_all(&confirm_send);
+
+    timeout(Duration::from_secs(TIMEOUT), write)
+        .await
+        .map_err(|_| AuthSnowErrors::WriteTimeout)?
+        .map_err(|_| AuthSnowErrors::FailedToWriteToStream)?;
+
+    // 2. server's confirmation (the server closes instead if ours was wrong)
+    let mut confirm_received = Zeroizing::new(vec![0u8; 32]);
+
+    let read = stream.read_exact(&mut confirm_received);
+
+    timeout(Duration::from_secs(TIMEOUT), read)
+        .await
+        .map_err(|_| AuthSnowErrors::ReadTimeout)?
+        .map_err(|_| AuthSnowErrors::FailedToReadFromStream)?;
+
+    // constant-time compare, so timing doesn't leak how many bytes matched
+    if confirm_expect.ct_eq(&confirm_received).unwrap_u8() != 1 {
+        return Ok(false);
+    }
+
+    transcript.extend_from_slice(&confirm_send);
+    transcript.extend_from_slice(&confirm_received);
 
     Ok(true)
 }
