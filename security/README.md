@@ -19,8 +19,13 @@ code scanning (Security -> Code scanning).
 | Secrets in git | gitleaks | any detected secret in history / pushed commits | |
 | Panics | clippy | | `unwrap`/`expect`/`panic`/indexing/arithmetic overflow/truncating casts outside tests |
 
-Code that does not compile cannot be linted by clippy or race-tested; that is
-reported as a note (it does not block - semgrep still covers it).
+Code that does not compile cannot be linted by clippy or race-tested. The gate
+then reports **PASSED - PARTIAL COVERAGE**: a warning banner at the top of the
+report, a yellow `::warning` annotation on the run/PR, and a `NOT ANALYSED`
+line in the log listing exactly what was skipped (crates that did not build,
+tools that were not installed, crashed or timed out). It does not block by
+default; set `CESA_REQUIRE_FULL_COVERAGE=1` (env or workflow) to make any gap
+fail the run.
 
 ## Run locally
 
