@@ -6,15 +6,16 @@ use std::fmt;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
 
 use crate::auth_snow::{
-    DeviceKeypairs, Keys, SECURE_MSG_MAX_PAYLOAD, SecureConnection, Tags, TrustedPeer,
+    AuthSnowErrors, DATA_LAYER_OVERHEAD, DeviceKeypairs, Keys, SecureConnection, Tags, TrustedPeer,
     TrustedPeers, auth_incoming, auth_outgoing,
 };
+use crate::guess_limiter::GuessLimiter;
 
 /// Identifies what kind of action/data is being sent in a packet.
 /// Encoded as a single byte at position [0] of the init header.
@@ -54,10 +55,14 @@ impl ActionType {
 /// Init header: action type (1) + payload length as little-endian u64 (8).
 const INIT_HEADER_LEN: usize = 9;
 
-/// Upper bound for one data payload declared in the init header.
-/// A payload has to fit into a single [`SecureConnection`] message until
-/// chunking lands (see the chunking TODO in auth_snow).
-pub const MAX_DATA_PACKET_LEN: u64 = SECURE_MSG_MAX_PAYLOAD as u64;
+/// Upper bound for one data payload declared in the init header (16 MiB).
+/// Checked before allocating, the payload itself is sent in chunks.
+pub const MAX_DATA_PACKET_LEN: u64 = 16 * 1024 * 1024;
+
+/// How many incoming connections may be handled at the same time.
+/// Each one costs SPAKE2 + ML-KEM work before the peer is authenticated,
+/// so without a cap a connection flood exhausts CPU, memory and tasks.
+pub const MAX_CONCURRENT_CONNECTIONS: usize = 16;
 
 /// A connection that is being authenticated, incoming or outgoing.
 pub struct IncomingConnection {
@@ -88,6 +93,8 @@ pub struct NetworkerContext {
     pub trusted_peers: TrustedPeers,
     /// Asks the user to confirm a new device (name, handshake hash).
     pub pair_fallback: fn(&String, &[u8; 32]) -> bool,
+    /// Counts wrong passwords per source and locks guessers out.
+    pub guess_limiter: Arc<GuessLimiter>,
 }
 
 /// One packet received from an authenticated peer.
@@ -118,6 +125,10 @@ pub enum TcpNetworkerErrors {
     FailedToWriteToStream,
     /// Data packet larger than `MAX_DATA_PACKET_LEN` — rejected before allocating / sending.
     DataTooLarge,
+    /// The payload failed the `d_key` layer: the peer uses a different data password.
+    FailedToDecryptData,
+    /// The peer is locked out after too many wrong passwords ([`GuessLimiter`]).
+    LockedOut,
 }
 
 impl fmt::Display for TcpNetworkerErrors {
@@ -132,6 +143,12 @@ impl fmt::Display for TcpNetworkerErrors {
             TcpNetworkerErrors::FailedToConnect => write!(f, "failed to make a connection request"),
             TcpNetworkerErrors::FailedToWriteToStream => write!(f, "failed to write to stream"),
             TcpNetworkerErrors::DataTooLarge => write!(f, "declared data packet is too large"),
+            TcpNetworkerErrors::FailedToDecryptData => {
+                write!(f, "failed to decrypt data (different d_key?)")
+            }
+            TcpNetworkerErrors::LockedOut => {
+                write!(f, "peer is locked out after too many wrong passwords")
+            }
         }
     }
 }
@@ -160,10 +177,13 @@ async fn read_secure(
 ///
 /// 1. authentication ([`auth_incoming`]): SPAKE2 + hybrid KEX + Noise +
 ///    ML-DSA signatures; unknown devices are paired only if both users confirm
-/// 2. <- init header (9 bytes): [0] = ActionType, [1..9] = payload length (u64 LE)
-/// 3. <- payload (only if the length is not 0)
+/// 2. <- init header (9 bytes): [0] = ActionType, [1..9] = encrypted payload
+///    length (u64 LE, plaintext + [`DATA_LAYER_OVERHEAD`]), 0 = no payload
+/// 3. <- payload, encrypted with a key derived from `d_key`, in chunks
+///    ([`SecureConnection::read_encrypted`])
 ///
-/// Everything after step 1 is encrypted and authenticated by the Noise transport.
+/// Everything after step 1 is encrypted and authenticated by the Noise
+/// transport; the payload additionally by the `d_key` layer.
 ///
 /// Returns `Ok(None)` if the peer doesn't know `a_key` (closed without data).
 pub async fn recv_handler(
@@ -172,7 +192,15 @@ pub async fn recv_handler(
 ) -> Result<Option<ReceivedPacket>, TcpNetworkerErrors> {
     let (stream, peer_addr) = incoming_connection;
 
+    // locked out for guessing the password: no handshake at all
+    if context.guess_limiter.is_locked(peer_addr.ip()).await {
+        warn!(%peer_addr, "peer is locked out after wrong passwords, closing");
+        return Err(TcpNetworkerErrors::LockedOut);
+    }
+
     debug!(%peer_addr, "recv_handler started, authenticating peer");
+
+    let context_keys = context.keys.clone();
 
     // 1. authentication
     let Some((mut secure_connection, peer)) = auth_incoming(
@@ -188,9 +216,13 @@ pub async fn recv_handler(
         TcpNetworkerErrors::FailedToAuthenticate
     })?
     else {
+        // the peer sent a wrong confirmation value: one password guess
         warn!(%peer_addr, "peer failed SPAKE2 confirmation (wrong a_key), closing");
+        context.guess_limiter.record_failure(peer_addr.ip()).await;
         return Ok(None);
     };
+
+    context.guess_limiter.record_success(peer_addr.ip()).await;
 
     debug!(%peer_addr, peer = %peer.name(), "peer authenticated, reading init header");
 
@@ -208,7 +240,7 @@ pub async fn recv_handler(
     );
 
     // the size comes from the peer: bound it before allocating
-    if size > MAX_DATA_PACKET_LEN {
+    if size > MAX_DATA_PACKET_LEN.saturating_add(DATA_LAYER_OVERHEAD as u64) {
         warn!(%peer_addr, size, max = MAX_DATA_PACKET_LEN, "declared data packet too large, rejecting");
         return Err(TcpNetworkerErrors::DataTooLarge);
     }
@@ -218,11 +250,23 @@ pub async fn recv_handler(
     // unknown values fall back to Default, so newer peers stay compatible
     let action_type = ActionType::from_u8(*action_byte).unwrap_or(ActionType::Default);
 
-    // 3. payload
+    // 3. payload (size bounded above)
     let data = if size == 0 {
         Zeroizing::new(Vec::new())
     } else {
-        read_secure(&mut secure_connection, size, peer_addr).await?
+        // cloned, so the read lock is released before any network I/O
+        let d_key = context_keys.read().await.d_key.clone();
+
+        secure_connection
+            .read_encrypted(size, &d_key, Tags::Regular)
+            .await
+            .map_err(|e| {
+                warn!(%peer_addr, error = %e, "failed to read data packet from peer");
+                match e {
+                    AuthSnowErrors::FailedToDecryptData => TcpNetworkerErrors::FailedToDecryptData,
+                    _ => TcpNetworkerErrors::FailedToReadFromStream,
+                }
+            })?
     };
 
     info!(
@@ -258,6 +302,8 @@ pub async fn recv(
 
     info!(%local_addr, "TCP listener started, waiting for incoming connections");
 
+    let connection_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+
     loop {
         let cloned_token = cancellation_token.clone();
         let context_clone = context.clone();
@@ -277,9 +323,21 @@ pub async fn recv(
         };
 
         let peer_addr = incoming_connection.1;
+
+        // no free slot: close right away instead of queueing, so a flood
+        // can't pile up waiting tasks
+        let Ok(slot) = connection_slots.clone().try_acquire_owned() else {
+            warn!(%local_addr, %peer_addr, max = MAX_CONCURRENT_CONNECTIONS, "too many connections, dropping");
+            drop(incoming_connection);
+            continue;
+        };
+
         info!(%local_addr, %peer_addr, "accepted incoming TCP connection, spawning recv_handler");
 
         tokio::spawn(async move {
+            // held until the handler finishes, frees the slot on drop
+            let _slot = slot;
+
             select! {
                 _ = cloned_token.cancelled() => {
                     info!(%peer_addr, "cancellation token fired mid-handler, dropping recv_handler task");
@@ -309,8 +367,9 @@ pub async fn recv(
 /// sends one packet.
 ///
 /// 1. authentication ([`auth_outgoing`]), pairs the device if needed
-/// 2. -> init header (9 bytes): [0] = ActionType, [1..9] = payload length (u64 LE)
-/// 3. -> payload (only if not empty)
+/// 2. -> init header (9 bytes): [0] = ActionType, [1..9] = encrypted payload length (u64 LE)
+/// 3. -> payload encrypted with the `d_key` layer, in chunks
+///    ([`SecureConnection::write_encrypted`]), if not empty
 ///
 /// `ConnectNewDevice` only pairs: it sends a header with length 0 and no payload.
 pub async fn connect_handler(
@@ -330,40 +389,69 @@ pub async fn connect_handler(
         return Err(TcpNetworkerErrors::DataTooLarge);
     }
 
+    // cloned, so the read lock is released before any network I/O
+    let d_key = context.keys.read().await.d_key.clone();
+
+    // a fake server gets one password guess from our confirmation value per
+    // connection, so servers that keep failing are locked out as well
+    if context.guess_limiter.is_locked(connect_addr.ip()).await {
+        warn!(%connect_addr, "server is locked out after failed confirmations, not connecting");
+        return Err(TcpNetworkerErrors::LockedOut);
+    }
+
+    let guess_limiter = context.guess_limiter.clone();
+
     // 1. authentication
-    let Some((mut secure_connection, peer)) = auth_outgoing(
+    let authenticated = auth_outgoing(
         context.keys,
         &context.device_keypairs,
         context.trusted_peers,
         IncomingConnection::new(outgoing_connection, connect_addr),
         context.pair_fallback,
     )
-    .await
-    .map_err(|e| {
-        warn!(%connect_addr, error = %e, "authentication of outgoing connection failed");
-        TcpNetworkerErrors::FailedToAuthenticate
-    })?
-    else {
+    .await;
+
+    let authenticated = match authenticated {
+        Ok(authenticated) => authenticated,
+        Err(e) => {
+            // after we sent our confirmation value, any failure (wrong value,
+            // the server hanging up or stalling) may have been a guess against it
+            if matches!(
+                e,
+                AuthSnowErrors::FailedToConfirmMutualAuthSpake2 | AuthSnowErrors::HandshakeTimeout
+            ) {
+                guess_limiter.record_failure(connect_addr.ip()).await;
+            }
+            warn!(%connect_addr, error = %e, "authentication of outgoing connection failed");
+            return Err(TcpNetworkerErrors::FailedToAuthenticate);
+        }
+    };
+
+    let Some((mut secure_connection, peer)) = authenticated else {
         warn!(%connect_addr, "server failed SPAKE2 confirmation (wrong a_key), closing");
+        guess_limiter.record_failure(connect_addr.ip()).await;
         return Err(TcpNetworkerErrors::FailedToAuthenticate);
     };
 
+    guess_limiter.record_success(connect_addr.ip()).await;
+
     debug!(%connect_addr, peer = %peer.name(), "peer authenticated, sending init header");
 
-    let size = if action_type == ActionType::ConnectNewDevice {
+    // what goes on the wire: plaintext + nonce + GCM tag, or nothing
+    let size = if action_type == ActionType::ConnectNewDevice || size == 0 {
         0
     } else {
-        size
+        size.saturating_add(DATA_LAYER_OVERHEAD as u64)
     };
 
     // 2. init header
-    let mut init_data = Vec::with_capacity(INIT_HEADER_LEN + 1); // + tag
+    let mut init_data = Vec::with_capacity(INIT_HEADER_LEN);
 
     init_data.push(action_type as u8);
     init_data.extend_from_slice(&size.to_le_bytes());
 
     secure_connection
-        .write_timeout(&mut init_data, Tags::Regular)
+        .write_timeout(&init_data, Tags::Regular)
         .await
         .map_err(|e| {
             error!(%connect_addr, error = %e, "failed to send init header");
@@ -372,12 +460,8 @@ pub async fn connect_handler(
 
     // 3. payload
     if size > 0 {
-        let mut payload = Zeroizing::new(Vec::with_capacity(data.len().saturating_add(1))); // + tag
-
-        payload.extend_from_slice(&data);
-
         secure_connection
-            .write_timeout(&mut payload, Tags::Regular)
+            .write_encrypted(&data, &d_key, Tags::Regular)
             .await
             .map_err(|e| {
                 error!(%connect_addr, error = %e, "failed to send data packet");
@@ -446,8 +530,10 @@ pub async fn connect(
 }
 
 #[cfg(test)]
+#[allow(clippy::large_futures)] // full handshakes in tests, stack size doesn't matter
 mod tests {
     use super::*;
+    use crate::auth_snow::{AuthKey, DataKey};
 
     const TEST_A_KEY: [u8; 32] = [0xAB; 32];
     const TEST_D_KEY: [u8; 32] = [0xCD; 32];
@@ -467,11 +553,24 @@ mod tests {
         a_key: [u8; 32],
         pair_fallback: fn(&String, &[u8; 32]) -> bool,
     ) -> NetworkerContext {
+        make_context_d(a_key, TEST_D_KEY, pair_fallback)
+    }
+
+    /// Like [`make_context`] with an explicit `d_key`.
+    fn make_context_d(
+        a_key: [u8; 32],
+        d_key: [u8; 32],
+        pair_fallback: fn(&String, &[u8; 32]) -> bool,
+    ) -> NetworkerContext {
         NetworkerContext {
-            keys: Arc::new(RwLock::new(Keys::new(&a_key, &TEST_D_KEY))),
+            keys: Arc::new(RwLock::new(Keys::new(
+                AuthKey::from_bytes(&a_key),
+                DataKey::from_bytes(&d_key),
+            ))),
             device_keypairs: Arc::new(DeviceKeypairs::generate().unwrap()),
             trusted_peers: Arc::new(RwLock::new(Vec::new())),
             pair_fallback,
+            guess_limiter: Arc::new(GuessLimiter::new()),
         }
     }
 
@@ -537,6 +636,8 @@ mod tests {
             TcpNetworkerErrors::FailedToConnect,
             TcpNetworkerErrors::FailedToWriteToStream,
             TcpNetworkerErrors::DataTooLarge,
+            TcpNetworkerErrors::FailedToDecryptData,
+            TcpNetworkerErrors::LockedOut,
         ];
 
         for e in errors {
@@ -565,10 +666,10 @@ mod tests {
         assert_eq!(client_peers.read().await.len(), 1);
     }
 
-    /// Test that a payload of exactly MAX_DATA_PACKET_LEN bytes arrives intact
+    /// Test that a multi-chunk payload (1 MiB) arrives intact
     #[tokio::test]
-    async fn test_max_size_payload() {
-        let data = vec![0x5A; SECURE_MSG_MAX_PAYLOAD];
+    async fn test_large_payload_chunked() {
+        let data: Vec<u8> = (0..=250u8).cycle().take(1024 * 1024).collect();
 
         let (server_result, client_result) = exchange(
             make_context(TEST_A_KEY, accept_all),
@@ -597,7 +698,12 @@ mod tests {
             addr,
             stream,
             ActionType::ClipboardSync,
-            Zeroizing::new(vec![0u8; SECURE_MSG_MAX_PAYLOAD + 1]),
+            Zeroizing::new(vec![
+                0u8;
+                usize::try_from(MAX_DATA_PACKET_LEN)
+                    .unwrap()
+                    .saturating_add(1)
+            ]),
         )
         .await;
 
@@ -664,6 +770,124 @@ mod tests {
         assert_eq!(client_result, Err(TcpNetworkerErrors::FailedToAuthenticate));
         assert!(server_peers.read().await.is_empty());
         assert!(client_peers.read().await.is_empty());
+    }
+
+    /// Test that a peer with the right a_key but a different d_key can pair,
+    /// but its data is rejected
+    #[tokio::test]
+    async fn test_different_d_key_data_rejected() {
+        let (server_result, client_result) = exchange(
+            make_context(TEST_A_KEY, accept_all),
+            make_context_d(TEST_A_KEY, [0x22; 32], accept_all),
+            ActionType::ClipboardSync,
+            b"clipboard",
+        )
+        .await;
+
+        assert_eq!(client_result, Ok(()));
+        assert_eq!(
+            server_result.err(),
+            Some(TcpNetworkerErrors::FailedToDecryptData)
+        );
+    }
+
+    /// Test that connections past MAX_CONCURRENT_CONNECTIONS are closed at once
+    #[tokio::test]
+    async fn test_connection_limit_drops_extra_connections() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let token = CancellationToken::new();
+        let server_token = token.clone();
+        let context = make_context(TEST_A_KEY, accept_all);
+
+        let server = tokio::spawn(async move { recv(&listener, context, server_token).await });
+
+        // occupy every slot: each handler is waiting for our SPAKE2 message
+        let mut held = Vec::new();
+
+        for _ in 0..MAX_CONCURRENT_CONNECTIONS {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let mut first = [0u8; 1];
+
+            // the server speaks first (SPAKE2), so this proves the slot is taken
+            stream.read_exact(&mut first).await.unwrap();
+            held.push(stream);
+        }
+
+        // one more: closed without a single byte
+        let mut extra = TcpStream::connect(addr).await.unwrap();
+        let mut buf = Vec::new();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            extra.read_to_end(&mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(read, 0);
+
+        token.cancel();
+        assert!(server.await.unwrap().is_ok());
+    }
+
+    /// Test that a client guessing wrong passwords is locked out after MAX_FAILURES
+    #[tokio::test]
+    async fn test_wrong_passwords_lock_out_the_source() {
+        use crate::guess_limiter::MAX_FAILURES;
+
+        let server = make_context(TEST_A_KEY, accept_all);
+
+        for _ in 0..MAX_FAILURES {
+            let (server_result, _) = exchange(
+                server.clone(),
+                make_context([0x11; 32], accept_all),
+                ActionType::Debug,
+                b"guess",
+            )
+            .await;
+            assert!(server_result.unwrap().is_none());
+        }
+
+        // even the right password is refused now, before any handshake
+        let (server_result, client_result) = exchange(
+            server.clone(),
+            make_context(TEST_A_KEY, accept_all),
+            ActionType::Debug,
+            b"hi",
+        )
+        .await;
+
+        assert_eq!(server_result.err(), Some(TcpNetworkerErrors::LockedOut));
+        assert!(client_result.is_err());
+    }
+
+    /// Test that a server failing our confirmation is locked out on the client too
+    #[tokio::test]
+    async fn test_client_locks_out_failing_server() {
+        use crate::guess_limiter::MAX_FAILURES;
+
+        let client = make_context([0x11; 32], accept_all);
+
+        for _ in 0..MAX_FAILURES {
+            let (_, client_result) = exchange(
+                make_context(TEST_A_KEY, accept_all),
+                client.clone(),
+                ActionType::Debug,
+                b"x",
+            )
+            .await;
+            assert!(client_result.is_err());
+        }
+
+        assert!(
+            client
+                .guess_limiter
+                .is_locked("127.0.0.1".parse().unwrap())
+                .await
+        );
     }
 
     /// Test that cancelling before connect() returns Ok(()) without connecting

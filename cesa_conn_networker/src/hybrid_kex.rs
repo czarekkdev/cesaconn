@@ -1,9 +1,3 @@
-/*
-TODO:
-
-add tests
-*/
-
 use std::time::Duration;
 
 use crate::{
@@ -56,12 +50,6 @@ impl Tags {
         packet.push(self as u8);
     }
 
-    /// Returns `true` if `packet` ends with this tag.
-    #[allow(dead_code)] // API for callers outside the PoC binary (daemon, tests)
-    pub fn check_tag(self, packet: &[u8]) -> bool {
-        packet.ends_with(&[self as u8])
-    }
-
     /// Removes the tag from the end of `packet`.
     /// Returns `false` (and leaves `packet` untouched) if the tag doesn't match.
     pub fn untag(self, packet: &mut Vec<u8>) -> bool {
@@ -87,7 +75,7 @@ async fn x25519_kex_server(
 ) -> Result<SsKey, AuthSnowErrors> {
     // fresh ephemeral key pair for this connection
     let x25519_pair = x25519_cesa::generate_new_key_pair(
-        *random_array::<32>().map_err(|_| AuthSnowErrors::FailedToGenerateRandomData)?,
+        &random_array::<32>().map_err(|_| AuthSnowErrors::FailedToGenerateRandomData)?,
     );
 
     let mut x25519_pub = Zeroizing::new(x25519_pair.public.to_vec());
@@ -112,15 +100,13 @@ async fn x25519_kex_server(
     }
 
     // fails if the client sent a low-order point (all-zero shared secret)
-    let x25519_ss = Zeroizing::new(
-        calculate_shared_key(
-            &x25519_pair.private,
-            x25519_recv
-                .as_array()
-                .ok_or(AuthSnowErrors::FailedToConvertToArray)?,
-        )
-        .ok_or(AuthSnowErrors::FailedToCalculateSharedSecret)?,
-    );
+    let x25519_ss = calculate_shared_key(
+        &x25519_pair.private,
+        x25519_recv
+            .as_array()
+            .ok_or(AuthSnowErrors::FailedToConvertToArray)?,
+    )
+    .ok_or(AuthSnowErrors::FailedToCalculateSharedSecret)?;
 
     // 2. our public key
     let write = stream.write_all(&x25519_pub);
@@ -298,7 +284,7 @@ async fn x25519_kex_client(
 ) -> Result<SsKey, AuthSnowErrors> {
     // fresh ephemeral key pair for this connection
     let x25519_pair = x25519_cesa::generate_new_key_pair(
-        *random_array::<32>().map_err(|_| AuthSnowErrors::FailedToGenerateRandomData)?,
+        &random_array::<32>().map_err(|_| AuthSnowErrors::FailedToGenerateRandomData)?,
     );
 
     let mut x25519_pub = Zeroizing::new(x25519_pair.public.to_vec());
@@ -336,8 +322,7 @@ async fn x25519_kex_client(
         x25519_recv
             .as_array()
             .ok_or(AuthSnowErrors::FailedToConvertToArray)?,
-    )
-    .map(Zeroizing::new);
+    );
 
     // 3. our confirmation, tell the server why we stop instead of just closing
     send_confirm(stream, shared.is_some(), transcript).await?;
@@ -425,4 +410,78 @@ pub async fn hybrid_kex_client(
         x25519_ss,
         mlkem_ss,
     })
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    /// Connected localhost pair: (server side, client side).
+    async fn pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, server) = tokio::join!(TcpStream::connect(addr), listener.accept());
+
+        (server.unwrap().0, client.unwrap())
+    }
+
+    /// Test that both sides agree on both secrets and on the transcript
+    #[tokio::test]
+    async fn test_hybrid_kex_agrees() {
+        let (mut s, mut c) = pair().await;
+        let mut st = Zeroizing::new(Vec::new());
+        let mut ct = Zeroizing::new(Vec::new());
+
+        let (sr, cr) = tokio::join!(
+            hybrid_kex_server(&mut s, &mut st),
+            hybrid_kex_client(&mut c, &mut ct)
+        );
+        let (sr, cr) = (sr.unwrap(), cr.unwrap());
+
+        assert_eq!(*sr.x25519_ss, *cr.x25519_ss);
+        assert_eq!(*sr.mlkem_ss, *cr.mlkem_ss);
+        assert_ne!(*sr.x25519_ss, *sr.mlkem_ss);
+        assert_ne!(*sr.x25519_ss, [0u8; 32]);
+        assert_eq!(*st, *ct);
+    }
+
+    /// Test that every run produces new secrets (ephemeral keys)
+    #[tokio::test]
+    async fn test_hybrid_kex_fresh_secrets() {
+        let mut secrets = Vec::new();
+
+        for _ in 0..2 {
+            let (mut s, mut c) = pair().await;
+            let mut st = Zeroizing::new(Vec::new());
+            let mut ct = Zeroizing::new(Vec::new());
+
+            let (sr, _) = tokio::join!(
+                hybrid_kex_server(&mut s, &mut st),
+                hybrid_kex_client(&mut c, &mut ct)
+            );
+            secrets.push(sr.unwrap());
+        }
+
+        assert_ne!(*secrets[0].x25519_ss, *secrets[1].x25519_ss);
+        assert_ne!(*secrets[0].mlkem_ss, *secrets[1].mlkem_ss);
+    }
+
+    /// Test that garbage instead of a client key makes the server fail, not hang or panic
+    #[tokio::test]
+    async fn test_server_rejects_garbage() {
+        let (mut s, mut c) = pair().await;
+        let mut st = Zeroizing::new(Vec::new());
+
+        let server = hybrid_kex_server(&mut s, &mut st);
+        let client = async {
+            c.write_all(&[0xFFu8; 64]).await.unwrap();
+            drop(c);
+        };
+        let (sr, _) = tokio::join!(server, client);
+
+        assert_eq!(sr.err(), Some(AuthSnowErrors::KexFailed));
+    }
 }

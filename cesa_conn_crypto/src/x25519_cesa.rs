@@ -1,4 +1,3 @@
-use sha2::{Digest, Sha256};
 use tracing::trace;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
@@ -29,12 +28,15 @@ pub fn calculate_public_key(private_key: &[u8; 32]) -> [u8; 32] {
     *public_key.as_bytes()
 }
 
-/// Computes ECDH shared secret from private key and the other party's public key
-/// The result should be hashed with SHA-256 before use as an AES-256 key
+/// Computes ECDH shared secret from private key and the other party's public key.
+/// Never use the result directly as a key: feed it into a KDF (HKDF) with a label.
 ///
 /// Returns `None` if the exchange was non-contributory, i.e. `their_public`
 /// is a low-order point that would force an all-zero shared secret.
-pub fn calculate_shared_key(private_key: &[u8; 32], their_public: &[u8; 32]) -> Option<[u8; 32]> {
+pub fn calculate_shared_key(
+    private_key: &[u8; 32],
+    their_public: &[u8; 32],
+) -> Option<Zeroizing<[u8; 32]>> {
     trace!("computing X25519 ECDH shared secret");
     let private_key = Zeroizing::new(StaticSecret::from(*private_key));
     let their_public = PublicKey::from(*their_public);
@@ -44,23 +46,19 @@ pub fn calculate_shared_key(private_key: &[u8; 32], their_public: &[u8; 32]) -> 
         return None;
     }
 
-    Some(*shared_secret.as_bytes())
-}
-
-/// Hashes the ECDH shared secret using SHA-256 to produce a secure AES-256 key.
-/// Raw shared secret should never be used directly as an AES key — always hash first.
-pub fn hash_key(shared_key: &[u8; 32]) -> [u8; 32] {
-    trace!("hashing ECDH shared secret with SHA-256");
-    Sha256::digest(*shared_key).into()
+    Some(Zeroizing::new(*shared_secret.as_bytes()))
 }
 
 /// Generates an [`X25519KeyPair`] from 32 bytes of caller-supplied entropy.
 /// The caller is responsible for ensuring `random_data` is cryptographically secure
 /// (e.g. sourced from [`crate::crand::random_array`]).
-pub fn generate_new_key_pair(random_data: [u8; 32]) -> X25519KeyPair {
-    let pub_key = Zeroizing::new(calculate_public_key(&random_data));
+///
+/// Taken by reference, so the private key isn't copied into an un-wiped
+/// by-value argument.
+pub fn generate_new_key_pair(random_data: &Zeroizing<[u8; 32]>) -> X25519KeyPair {
+    let pub_key = calculate_public_key(random_data);
 
-    X25519KeyPair::new(*pub_key, &random_data)
+    X25519KeyPair::new(pub_key, random_data)
 }
 
 #[cfg(test)]
@@ -68,8 +66,8 @@ mod tests {
     use super::*;
 
     /// Generates a random private key using OS entropy via `crand`.
-    fn generate_private_key() -> [u8; 32] {
-        *crate::crand::random_array::<32>().expect("OS RNG should succeed")
+    fn generate_private_key() -> Zeroizing<[u8; 32]> {
+        crate::crand::random_array::<32>().expect("OS RNG should succeed")
     }
 
     // -------------------------------------------------------------------------
@@ -148,31 +146,6 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // hash_key tests
-    // -------------------------------------------------------------------------
-
-    /// `hash_key` must be pure — same input always yields the same digest.
-    #[test]
-    fn test_hash_key_deterministic() {
-        let shared = [0xABu8; 32];
-        assert_eq!(hash_key(&shared), hash_key(&shared));
-    }
-
-    /// The SHA-256 digest of any non-trivial input must differ from the input itself.
-    #[test]
-    fn test_hash_key_changes_value() {
-        let shared = [1u8; 32];
-        let hashed = hash_key(&shared);
-        assert_ne!(hashed, shared);
-    }
-
-    /// Different shared secrets must hash to different values.
-    #[test]
-    fn test_hash_key_unique() {
-        assert_ne!(hash_key(&[1u8; 32]), hash_key(&[2u8; 32]));
-    }
-
-    // -------------------------------------------------------------------------
     // generate_new_key_pair tests
     // -------------------------------------------------------------------------
 
@@ -180,7 +153,7 @@ mod tests {
     #[test]
     fn test_generate_new_key_pair_public_key_correct() {
         let seed = generate_private_key();
-        let pair = generate_new_key_pair(seed);
+        let pair = generate_new_key_pair(&seed);
         assert_eq!(*pair.public, calculate_public_key(&seed));
     }
 
@@ -188,8 +161,8 @@ mod tests {
     #[test]
     fn test_generate_new_key_pair_private_key_stored() {
         let seed = generate_private_key();
-        let pair = generate_new_key_pair(seed);
-        assert_eq!(*pair.private, seed);
+        let pair = generate_new_key_pair(&seed);
+        assert_eq!(*pair.private, *seed);
     }
 
     /// A pair generated via `generate_new_key_pair` must satisfy the ECDH property
@@ -199,8 +172,8 @@ mod tests {
         let seed_a = generate_private_key();
         let seed_b = generate_private_key();
 
-        let pair_a = generate_new_key_pair(seed_a);
-        let pair_b = generate_new_key_pair(seed_b);
+        let pair_a = generate_new_key_pair(&seed_a);
+        let pair_b = generate_new_key_pair(&seed_b);
 
         let shared_a =
             calculate_shared_key(&pair_a.private, &pair_b.public).expect("valid peer key");

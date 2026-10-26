@@ -1,50 +1,48 @@
-//TODO: Change find broadcaster to loop and check if the ip isnt local machine
-//TODO: tag packets
+//! LAN discovery over UDP broadcast.
+//!
+//! An announcement only says "a CesaConn device listens at this address".
+//! It is deliberately NOT encrypted or authenticated with anything derived
+//! from the password: any password-derived value on the wire (e.g. AES-GCM
+//! of a known name under `a_key`) lets anyone on the LAN capture one packet
+//! and guess the password offline, which defeats SPAKE2. So the result of
+//! discovery is only a hint where to connect; whether a device is trusted
+//! is decided by the TCP handshake (SPAKE2 + signatures) alone. Replaying or
+//! forging announcements can at most make us try a connection that fails.
 
 use core::fmt;
 use core::net::SocketAddr;
-use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::RwLock;
-use tokio::time::{Duration, sleep, timeout};
+use tokio::time::{Duration, Instant, sleep, timeout_at};
 use tracing::{debug, error, info, warn};
-use zeroize::Zeroize;
 
-use crate::auth_snow::Keys;
-use cesa_conn_crypto::aes::{AESError, decrypt, encrypt};
+use cesa_conn_crypto::crand::random_array;
 
-/// AES-GCM nonce length (bytes).
-const TUNNEL_NONCE_LEN: usize = 12;
-/// AES-GCM authentication tag length (bytes).
-const TUNNEL_TAG_LEN: usize = 16;
+/// Port announcements are sent to (and listened on).
+pub const DISCOVERY_PORT: u16 = 3636;
 
-/// Encrypts `plaintext` with AES-256-GCM under `key`.
-/// Returns: nonce (12 bytes) + ciphertext (N + 16 bytes). The nonce is random,
-/// so the output differs on every call even for the same input.
-pub(crate) fn encrypt_tunnel(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, AESError> {
-    let (ciphertext, nonce) = encrypt(key, plaintext)?;
+/// Longest a broadcast or a search may run (seconds).
+pub const MAX_BROADCAST_DURATION: u64 = 20;
 
-    let mut packet = Vec::with_capacity(ciphertext.len().saturating_add(TUNNEL_NONCE_LEN));
+/* Announcement layout */
+/// protocol magic (8)
+const MAGIC: &[u8; 8] = b"CESACONN";
+/// protocol version (1)
+const VERSION: u8 = 1;
+/// magic (8) + version (1) + random instance id (16)
+const ANNOUNCEMENT_LEN: usize = 8 + 1 + 16;
 
-    packet.extend_from_slice(&nonce);
-    packet.extend_from_slice(&ciphertext);
+/// Random id of one running instance, so a device ignores its own broadcasts.
+/// Not a secret and not an identity: it changes on every start.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct InstanceId([u8; 16]);
 
-    Ok(packet)
-}
-
-/// Inverse of [`encrypt_tunnel`]: splits off the nonce and decrypts the rest.
-/// Packets shorter than nonce + tag are rejected before touching AES.
-pub(crate) fn decrypt_tunnel(key: &[u8; 32], packet: &[u8]) -> Result<Vec<u8>, AESError> {
-    if packet.len() < TUNNEL_NONCE_LEN + TUNNEL_TAG_LEN {
-        return Err(AESError::DecryptionFailed);
+impl InstanceId {
+    /// A fresh random id.
+    pub fn generate() -> Result<Self, UdpNetworkerErrors> {
+        Ok(Self(
+            *random_array::<16>().map_err(|_| UdpNetworkerErrors::FailedToGenerateId)?,
+        ))
     }
-
-    let (nonce, ciphertext) = packet.split_at(TUNNEL_NONCE_LEN);
-
-    let nonce: &[u8; TUNNEL_NONCE_LEN] =
-        nonce.try_into().map_err(|_| AESError::DecryptionFailed)?;
-
-    decrypt(key, ciphertext, nonce)
 }
 
 /// Errors that can occur during UDP networking operations
@@ -56,20 +54,12 @@ pub enum UdpNetworkerErrors {
     FailedToSetBroadcastMode,
     /// Failed to send broadcast packet to the network
     FailedToSendBroadcast,
-    /// No device responded within the given duration
+    /// No device announced itself within the given duration
     Timeout,
     /// Failed to receive incoming UDP packet
     FailedToFetchResult,
-    /// Received packet was larger than the buffer — may have been truncated
-    DataTooBig,
-    /// Received packet does not match the expected device identifier
-    UnknownDevice,
-    /// AES-GCM encryption failed — should not happen under normal conditions.
-    FailedToEncryptTunnel,
-    /// AES-GCM decryption failed — wrong key or data was tampered with in transit.
-    FailedToDecryptTunnel,
-    /// Failed while trying to cenvert u8 to String
-    FailedToConvertU8ToString,
+    /// The OS failed to provide random bytes for the instance id
+    FailedToGenerateId,
 }
 
 impl fmt::Display for UdpNetworkerErrors {
@@ -84,430 +74,265 @@ impl fmt::Display for UdpNetworkerErrors {
             }
             UdpNetworkerErrors::Timeout => write!(f, "Discovery timed out — no device found"),
             UdpNetworkerErrors::FailedToFetchResult => write!(f, "Failed to receive UDP packet"),
-            UdpNetworkerErrors::DataTooBig => write!(f, "Received packet exceeds buffer size"),
-            UdpNetworkerErrors::UnknownDevice => write!(f, "Unknown device — name mismatch"),
-            UdpNetworkerErrors::FailedToEncryptTunnel => write!(f, "failed to encrypt tunnel data"),
-            UdpNetworkerErrors::FailedToDecryptTunnel => write!(f, "failed to decrypt tunnel data"),
-            UdpNetworkerErrors::FailedToConvertU8ToString => {
-                write!(f, "failed to convert u8 to string")
+            UdpNetworkerErrors::FailedToGenerateId => {
+                write!(f, "failed to generate instance id")
             }
         }
     }
 }
 
-/// Maximum allowed duration for broadcast/listening operations in seconds
-pub static MAX_BROADCAST_DURATION: u64 = 20;
+/// Builds an announcement: magic (8) + version (1) + instance id (16).
+fn announcement(id: InstanceId) -> [u8; ANNOUNCEMENT_LEN] {
+    let mut packet = [0u8; ANNOUNCEMENT_LEN];
 
-/// Identifier name used to recognize CesaConn devices on the network
-pub static BROADCAST_NAME: &str = "CesaConn Broadcast";
+    for (dst, src) in packet
+        .iter_mut()
+        .zip(MAGIC.iter().chain([VERSION].iter()).chain(id.0.iter()))
+    {
+        *dst = *src;
+    }
 
-/// Broadcasts a UDP presence message every second for the given duration.
-/// Duration is capped at MAX_BROADCAST_DURATION to prevent indefinite broadcasting.
-/// Returns Ok(()) if all packets were sent successfully.
+    packet
+}
+
+/// Parses an announcement. Anything that isn't exactly one is `None`.
+fn parse_announcement(packet: &[u8]) -> Option<InstanceId> {
+    let packet: &[u8; ANNOUNCEMENT_LEN] = packet.try_into().ok()?;
+    let (magic, rest) = packet.split_first_chunk::<8>()?;
+    let (version, id) = rest.split_first()?;
+
+    if magic != MAGIC || *version != VERSION {
+        return None;
+    }
+
+    Some(InstanceId(id.try_into().ok()?))
+}
+
+/// Announces this device on the LAN once per second for `duration` seconds
+/// (capped at [`MAX_BROADCAST_DURATION`]).
+///
+/// The announcement carries no secret, see the module docs.
 pub async fn udp_broadcast_presence(
-    message: &[u8],
     duration: u64,
-    keys: Arc<RwLock<Keys>>,
+    id: InstanceId,
 ) -> Result<(), UdpNetworkerErrors> {
-    // Cap duration to the allowed maximum to prevent indefinite broadcasting
-    let duration = if duration > MAX_BROADCAST_DURATION {
-        MAX_BROADCAST_DURATION
-    } else {
-        duration
-    };
+    let duration = duration.min(MAX_BROADCAST_DURATION);
+    let packet = announcement(id);
+    let destination = SocketAddr::from(([255, 255, 255, 255], DISCOVERY_PORT));
 
-    debug!(
-        requested_duration = duration,
-        capped_duration = duration,
-        "udp_broadcast_presence started"
-    );
-
-    // Bind to all interfaces on port 6363. Intentional: LAN broadcast discovery must
-    // work on whichever interface the peer is on; packets are encrypted with a_key.
+    // Ephemeral port: only the destination port matters for the listener.
     // nosemgrep: cesa.net.bind-all-interfaces
-    let socket = UdpSocket::bind("0.0.0.0:6363").await.map_err(|e| {
-        error!(error = %e, addr = "0.0.0.0:6363", "failed to bind UDP socket for broadcast");
+    let socket = UdpSocket::bind("0.0.0.0:0").await.map_err(|e| {
+        error!(error = %e, "failed to bind UDP socket for broadcast");
         UdpNetworkerErrors::FailedToBindSocket
     })?;
 
-    debug!(local_addr = "0.0.0.0:6363", "UDP broadcast socket bound");
-
-    // Enable broadcast mode — required to send packets to 255.255.255.255
+    // required to send packets to 255.255.255.255
     socket.set_broadcast(true).map_err(|e| {
         error!(error = %e, "failed to enable broadcast mode on UDP socket");
         UdpNetworkerErrors::FailedToSetBroadcastMode
     })?;
 
-    info!(
-        "UDP broadcast mode enabled, will send {} packets to 255.255.255.255:3636",
-        duration
-    );
+    info!(duration, %destination, "broadcasting presence");
 
     for tick in 0..duration {
-        let e_msg = encrypt_tunnel(&keys.read().await.a_key, message).map_err(|e| {
-            error!(error = %e, tick, "failed to encrypt broadcast message");
-            UdpNetworkerErrors::FailedToEncryptTunnel
+        let bytes_sent = socket.send_to(&packet, destination).await.map_err(|e| {
+            error!(error = %e, tick, %destination, "failed to send UDP broadcast packet");
+            UdpNetworkerErrors::FailedToSendBroadcast
         })?;
 
-        // Send presence packet to the entire local network
-        let bytes_sent = socket
-            .send_to(e_msg.as_ref(), "255.255.255.255:3636")
-            .await
-            .map_err(|e| {
-                error!(error = %e, tick, dest = "255.255.255.255:3636", "failed to send UDP broadcast packet");
-                UdpNetworkerErrors::FailedToSendBroadcast
-            })?;
+        debug!(tick, bytes_sent, "announcement sent");
 
-        let message_str = String::from_utf8(message.to_vec())
-            .map_err(|e| {
-                error!(error = %e, "failed to convert broadcast message bytes to UTF-8 string for logging");
-                UdpNetworkerErrors::FailedToConvertU8ToString
-            })?;
-
-        debug!(
-            tick,
-            bytes_sent,
-            dest = "255.255.255.255:3636",
-            message = %message_str,
-            "broadcast packet sent"
-        );
-
-        // Wait one second before sending the next broadcast
         sleep(Duration::from_secs(1)).await;
     }
 
-    // Disable broadcast mode after finishing — good practice to clean up
-    socket.set_broadcast(false).map_err(|e| {
-        error!(error = %e, "failed to disable broadcast mode on UDP socket");
-        UdpNetworkerErrors::FailedToSetBroadcastMode
-    })?;
-
-    info!(
-        "UDP broadcast mode disabled, broadcast complete ({} packets sent)",
-        duration
-    );
-
+    info!(duration, "broadcast complete");
     Ok(())
 }
 
-/// Listens for incoming UDP packets for the given duration.
-/// Returns Ok(SocketAddr) if a valid CesaConn device is found.
-/// Returns Err if timeout, socket error, oversized packet, or name mismatch.
+/// Listens for announcements of OTHER devices for up to `duration` seconds
+/// (capped at [`MAX_BROADCAST_DURATION`]) and returns the first sender's address.
+///
+/// Packets that aren't a valid announcement, and our own (`own_id`), are
+/// skipped. The address is only a hint: it is NOT authenticated, the TCP
+/// handshake decides trust.
 pub async fn udp_find_broadcaster(
     duration: u64,
-    message: &[u8],
-    keys: Arc<RwLock<Keys>>,
+    own_id: InstanceId,
 ) -> Result<SocketAddr, UdpNetworkerErrors> {
-    // Cap duration to the allowed maximum
-    let duration = if duration > MAX_BROADCAST_DURATION {
-        MAX_BROADCAST_DURATION
-    } else {
-        duration
-    };
+    let duration = duration.min(MAX_BROADCAST_DURATION);
+    // one deadline for the whole search, junk packets can't extend it
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(duration))
+        .ok_or(UdpNetworkerErrors::Timeout)?;
 
-    debug!(
-        timeout_secs = duration,
-        "udp_find_broadcaster started, waiting for broadcast packets"
-    );
-
-    // Bind to all interfaces on port 3636 to receive broadcasts. Intentional: broadcast
-    // packets only arrive on a wildcard bind; anything that fails decryption is dropped.
+    // Broadcasts only arrive on a wildcard bind.
     // nosemgrep: cesa.net.bind-all-interfaces
-    let socket = UdpSocket::bind("0.0.0.0:3636").await.map_err(|e| {
-        error!(error = %e, addr = "0.0.0.0:3636", "failed to bind UDP socket for discovery");
-        UdpNetworkerErrors::FailedToBindSocket
-    })?;
-
-    debug!(local_addr = "0.0.0.0:3636", "UDP discovery socket bound");
-
-    // Receive buffer — max 1024 bytes per packet
-    let mut buf = [0; 1024];
+    let socket = UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT))
+        .await
+        .map_err(|e| {
+            error!(error = %e, port = DISCOVERY_PORT, "failed to bind UDP socket for discovery");
+            UdpNetworkerErrors::FailedToBindSocket
+        })?;
 
     info!(
         timeout_secs = duration,
         "searching for CesaConn devices on network..."
     );
 
-    // Wait for incoming packet — abort if duration expires
-    let recv_result = timeout(Duration::from_secs(duration), socket.recv_from(&mut buf))
-        .await
-        .map_err(|_| {
-            warn!(
-                timeout_secs = duration,
-                "UDP discovery timed out — no device responded"
-            );
-            UdpNetworkerErrors::Timeout
-        })?; // timeout expired;
+    // one byte bigger than an announcement, so a longer packet is detectable
+    let mut buf = [0u8; ANNOUNCEMENT_LEN + 1];
 
-    let (len, addr) = match recv_result {
-        Ok(v) => v,
-        Err(e) => {
-            #[cfg(windows)]
-            if e.raw_os_error() == Some(10040) {
-                error!(error = %e, "received UDP packet larger than receive buffer (Windows error 10040)");
-                return Err(UdpNetworkerErrors::DataTooBig);
+    loop {
+        let (len, addr) = timeout_at(deadline, socket.recv_from(&mut buf))
+            .await
+            .map_err(|_| {
+                warn!(
+                    timeout_secs = duration,
+                    "UDP discovery timed out — no device responded"
+                );
+                UdpNetworkerErrors::Timeout
+            })?
+            .map_err(|e| {
+                error!(error = %e, "failed to receive UDP packet");
+                UdpNetworkerErrors::FailedToFetchResult
+            })?;
+
+        match buf.get(..len).and_then(parse_announcement) {
+            Some(id) if id == own_id => {
+                debug!(%addr, "ignoring our own announcement");
             }
-
-            error!(error = %e, "failed to receive UDP packet");
-            return Err(UdpNetworkerErrors::FailedToFetchResult);
+            Some(_) => {
+                info!(%addr, "found CesaConn device (unauthenticated hint)");
+                return Ok(addr);
+            }
+            None => {
+                debug!(%addr, len, "ignoring packet that isn't an announcement");
+            }
         }
-    };
-
-    debug!(%addr, bytes_received = len, "received UDP packet");
-
-    // If len equals buffer size, packet may have been truncated — discard it
-    // recv_from never returns more than buf.len(), so == means truncation occurred
-    if len == buf.len() {
-        warn!(%addr, bytes_received = len, buffer_size = buf.len(), "received packet fills entire buffer — likely truncated, discarding");
-        buf.zeroize();
-        return Err(UdpNetworkerErrors::DataTooBig);
-    }
-
-    // Convert received bytes to string for device name comparison
-    debug!(%addr, "decrypting received UDP packet");
-    // len < buf.len() checked above
-    let received = buf.get(..len).ok_or(UdpNetworkerErrors::DataTooBig)?;
-    let name = decrypt_tunnel(&keys.read().await.a_key, received)
-        .map_err(|e| {
-            warn!(%addr, error = %e, "failed to decrypt received UDP packet — wrong key or tampered data");
-            UdpNetworkerErrors::FailedToDecryptTunnel
-        })?;
-
-    buf.zeroize();
-
-    // Verify the packet comes from a recognized CesaConn device
-    if *name == *message {
-        let device_name = String::from_utf8_lossy(name.as_ref()).into_owned();
-        info!(%addr, device_name = %device_name, "found CesaConn device");
-        Ok(addr)
-    } else {
-        warn!(%addr, expected = %String::from_utf8_lossy(message), received = %String::from_utf8_lossy(&name), "device responded but name does not match expected value, ignoring");
-        // Device responded but name doesn't match — ignore it
-        Err(UdpNetworkerErrors::UnknownDevice)
     }
 }
 
 #[cfg(test)]
-// tests bind the fixed discovery port 3636: the guard is held across awaits on
+// tests bind the fixed discovery port: the guard is held across awaits on
 // purpose, so they run one at a time
 #[allow(clippy::await_holding_invalid_type)]
 mod tests {
     use super::*;
-    use tokio::net::UdpSocket;
-    use tokio::time::{Duration, sleep};
 
-    /// Pre-shared key used across all tests.
-    const TEST_KEY: [u8; 32] = [0xAB; 32];
-
-    // udp_find_broadcaster always binds to port 3636. Tests that call it must not
-    // run concurrently or they race to bind the same port and get FailedToBindSocket.
-    // This lock serializes all tests that use port 3636.
-    static PORT_3636_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-    fn port_3636_lock() -> &'static tokio::sync::Mutex<()> {
-        PORT_3636_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    /// Serialises tests that bind the fixed discovery port.
+    fn port_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
-    /// Wraps a raw 32-byte key in `Keys` (d_key zeroed — UDP only uses a_key) and returns it
-    /// behind `Arc<RwLock>` to match the signatures of `udp_broadcast_presence` / `udp_find_broadcaster`.
-    fn make_test_key(key: [u8; 32]) -> Arc<RwLock<Keys>> {
-        Arc::new(RwLock::new(Keys::new(&key, &[0u8; 32])))
+    /// Sends `packet` to the discovery port on localhost.
+    async fn send_local(packet: &[u8]) {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket
+            .send_to(packet, ("127.0.0.1", DISCOVERY_PORT))
+            .await
+            .unwrap();
     }
 
-    /// `UdpSocket::bind` must succeed on any available port.
+    /// Starts a 2 s search in the background and waits until it is listening.
+    async fn search(
+        own_id: InstanceId,
+    ) -> tokio::task::JoinHandle<Result<SocketAddr, UdpNetworkerErrors>> {
+        let handle = tokio::spawn(async move { udp_find_broadcaster(2, own_id).await });
+        sleep(Duration::from_millis(100)).await;
+        handle
+    }
+
+    /// Test that an announcement round-trips through build and parse
+    #[test]
+    fn test_announcement_roundtrip() {
+        let id = InstanceId::generate().unwrap();
+        assert_eq!(parse_announcement(&announcement(id)), Some(id));
+    }
+
+    /// Test that wrong magic, version or length is rejected
+    #[test]
+    fn test_parse_rejects_malformed() {
+        let id = InstanceId::generate().unwrap();
+        let good = announcement(id);
+
+        let mut bad_magic = good;
+        bad_magic[0] ^= 0xFF;
+        let mut bad_version = good;
+        bad_version[8] = VERSION.wrapping_add(1);
+
+        assert_eq!(parse_announcement(&bad_magic), None);
+        assert_eq!(parse_announcement(&bad_version), None);
+        assert_eq!(parse_announcement(&good[..ANNOUNCEMENT_LEN - 1]), None);
+        assert_eq!(parse_announcement(&[good.as_slice(), &[0]].concat()), None);
+        assert_eq!(parse_announcement(&[]), None);
+    }
+
+    /// Test that the announcement contains nothing but magic, version and id
+    #[test]
+    fn test_announcement_has_no_secret_material() {
+        let packet = announcement(InstanceId([0x42; 16]));
+
+        assert_eq!(&packet[..8], MAGIC);
+        assert_eq!(packet[8], VERSION);
+        assert_eq!(&packet[9..], &[0x42; 16]);
+    }
+
+    /// Test that another device's announcement is found
     #[tokio::test]
-    async fn test_bind_socket() {
-        let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
-        assert!(socket.local_addr().is_ok());
+    async fn test_finds_other_device() {
+        let _guard = port_lock().lock().await;
+        let handle = search(InstanceId::generate().unwrap()).await;
+
+        send_local(&announcement(InstanceId::generate().unwrap())).await;
+
+        assert!(handle.await.unwrap().is_ok());
     }
 
-    /// Duration above `MAX_BROADCAST_DURATION` must be capped to the maximum.
+    /// Test that our own announcement and junk are skipped, then a real one found
     #[tokio::test]
-    async fn test_duration_cap() {
-        let over_limit = MAX_BROADCAST_DURATION + 100;
-        let capped = if over_limit > MAX_BROADCAST_DURATION {
-            MAX_BROADCAST_DURATION
-        } else {
-            over_limit
-        };
-        assert_eq!(capped, MAX_BROADCAST_DURATION);
+    async fn test_skips_own_and_junk() {
+        let _guard = port_lock().lock().await;
+        let own = InstanceId::generate().unwrap();
+        let handle = search(own).await;
+
+        send_local(&announcement(own)).await;
+        send_local(b"CesaConn Broadcast").await;
+        send_local(&[0u8; 1024]).await;
+        sleep(Duration::from_millis(100)).await;
+        assert!(!handle.is_finished());
+
+        send_local(&announcement(InstanceId::generate().unwrap())).await;
+        assert!(handle.await.unwrap().is_ok());
     }
 
-    /// A packet that decrypts successfully but carries the wrong device name must be
-    /// rejected with `UnknownDevice`.
+    /// Test that only junk and our own packets end in Timeout
     #[tokio::test]
-    async fn test_unknown_device_rejected() {
-        let _guard = port_3636_lock().lock().await;
-        let key = make_test_key(TEST_KEY);
-        let key_clone = Arc::clone(&key);
-
-        let handle = tokio::spawn(async move {
-            udp_find_broadcaster(2, BROADCAST_NAME.as_bytes(), key_clone).await
-        });
-
-        // Give the listener time to bind before sending
+    async fn test_only_junk_times_out() {
+        let _guard = port_lock().lock().await;
+        let own = InstanceId::generate().unwrap();
+        let handle = tokio::spawn(async move { udp_find_broadcaster(1, own).await });
         sleep(Duration::from_millis(100)).await;
 
-        // Bind to an ephemeral port — receiver only cares about the destination port (3636)
-        let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
-        // Encrypt with the correct key so decryption succeeds, but use a wrong device name
-        let raw_key: [u8; 32] = *key.read().await.a_key;
-        let encrypted = encrypt_tunnel(&raw_key, b"UnknownDevice").unwrap();
-        socket.send_to(&encrypted, "127.0.0.1:3636").await.unwrap();
+        send_local(&announcement(own)).await;
+        send_local(b"garbage").await;
 
-        let result = handle.await.unwrap();
-        assert_eq!(result, Err(UdpNetworkerErrors::UnknownDevice));
+        assert_eq!(handle.await.unwrap(), Err(UdpNetworkerErrors::Timeout));
     }
 
-    /// A packet encrypted with a mismatched key must fail AES-GCM authentication
-    /// and return `FailedToDecryptTunnel`.
-    #[tokio::test]
-    async fn test_wrong_key_fails_decryption() {
-        let _guard = port_3636_lock().lock().await;
-        let handle = tokio::spawn(async {
-            udp_find_broadcaster(2, BROADCAST_NAME.as_bytes(), make_test_key(TEST_KEY)).await
-        });
-
-        sleep(Duration::from_millis(100)).await;
-
-        // Bind to an ephemeral port — receiver only cares about the destination port (3636)
-        let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
-        let wrong_key = [0xFF; 32];
-        // Encrypt with a different key — receiver's GCM tag check will fail
-        let encrypted = encrypt_tunnel(&wrong_key, BROADCAST_NAME.as_bytes()).unwrap();
-        socket.send_to(&encrypted, "127.0.0.1:3636").await.unwrap();
-
-        let result = handle.await.unwrap();
-        assert_eq!(result, Err(UdpNetworkerErrors::FailedToDecryptTunnel));
-    }
-
-    /// A correctly encrypted packet whose plaintext matches `BROADCAST_NAME` must be
-    /// accepted — the function returns the sender's `SocketAddr`.
-    #[tokio::test]
-    async fn test_correct_broadcast_found() {
-        let _guard = port_3636_lock().lock().await;
-        let key = make_test_key(TEST_KEY);
-        let key_clone = Arc::clone(&key);
-
-        let handle = tokio::spawn(async move {
-            udp_find_broadcaster(2, BROADCAST_NAME.as_bytes(), key_clone).await
-        });
-
-        sleep(Duration::from_millis(100)).await;
-
-        // Bind to an ephemeral port — receiver only cares about the destination port (3636)
-        let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
-        let raw_key: [u8; 32] = *key.read().await.a_key;
-        let encrypted = encrypt_tunnel(&raw_key, BROADCAST_NAME.as_bytes()).unwrap();
-        socket.send_to(&encrypted, "127.0.0.1:3636").await.unwrap();
-
-        let result = handle.await.unwrap();
-        assert!(result.is_ok());
-    }
-
-    /// A UDP packet larger than the 1024-byte receive buffer must be rejected as `DataTooBig`.
-    #[tokio::test]
-    async fn test_oversized_packet_rejected() {
-        let _guard = port_3636_lock().lock().await;
-        let handle = tokio::spawn(async {
-            udp_find_broadcaster(2, BROADCAST_NAME.as_bytes(), make_test_key(TEST_KEY)).await
-        });
-
-        sleep(Duration::from_millis(100)).await;
-
-        // Bind to an ephemeral port — receiver only cares about the destination port (3636)
-        let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
-        let big_data = vec![0u8; 1025];
-        socket.send_to(&big_data, "127.0.0.1:3636").await.unwrap();
-
-        let result = handle.await.unwrap();
-        assert_eq!(result, Err(UdpNetworkerErrors::DataTooBig));
-    }
-
-    /// `Arc<RwLock<Vec<SocketAddr>>>` must be readable from multiple concurrent tasks —
-    /// verifies the shared-state pattern used by callers of this module.
-    #[tokio::test]
-    async fn test_known_addrs_holds_multiple_entries() {
-        let known_addrs: Arc<RwLock<Vec<SocketAddr>>> = Arc::new(RwLock::new(vec![
-            "192.168.1.1:6363".parse().unwrap(),
-            "192.168.1.2:6363".parse().unwrap(),
-            "10.0.0.1:6363".parse().unwrap(),
-        ]));
-
-        let addrs = known_addrs.read().await;
-        assert_eq!(addrs.len(), 3);
-        assert!(addrs.contains(&"192.168.1.2:6363".parse::<SocketAddr>().unwrap()));
-        drop(addrs);
-    }
-
-    /// An `Arc::clone` of a `RwLock<Vec<SocketAddr>>` must share the same underlying data
-    /// across spawned tasks.
-    #[tokio::test]
-    async fn test_known_addrs_arc_clone() {
-        let known_addrs = Arc::new(RwLock::new(vec![
-            "192.168.0.1:6363".parse::<SocketAddr>().unwrap(),
-        ]));
-
-        let clone = Arc::clone(&known_addrs);
-
-        tokio::spawn(async move {
-            assert_eq!(clone.read().await.len(), 1);
-        })
-        .await
-        .unwrap();
-    }
-
-    /// The encryption key must not be mutated by `udp_find_broadcaster` on timeout.
-    #[tokio::test]
-    async fn test_key_not_mutated_on_timeout() {
-        let _guard = port_3636_lock().lock().await;
-        let key = make_test_key(TEST_KEY);
-
-        let _ = udp_find_broadcaster(1, BROADCAST_NAME.as_bytes(), Arc::clone(&key)).await;
-
-        let k = key.read().await;
-        assert_eq!(*k.a_key, TEST_KEY);
-    }
-
-    /// All `UdpNetworkerErrors` variants must produce a non-empty `Display` string.
+    /// Test that every error has a non-empty message
     #[test]
     fn test_error_display() {
-        assert!(
-            !UdpNetworkerErrors::FailedToBindSocket
-                .to_string()
-                .is_empty()
-        );
-        assert!(
-            !UdpNetworkerErrors::FailedToSetBroadcastMode
-                .to_string()
-                .is_empty()
-        );
-        assert!(
-            !UdpNetworkerErrors::FailedToSendBroadcast
-                .to_string()
-                .is_empty()
-        );
-        assert!(!UdpNetworkerErrors::Timeout.to_string().is_empty());
-        assert!(
-            !UdpNetworkerErrors::FailedToFetchResult
-                .to_string()
-                .is_empty()
-        );
-        assert!(!UdpNetworkerErrors::DataTooBig.to_string().is_empty());
-        assert!(!UdpNetworkerErrors::UnknownDevice.to_string().is_empty());
-        assert!(
-            !UdpNetworkerErrors::FailedToEncryptTunnel
-                .to_string()
-                .is_empty()
-        );
-        assert!(
-            !UdpNetworkerErrors::FailedToDecryptTunnel
-                .to_string()
-                .is_empty()
-        );
-        assert!(
-            !UdpNetworkerErrors::FailedToConvertU8ToString
-                .to_string()
-                .is_empty()
-        );
+        for e in [
+            UdpNetworkerErrors::FailedToBindSocket,
+            UdpNetworkerErrors::FailedToSetBroadcastMode,
+            UdpNetworkerErrors::FailedToSendBroadcast,
+            UdpNetworkerErrors::Timeout,
+            UdpNetworkerErrors::FailedToFetchResult,
+            UdpNetworkerErrors::FailedToGenerateId,
+        ] {
+            assert!(!e.to_string().is_empty());
+        }
     }
 }

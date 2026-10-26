@@ -6,6 +6,7 @@ use aes_gcm::{Aes256Gcm, Key, Nonce};
 use rand::TryRng;
 use rand::rngs::SysRng;
 use tracing::{error, trace};
+use zeroize::Zeroizing;
 
 /// Represents all possible errors that can occur during cryptographic operations
 #[derive(Debug)]
@@ -70,7 +71,7 @@ pub fn decrypt(
     key: &[u8; 32],
     ciphertext: &[u8],
     nonce_bytes: &[u8; 12],
-) -> Result<Vec<u8>, AESError> {
+) -> Result<Zeroizing<Vec<u8>>, AESError> {
     trace!(
         ciphertext_len = ciphertext.len(),
         "AES-256-GCM decrypt called"
@@ -93,7 +94,7 @@ pub fn decrypt(
         plaintext_len = plaintext.len(),
         "AES-256-GCM decryption successful"
     );
-    Ok(plaintext)
+    Ok(Zeroizing::new(plaintext))
 }
 
 #[cfg(test)]
@@ -121,7 +122,7 @@ mod tests {
         let (ciphertext, nonce) = encrypt(&key, data).unwrap();
         let plaintext = decrypt(&key, &ciphertext, &nonce).unwrap();
 
-        assert_eq!(plaintext, data);
+        assert_eq!(plaintext.as_slice(), &data[..]);
     }
 
     /// Test that wrong key fails decryption
@@ -190,7 +191,7 @@ mod tests {
         let (ciphertext, nonce) = encrypt(&key, data).unwrap();
         let plaintext = decrypt(&key, &ciphertext, &nonce).unwrap();
 
-        assert_eq!(plaintext, data);
+        assert_eq!(plaintext.as_slice(), &data[..]);
     }
 
     /// Test encryption of large data
@@ -202,6 +203,6 @@ mod tests {
         let (ciphertext, nonce) = encrypt(&key, &data).unwrap();
         let plaintext = decrypt(&key, &ciphertext, &nonce).unwrap();
 
-        assert_eq!(plaintext, data);
+        assert_eq!(plaintext.as_slice(), &data[..]);
     }
 }

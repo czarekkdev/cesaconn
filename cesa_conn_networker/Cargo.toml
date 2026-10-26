@@ -8,10 +8,15 @@ publish = false
 name = "cesa_conn_networker"
 path = "src/cesa_conn_networker.rs"
 
+[features]
+# servertest / clienttest manual end-to-end commands; never in release builds
+test-commands = []
+
 [dependencies]
 btleplug = "0.11.8"
 tokio = { version = "1.50.0", features = ["full"] }
 cesa_conn_crypto = { path = "../cesa_conn_crypto" }
+cesa_conn_system = { path = "../cesa_conn_system" }
 tokio-util = "0.7.18"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -20,7 +25,20 @@ snow = "0.10.0"
 rand = "0.10.1"
 libcrux-ml-kem = "0.0.11"
 spake2 = "0.4.0"
-hkdf = "0.13.0"
-blake2 = "0.11.0-rc.6"
+hkdf = "0.12.4"
+blake2 = "0.10.6"
 subtle = "2.6.1"
 libcrux-ml-dsa = "0.0.11"
+
+[target.'cfg(unix)'.dependencies]
+# geteuid() / peer audit token without unsafe
+nix = { version = "0.31.3", features = ["socket", "user"] }
+
+# IPC client code-signature check (see ipc_server.rs)
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10.1"
+security-framework = "3.7.0"
+
+[dev-dependencies]
+# paused clock for lockout tests
+tokio = { version = "1.50.0", features = ["full", "test-util"] }

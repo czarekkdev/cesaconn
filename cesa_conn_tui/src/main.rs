@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 fn main() -> std::io::Result<()> {
     let mut terminal = ratatui::init();
     let mut app = cesa_conn_tui::App::new();
