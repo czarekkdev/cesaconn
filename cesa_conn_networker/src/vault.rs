@@ -37,13 +37,13 @@ use cesa_conn_crypto::{
 };
 use cesa_conn_system::ipc::check_private_dir;
 
-use crate::auth_snow::{AuthKey, DataKey};
+use crate::auth_snow::{AuthKey, DataKey, IDENTITY_SEED_LEN};
 
 /* format constants */
 /// File magic.
 const MAGIC: &[u8; 8] = b"CESAVLT\0";
 /// Format version.
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 /// -> magic (8) + version (1)
 const HEADER_LEN: usize = 9;
 /// AES-GCM nonce (12) and tag (16)
@@ -69,8 +69,12 @@ const DATA_LABEL: &[u8] = b"cesaconn-vault-data";
 const TAG_A_KEY: u8 = 0x01;
 const TAG_A_SALT: u8 = 0x02;
 const TAG_CONFIG: u8 = 0x03;
+const TAG_IDENTITY: u8 = 0x04;
+const TAG_PEERS: u8 = 0x05;
 /// Largest config blob (bytes).
 pub const MAX_CONFIG_LEN: usize = 64 * 1024;
+/// Largest encoded trusted-peer list (256 peers of about 2.9 KB fit).
+pub const MAX_PEERS_LEN: usize = 1024 * 1024;
 
 /// Vault file name inside the private data directory.
 const FILE_NAME: &str = "vault.bin";
@@ -158,23 +162,31 @@ pub struct VaultContents {
     pub a_salt: Zeroizing<[u8; 32]>,
     /// Daemon settings (opaque here); empty until there are settings.
     pub config: Zeroizing<Vec<u8>>,
+    /// This device's identity seed (X25519 private key || ML-DSA seed).
+    pub identity: Zeroizing<[u8; IDENTITY_SEED_LEN]>,
+    /// Trusted peers, encoded by `auth_snow::encode_peers` (opaque here).
+    pub peers: Zeroizing<Vec<u8>>,
 }
 
 impl VaultContents {
     /// TLV encoding, pre-sized so the buffer never reallocates.
     fn encode(&self) -> Result<Zeroizing<Vec<u8>>, VaultErrors> {
-        if self.config.len() > MAX_CONFIG_LEN {
+        if self.config.len() > MAX_CONFIG_LEN || self.peers.len() > MAX_PEERS_LEN {
             return Err(VaultErrors::TooLarge);
         }
 
-        // three entries of tag (1) + len (4), two 32-byte values, the config
-        let len = (5 + 32 + 5 + 32 + 5_usize).saturating_add(self.config.len());
+        // five entries of tag (1) + len (4), the values
+        let len = (5 * 5 + 32 + 32 + IDENTITY_SEED_LEN)
+            .saturating_add(self.config.len())
+            .saturating_add(self.peers.len());
         let mut out = Zeroizing::new(Vec::with_capacity(len));
 
         for (tag, value) in [
             (TAG_A_KEY, self.a_key.expose().as_slice()),
             (TAG_A_SALT, self.a_salt.as_slice()),
             (TAG_CONFIG, self.config.as_slice()),
+            (TAG_IDENTITY, self.identity.as_slice()),
+            (TAG_PEERS, self.peers.as_slice()),
         ] {
             let value_len = u32::try_from(value.len()).map_err(|_| VaultErrors::TooLarge)?;
             out.push(tag);
@@ -190,15 +202,24 @@ impl VaultContents {
         let (a_key, rest) = take_entry(bytes, TAG_A_KEY)?;
         let (a_salt, rest) = take_entry(rest, TAG_A_SALT)?;
         let (config, rest) = take_entry(rest, TAG_CONFIG)?;
+        let (identity, rest) = take_entry(rest, TAG_IDENTITY)?;
+        let (peers, rest) = take_entry(rest, TAG_PEERS)?;
 
-        if !rest.is_empty() || config.len() > MAX_CONFIG_LEN {
+        if !rest.is_empty() || config.len() > MAX_CONFIG_LEN || peers.len() > MAX_PEERS_LEN {
             return None;
         }
+
+        // exact length, copied straight into a zeroizing buffer
+        let identity: &[u8; IDENTITY_SEED_LEN] = identity.try_into().ok()?;
+        let mut identity_seed = Zeroizing::new([0u8; IDENTITY_SEED_LEN]);
+        identity_seed.copy_from_slice(identity);
 
         Some(Self {
             a_key: AuthKey::from_bytes(a_key.try_into().ok()?),
             a_salt: Zeroizing::new(a_salt.try_into().ok()?),
             config: Zeroizing::new(config.to_vec()),
+            identity: identity_seed,
+            peers: Zeroizing::new(peers.to_vec()),
         })
     }
 }
@@ -502,6 +523,8 @@ mod tests {
             a_key: AuthKey::from_bytes(&[0xA1; 32]),
             a_salt: Zeroizing::new([0xA5; 32]),
             config: Zeroizing::new(config.to_vec()),
+            identity: Zeroizing::new([0x1D; IDENTITY_SEED_LEN]),
+            peers: Zeroizing::new(b"peer list".to_vec()),
         }
     }
 
@@ -527,6 +550,56 @@ mod tests {
         assert_eq!(**opened.contents.a_key.expose(), [0xA1; 32]);
         assert_eq!(*opened.contents.a_salt, [0xA5; 32]);
         assert_eq!(opened.contents.config.as_slice(), b"cfg");
+        assert_eq!(*opened.contents.identity, [0x1D; IDENTITY_SEED_LEN]);
+        assert_eq!(opened.contents.peers.as_slice(), b"peer list");
+    }
+
+    /// Test that a vault of the previous version (no identity) is refused as
+    /// "not a vault of this version", not misread
+    #[test]
+    fn test_old_version_refused() {
+        let kek = [3u8; 32];
+        let mut file = sealed(&kek, b"");
+        file[HEADER_LEN - 1] = 1;
+        assert_eq!(open(&kek, &file).err(), Some(VaultErrors::Malformed));
+    }
+
+    /// Test that decoding is strict about the new entries: wrong identity
+    /// length, missing or reordered entries, trailing bytes
+    #[test]
+    fn test_decode_strict_entries() {
+        let good = contents(b"c").encode().unwrap();
+        assert!(VaultContents::decode(&good).is_some());
+
+        let mut trailing = good.to_vec();
+        trailing.push(0);
+        assert!(VaultContents::decode(&trailing).is_none());
+
+        // identity one byte short (entry length and value both shortened)
+        let mut short = contents(b"c");
+        short.peers = Zeroizing::new(Vec::new());
+        let mut bytes = short.encode().unwrap().to_vec();
+        let id_at = bytes
+            .windows(5)
+            .position(|w| w == [TAG_IDENTITY, 64, 0, 0, 0])
+            .unwrap();
+        bytes[id_at + 1] = 63;
+        bytes.remove(id_at + 5);
+        assert!(VaultContents::decode(&bytes).is_none());
+
+        // identity one byte long
+        let mut bytes = short.encode().unwrap().to_vec();
+        let id_at = bytes
+            .windows(5)
+            .position(|w| w == [TAG_IDENTITY, 64, 0, 0, 0])
+            .unwrap();
+        bytes[id_at + 1] = 65;
+        bytes.insert(id_at + 5, 0);
+        assert!(VaultContents::decode(&bytes).is_none());
+
+        // peers entry missing
+        let cut = good.windows(1).rposition(|w| w == [TAG_PEERS]).unwrap();
+        assert!(VaultContents::decode(&good[..cut]).is_none());
     }
 
     /// Test that a wrong KEK (wrong data password) is reported as such
@@ -580,7 +653,13 @@ mod tests {
         let kek = [3u8; 32];
         let file = sealed(&kek, b"listen_port=3232");
 
-        for secret in [[0xA1u8; 32].as_slice(), &[0xA5u8; 32], b"listen_port"] {
+        for secret in [
+            [0xA1u8; 32].as_slice(),
+            &[0xA5u8; 32],
+            &[0x1D; IDENTITY_SEED_LEN],
+            b"listen_port",
+            b"peer list",
+        ] {
             assert!(!file.windows(secret.len()).any(|w| w == secret));
         }
     }
@@ -667,6 +746,13 @@ mod tests {
         let wrapped = wrap_dek(&[1; 32], &dek).unwrap();
         assert_eq!(
             seal(&wrapped, &dek, &contents(&vec![0; MAX_CONFIG_LEN + 1])).err(),
+            Some(VaultErrors::TooLarge)
+        );
+
+        let mut many_peers = contents(b"");
+        many_peers.peers = Zeroizing::new(vec![0; MAX_PEERS_LEN + 1]);
+        assert_eq!(
+            seal(&wrapped, &dek, &many_peers).err(),
             Some(VaultErrors::TooLarge)
         );
     }
