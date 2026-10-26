@@ -38,7 +38,10 @@ use cesa_conn_system::{
 };
 
 use crate::{
-    auth_snow::{AuthKey, DataKey, TrustedPeer},
+    auth_snow::{
+        AuthKey, DataKey, DeviceKeypairs, IDENTITY_SEED_LEN, TrustedPeer, decode_peers,
+        encode_peers,
+    },
     ipc_server::{self, ClientPolicy},
     vault::{self, Salts, VaultContents, VaultErrors, WrappedDek},
 };
@@ -60,6 +63,8 @@ struct OpenVault {
     wrapped: WrappedDek,
     storage_salt: Salt,
     config: Zeroizing<Vec<u8>>,
+    /// This device's identity seed: made with the vault, kept for good.
+    identity: Zeroizing<[u8; IDENTITY_SEED_LEN]>,
 }
 
 /// The keys the user has set so far, their salts, and the vault state.
@@ -397,12 +402,27 @@ impl Daemon {
         Ok(())
     }
 
+    /// The trusted peers, encoded for the vault. Read before the key lock is
+    /// taken, so the two locks are never held together.
+    async fn encoded_peers(&self) -> Result<Zeroizing<Vec<u8>>, DaemonError> {
+        let peers = self.trusted_peers.read().await;
+        let encoded = encode_peers(&peers).ok_or_else(|| {
+            error!("trusted peers don't fit in the vault");
+            DaemonError::StorageFailed
+        })?;
+        drop(peers);
+
+        Ok(Zeroizing::new(encoded))
+    }
+
     /// Re-saves the open vault with a changed key. A new `d_key` re-wraps the
     /// DEK (and replaces the automatic-login key); a new `a_key` re-seals.
     async fn save_changed_key(&self, kind: KeyKind, key: &[u8; 32]) -> Result<(), DaemonError> {
         let Some(storage) = &self.storage else {
             return Ok(());
         };
+
+        let peers = self.encoded_peers().await?;
 
         let (file, new_wrap, auto_login) = {
             let keys = self.keys.read().await;
@@ -427,6 +447,8 @@ impl Daemon {
                 a_key,
                 a_salt: a_salt.clone(),
                 config: open.config.clone(),
+                identity: open.identity.clone(),
+                peers,
             };
             let file = vault::seal(&wrapped, &open.dek, &contents).map_err(storage_error)?;
 
@@ -487,6 +509,10 @@ impl Daemon {
             return;
         };
 
+        let Ok(peers) = self.encoded_peers().await else {
+            return;
+        };
+
         let prepared = {
             (|| {
                 let storage_salt = random_array::<32>().map_err(|_| VaultErrors::Crypto)?;
@@ -498,10 +524,14 @@ impl Daemon {
                 let kek = vault::derive_kek(&d_key, &storage_salt)?;
                 let wrapped = vault::wrap_dek(&kek, &dek)?;
                 let config = Zeroizing::new(Vec::new());
+                // the device identity is born with the vault
+                let identity = DeviceKeypairs::new_seed().map_err(|_| VaultErrors::Crypto)?;
                 let contents = VaultContents {
                     a_key: a_key.clone(),
                     a_salt: a_salt.clone(),
                     config: config.clone(),
+                    identity: identity.clone(),
+                    peers,
                 };
                 let file = vault::seal(&wrapped, &dek, &contents)?;
 
@@ -513,6 +543,7 @@ impl Daemon {
                         wrapped,
                         storage_salt,
                         config,
+                        identity,
                     },
                 ))
             })()
@@ -626,6 +657,12 @@ impl Daemon {
 
         let kek = vault::derive_kek(&d_key, &salts.storage_salt).map_err(storage_error)?;
         let opened = vault::open(&kek, &file).map_err(storage_error)?;
+        let peers = decode_peers(&opened.contents.peers).ok_or_else(|| {
+            error!("saved trusted peers are damaged");
+            DaemonError::StorageFailed
+        })?;
+
+        *self.trusted_peers.write().await = peers;
 
         let mut keys = self.keys.write().await;
         keys.a_key = Some(opened.contents.a_key);
@@ -637,6 +674,7 @@ impl Daemon {
             wrapped: opened.wrapped,
             storage_salt: salts.storage_salt,
             config: opened.contents.config,
+            identity: opened.contents.identity,
         });
         keys.locked = false;
         drop(keys);
@@ -1319,6 +1357,94 @@ mod tests {
         // the dropped request never ran
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert!(!daemon.status().await.auth_key_set);
+    }
+
+    /// The identity seed of an open vault.
+    async fn identity_seed(daemon: &Daemon) -> [u8; IDENTITY_SEED_LEN] {
+        **daemon
+            .keys
+            .read()
+            .await
+            .vault
+            .as_ref()
+            .map(|open| &open.identity)
+            .unwrap()
+    }
+
+    /// Test that the device identity is made with the vault and is the same
+    /// after a restart (no re-pairing), and differs between devices
+    #[tokio::test]
+    async fn test_identity_survives_restart() {
+        let storage = TestStorage::new("identity");
+        let daemon = storage.daemon().await;
+        setup(&daemon).await;
+        let before = identity_seed(&daemon).await;
+        assert_ne!(before, [0u8; IDENTITY_SEED_LEN]);
+        drop(daemon);
+
+        let daemon = storage.daemon().await;
+        ask(&daemon, Request::Unlock(update(DATA_PW)))
+            .await
+            .unwrap();
+        assert_eq!(identity_seed(&daemon).await, before);
+
+        // a re-save (password change) keeps it too
+        ask(
+            &daemon,
+            Request::SetDataPassword(update(b"new data password")),
+        )
+        .await
+        .unwrap();
+        drop(daemon);
+        let daemon = storage.daemon().await;
+        ask(&daemon, Request::Unlock(update(b"new data password")))
+            .await
+            .unwrap();
+        assert_eq!(identity_seed(&daemon).await, before);
+
+        let other = TestStorage::new("identity-other");
+        let other_daemon = other.daemon().await;
+        setup(&other_daemon).await;
+        assert_ne!(identity_seed(&other_daemon).await, before);
+    }
+
+    /// Test that trusted peers are saved in the vault and come back on unlock
+    #[tokio::test]
+    async fn test_peers_survive_restart() {
+        let storage = TestStorage::new("peers");
+        let daemon = storage.daemon().await;
+        daemon
+            .trusted_peers
+            .write()
+            .await
+            .push(TrustedPeer::for_test(7, "phone"));
+        setup(&daemon).await;
+        drop(daemon);
+
+        let daemon = storage.daemon().await;
+        assert!(daemon.peers().await.is_empty());
+        ask(&daemon, Request::Unlock(update(DATA_PW)))
+            .await
+            .unwrap();
+
+        let peers = daemon.peers().await;
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].name, "phone");
+        assert_eq!(peers[0].fingerprint, [7; 8]);
+
+        // a re-save (password change) keeps them
+        ask(
+            &daemon,
+            Request::SetAuthPassword(update(b"other auth password")),
+        )
+        .await
+        .unwrap();
+        drop(daemon);
+        let daemon = storage.daemon().await;
+        ask(&daemon, Request::Unlock(update(DATA_PW)))
+            .await
+            .unwrap();
+        assert_eq!(daemon.peers().await.len(), 1);
     }
 
     /// Test that without storage nothing can be unlocked or auto-logged

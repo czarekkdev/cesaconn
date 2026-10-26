@@ -625,18 +625,37 @@ pub struct DeviceKeypairs {
     mldsa_kep: MLDSA87KeyPair,
 }
 
+/// Length of an identity seed: X25519 private key (32) || ML-DSA-87 seed (32).
+pub const IDENTITY_SEED_LEN: usize = 64;
+
 impl DeviceKeypairs {
-    /// Generates a fresh random X25519 and ML-DSA-87 key pair.
-    /// Only call this once, when the device is set up.
+    /// A fresh random identity seed. Made once, when the device is set up,
+    /// then kept in the encrypted vault: the same seed is the same device.
+    pub fn new_seed() -> Result<Zeroizing<[u8; IDENTITY_SEED_LEN]>, AuthSnowErrors> {
+        random_array::<IDENTITY_SEED_LEN>().map_err(|_| AuthSnowErrors::FailedToGenerateRandomData)
+    }
+
+    /// The key pairs of a seed (deterministic).
+    ///
+    /// The ML-DSA seed is passed by value because libcrux takes it that way;
+    /// that stack copy is not wiped (libcrux limitation, upstream issue).
+    pub fn from_seed(seed: &Zeroizing<[u8; IDENTITY_SEED_LEN]>) -> Self {
+        let mut x25519_private = Zeroizing::new([0u8; 32]);
+        let mut mldsa_seed = Zeroizing::new([0u8; 32]);
+        let (x, m) = seed.split_at(32);
+        x25519_private.copy_from_slice(x);
+        mldsa_seed.copy_from_slice(m);
+
+        Self {
+            x25519_kep: generate_new_key_pair(&x25519_private),
+            mldsa_kep: generate_key_pair(*mldsa_seed),
+        }
+    }
+
+    /// A fresh random identity that is never saved (tests, manual test commands).
+    #[cfg(any(test, feature = "test-commands"))]
     pub fn generate() -> Result<Self, AuthSnowErrors> {
-        Ok(Self {
-            x25519_kep: generate_new_key_pair(
-                &random_array::<32>().map_err(|_| AuthSnowErrors::FailedToGenerateRandomData)?,
-            ),
-            mldsa_kep: generate_key_pair(
-                *random_array::<32>().map_err(|_| AuthSnowErrors::FailedToGenerateRandomData)?,
-            ),
-        })
+        Ok(Self::from_seed(&Self::new_seed()?))
     }
 }
 
@@ -651,7 +670,96 @@ pub struct TrustedPeer {
     name: String,
 }
 
+/// Most trusted peers kept (each is about 2.7 KB in the vault).
+pub const MAX_TRUSTED_PEERS: usize = 256;
+/// Longest saved peer name (bytes, UTF-8).
+pub const MAX_PEER_NAME_LEN: usize = 255;
+/// One encoded peer without its name: x25519 key, ML-DSA key, name length.
+const ENCODED_PEER_FIXED_LEN: usize = 32 + MLDSA87_VK_LEN + 1;
+
+/// A peer name that is safe to keep and show: at most [`MAX_PEER_NAME_LEN`]
+/// bytes and no control characters (no terminal escape sequences in the TUI).
+fn valid_peer_name(name: &str) -> bool {
+    name.len() <= MAX_PEER_NAME_LEN && !name.chars().any(char::is_control)
+}
+
+/// Encodes the trusted peers for the vault:
+/// `count (u16 LE) || (x25519 (32) || ML-DSA vk || name len (u8) || name)*`.
+/// `None` if there are too many or a name isn't valid ([`valid_peer_name`]).
+pub fn encode_peers(peers: &[TrustedPeer]) -> Option<Vec<u8>> {
+    if peers.len() > MAX_TRUSTED_PEERS || !peers.iter().all(|p| valid_peer_name(&p.name)) {
+        return None;
+    }
+
+    let count = u16::try_from(peers.len()).ok()?;
+    let len = peers.iter().try_fold(2usize, |len, peer| {
+        len.checked_add(ENCODED_PEER_FIXED_LEN)?
+            .checked_add(peer.name.len())
+    })?;
+    let mut out = Vec::with_capacity(len);
+    out.extend_from_slice(&count.to_le_bytes());
+
+    for peer in peers {
+        let name_len = u8::try_from(peer.name.len()).ok()?;
+        out.extend_from_slice(&peer.x25519_pub_key);
+        out.extend_from_slice(&peer.mldsa_verification_key);
+        out.push(name_len);
+        out.extend_from_slice(peer.name.as_bytes());
+    }
+
+    Some(out)
+}
+
+/// Strict inverse of [`encode_peers`]: exact length, valid names, no
+/// duplicate keys. `None` on anything else.
+pub fn decode_peers(bytes: &[u8]) -> Option<Vec<TrustedPeer>> {
+    let (count, mut rest) = bytes.split_first_chunk::<2>()?;
+    let count = usize::from(u16::from_le_bytes(*count));
+    if count > MAX_TRUSTED_PEERS {
+        return None;
+    }
+
+    let mut peers: Vec<TrustedPeer> = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (x25519_pub_key, after) = rest.split_first_chunk::<32>()?;
+        let (mldsa_verification_key, after) = after.split_first_chunk::<MLDSA87_VK_LEN>()?;
+        let (&name_len, after) = after.split_first()?;
+        let (name, after) = after.split_at_checked(usize::from(name_len))?;
+        let name = std::str::from_utf8(name).ok()?;
+        if !valid_peer_name(name) {
+            return None;
+        }
+        let name = name.to_owned();
+
+        if peers
+            .iter()
+            .any(|p| p.x25519_pub_key.ct_eq(x25519_pub_key).into())
+        {
+            return None;
+        }
+
+        peers.push(TrustedPeer {
+            x25519_pub_key: *x25519_pub_key,
+            mldsa_verification_key: *mldsa_verification_key,
+            name,
+        });
+        rest = after;
+    }
+
+    rest.is_empty().then_some(peers)
+}
+
 impl TrustedPeer {
+    /// A made-up peer for tests: every key byte is `byte`.
+    #[cfg(test)]
+    pub fn for_test(byte: u8, name: &str) -> Self {
+        Self {
+            x25519_pub_key: [byte; 32],
+            mldsa_verification_key: [byte; MLDSA87_VK_LEN],
+            name: name.to_owned(),
+        }
+    }
+
     /// Human-readable device name shown to the user.
     pub fn name(&self) -> &str {
         &self.name
@@ -1004,16 +1112,25 @@ async fn confirm_pairing(
 
 /// Adds `peer` to `trusted_peers` unless a device with the same static key is
 /// already there. Checked under the write lock, so two parallel pairings of the
-/// same device can't both add it.
-async fn save_peer(trusted_peers: &TrustedPeers, peer: &TrustedPeer) {
+/// same device can't both add it. Fails when [`MAX_TRUSTED_PEERS`] are saved
+/// (more wouldn't fit in the vault).
+async fn save_peer(trusted_peers: &TrustedPeers, peer: &TrustedPeer) -> Result<(), AuthSnowErrors> {
     let mut peers = trusted_peers.write().await;
 
-    if !peers
+    let known = peers
         .iter()
-        .any(|saved| saved.x25519_pub_key.ct_eq(&peer.x25519_pub_key).into())
-    {
+        .any(|saved| saved.x25519_pub_key.ct_eq(&peer.x25519_pub_key).into());
+    let result = if known {
+        Ok(())
+    } else if peers.len() >= MAX_TRUSTED_PEERS {
+        Err(AuthSnowErrors::FailedToPairNewDevice)
+    } else {
         peers.push(peer.clone());
-    }
+        Ok(())
+    };
+    drop(peers);
+
+    result
 }
 
 /// Identifies the peer after the Noise handshake, the same for both roles.
@@ -1475,8 +1592,14 @@ async fn finish_auth(
     };
 
     if !both_saved {
+        // full: refuse before asking the user, not after they said yes
+        if trusted_peers.read().await.len() >= MAX_TRUSTED_PEERS {
+            tracing::warn!("too many trusted devices: remove one before pairing another");
+            return Err(AuthSnowErrors::FailedToPairNewDevice);
+        }
+
         confirm_pairing(&mut secure_connection, role, &handshake_hash, pair_fallback).await?;
-        save_peer(trusted_peers, &peer).await;
+        save_peer(trusted_peers, &peer).await?;
     }
 
     Ok(Some((secure_connection, peer)))
@@ -2013,5 +2136,136 @@ mod tests {
         ] {
             assert!(!e.to_string().is_empty());
         }
+    }
+
+    /// Test that the same identity seed gives the same keys, a different seed
+    /// different ones (a restart must look like the same device)
+    #[test]
+    fn test_identity_from_seed() {
+        let seed = DeviceKeypairs::new_seed().unwrap();
+        let a = DeviceKeypairs::from_seed(&seed);
+        let b = DeviceKeypairs::from_seed(&seed);
+        let other = DeviceKeypairs::from_seed(&DeviceKeypairs::new_seed().unwrap());
+
+        assert_eq!(*a.x25519_kep.public, *b.x25519_kep.public);
+        assert_eq!(
+            a.mldsa_kep.verification_key.as_slice(),
+            b.mldsa_kep.verification_key.as_slice()
+        );
+        assert_ne!(*a.x25519_kep.public, *other.x25519_kep.public);
+        assert_ne!(
+            a.mldsa_kep.verification_key.as_slice(),
+            other.mldsa_kep.verification_key.as_slice()
+        );
+    }
+
+    /// Test that trusted peers encode and decode back unchanged
+    #[test]
+    fn test_peers_roundtrip() {
+        let peers = vec![
+            TrustedPeer::for_test(1, "laptop"),
+            TrustedPeer::for_test(2, "zażółć"),
+            TrustedPeer::for_test(3, ""),
+        ];
+        let decoded = decode_peers(&encode_peers(&peers).unwrap()).unwrap();
+
+        assert_eq!(decoded.len(), 3);
+        for (a, b) in peers.iter().zip(&decoded) {
+            assert_eq!(a.x25519_pub_key, b.x25519_pub_key);
+            assert_eq!(a.mldsa_verification_key, b.mldsa_verification_key);
+            assert_eq!(a.name, b.name);
+        }
+        assert_eq!(decode_peers(&encode_peers(&[]).unwrap()).unwrap().len(), 0);
+    }
+
+    /// Test that the peer list decoding is strict
+    #[test]
+    fn test_peers_decode_strict() {
+        let good = encode_peers(&[TrustedPeer::for_test(1, "ab")]).unwrap();
+
+        // truncated anywhere, or extra bytes
+        for cut in 0..good.len() {
+            assert!(decode_peers(&good[..cut]).is_none(), "cut at {cut}");
+        }
+        let mut longer = good.clone();
+        longer.push(0);
+        assert!(decode_peers(&longer).is_none());
+
+        // name not UTF-8
+        let mut bad_name = good.clone();
+        let last = bad_name.len() - 1;
+        bad_name[last] = 0xFF;
+        assert!(decode_peers(&bad_name).is_none());
+
+        // a terminal escape sequence in a name
+        let escape = encode_peers(&[TrustedPeer::for_test(1, "ab")]).unwrap();
+        let mut escape = escape.clone();
+        let last = escape.len() - 2;
+        escape[last] = 0x1B;
+        assert!(decode_peers(&escape).is_none());
+
+        // the same key twice
+        let twice =
+            encode_peers(&[TrustedPeer::for_test(1, "a"), TrustedPeer::for_test(1, "b")]).unwrap();
+        assert!(decode_peers(&twice).is_none());
+
+        // count above the limit
+        let mut too_many = good.clone();
+        too_many[..2].copy_from_slice(&u16::try_from(MAX_TRUSTED_PEERS + 1).unwrap().to_le_bytes());
+        assert!(decode_peers(&too_many).is_none());
+    }
+
+    /// Test that too many peers or too long a name can't be encoded
+    #[test]
+    fn test_peers_encode_limits() {
+        let many: Vec<_> = (0..=MAX_TRUSTED_PEERS)
+            .map(|i| TrustedPeer::for_test(u8::try_from(i % 256).unwrap(), ""))
+            .collect();
+        assert!(encode_peers(&many).is_none());
+        assert!(encode_peers(&many[..MAX_TRUSTED_PEERS]).is_some());
+
+        let long = "x".repeat(MAX_PEER_NAME_LEN + 1);
+        assert!(encode_peers(&[TrustedPeer::for_test(1, &long)]).is_none());
+        let longest = "x".repeat(MAX_PEER_NAME_LEN);
+        assert!(encode_peers(&[TrustedPeer::for_test(1, &longest)]).is_some());
+
+        for bad in ["a\u{1b}[2J", "new\nline", "\u{7f}", "\u{9b}"] {
+            assert!(
+                encode_peers(&[TrustedPeer::for_test(1, bad)]).is_none(),
+                "{bad:?}"
+            );
+        }
+        assert!(encode_peers(&[TrustedPeer::for_test(1, "Laptop Czarka 💻")]).is_some());
+    }
+
+    /// Test that saving a peer is idempotent and stops at the limit
+    #[tokio::test]
+    async fn test_save_peer_limit() {
+        let peers: TrustedPeers = Arc::default();
+        save_peer(&peers, &TrustedPeer::for_test(1, "a"))
+            .await
+            .unwrap();
+        save_peer(&peers, &TrustedPeer::for_test(1, "a"))
+            .await
+            .unwrap();
+        assert_eq!(peers.read().await.len(), 1);
+
+        {
+            let mut list = peers.write().await;
+            list.clear();
+            for i in 0..MAX_TRUSTED_PEERS {
+                let mut peer = TrustedPeer::for_test(0, "");
+                peer.x25519_pub_key[..8].copy_from_slice(&u64::try_from(i).unwrap().to_le_bytes());
+                list.push(peer);
+            }
+        }
+        assert!(
+            save_peer(&peers, &TrustedPeer::for_test(0xEE, "new"))
+                .await
+                .is_err()
+        );
+        // one already saved is still fine when full
+        let first = peers.read().await[0].clone();
+        save_peer(&peers, &first).await.unwrap();
     }
 }
