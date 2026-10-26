@@ -1,22 +1,30 @@
 //! UI <-> daemon IPC: wire protocol, socket location and the client side.
 //!
 //! Security model
-//! * The daemon owns `a_key` / `d_key` and NEVER sends them out. The UI only
-//!   sends passwords (once, to set them) and gets status back.
+//! * The daemon owns `a_key` / `d_key` and their salts and NEVER sends them
+//!   out. The UI only sends passwords (once, to set them) and gets status back;
+//!   it holds nothing to keep.
 //! * The socket lives in a private directory (owner only, `0700`) that is
 //!   checked on every use, and is itself `0600`.
 //! * The daemon accepts a connection only from a process of the same user
 //!   (kernel peer credentials), and on macOS only from code whose signature
 //!   satisfies a requirement fixed at build time (see the networker).
+//! * The other way round too: the UI only talks to (and sends a password to)
+//!   a daemon of the same user, and on macOS only to one whose signature
+//!   satisfies [`DAEMON_CODE_REQUIREMENT`].
 //!
-//! Wire format (version 1), one request and one response per connection:
+//! Wire format (version 2), one request and one response per connection:
 //! `frame = length (u32 LE, 1..=MAX_FRAME_LEN) || body`
 //!
 //! Request body: `kind (1) || payload`
 //! * `0x01` Status
-//! * `0x02` SetAuthPassword: `salt (32) || password (1..=MAX_PASSWORD_LEN)`
-//! * `0x03` SetDataPassword: same
 //! * `0x04` ListPeers
+//! * `0x05` SetAuthPassword: `password (1..=MAX_PASSWORD_LEN)`; the daemon
+//!   picks the salt
+//! * `0x06` SetDataPassword: same
+//! * `0x02` / `0x03` are retired (version 1 sent `salt || password` there).
+//!   They are refused, so a mismatched UI and daemon fail loudly instead of
+//!   deriving a key from the wrong bytes.
 //!
 //! Response body: `0x00 || payload` on success, `0x01 || error code (1)` on error
 //! * Status: `flags (1) || trusted peers (u32 LE)`; flags bit 0 = auth key set,
@@ -42,18 +50,36 @@ pub const MAX_PASSWORD_LEN: usize = 1024;
 pub const MAX_LISTED_PEERS: usize = 256;
 /// Timeout for every single read / write (seconds).
 pub const IO_TIMEOUT: Duration = Duration::from_secs(5);
-/// Argon2 salt length (bytes).
-pub const SALT_LEN: usize = 32;
 /// Bytes of a peer's key shown as its fingerprint.
 pub const FINGERPRINT_LEN: usize = 8;
 
 /// longest `ListPeers` body: status + count + every peer at full name length
 const MAX_PEERS_BODY: usize = 1 + 2 + MAX_LISTED_PEERS * (FINGERPRINT_LEN + 1 + 255);
-/// longest request body: kind + salt + password
-const MAX_REQUEST_BODY: usize = 1 + SALT_LEN + MAX_PASSWORD_LEN;
+/// longest request body: kind + password
+const MAX_REQUEST_BODY: usize = 1 + MAX_PASSWORD_LEN;
 
 const _: () = assert!(MAX_PEERS_BODY <= MAX_FRAME_LEN as usize);
 const _: () = assert!(MAX_REQUEST_BODY <= MAX_FRAME_LEN as usize);
+
+/// Code requirement the daemon must satisfy (macOS), fixed when the UI is built:
+/// `CESA_IPC_DAEMON_CODE_REQUIREMENT='anchor apple generic and certificate
+/// leaf[subject.OU] = "TEAMID" and identifier "dev.czarekk.cesaconn.daemon"'`
+///
+/// Only meaningful with a Developer ID signature and the hardened runtime on
+/// the daemon. Unset: the daemon is checked by uid only, and the UI says so.
+pub const DAEMON_CODE_REQUIREMENT: Option<&str> = option_env!("CESA_IPC_DAEMON_CODE_REQUIREMENT");
+
+/// Whether the daemon's code signature is checked before anything is sent.
+pub fn daemon_signature_checked() -> bool {
+    DAEMON_CODE_REQUIREMENT.is_some()
+}
+
+/// `false` if a requirement was built in but doesn't parse (or this platform
+/// has no code signing): then every daemon is refused, which fails closed.
+pub fn daemon_requirement_valid() -> bool {
+    DAEMON_CODE_REQUIREMENT
+        .is_none_or(|requirement| crate::code_signature::validate_requirement(requirement).is_ok())
+}
 
 /// Socket file name inside the private directory.
 const SOCKET_NAME: &str = "daemon.sock";
@@ -62,9 +88,9 @@ const DIR_NAME: &str = "cesaconn";
 
 /* request kinds */
 const REQ_STATUS: u8 = 0x01;
-const REQ_SET_AUTH_PASSWORD: u8 = 0x02;
-const REQ_SET_DATA_PASSWORD: u8 = 0x03;
 const REQ_LIST_PEERS: u8 = 0x04;
+const REQ_SET_AUTH_PASSWORD: u8 = 0x05;
+const REQ_SET_DATA_PASSWORD: u8 = 0x06;
 
 /* response status */
 const RESP_OK: u8 = 0x00;
@@ -83,7 +109,8 @@ pub enum IpcErrors {
     FailedToPrepareSocket,
     /// The daemon isn't running (nothing listens on the socket).
     FailedToConnect,
-    /// The process behind the socket runs as a different user.
+    /// The process behind the socket runs as a different user, or (macOS)
+    /// its code signature doesn't satisfy [`DAEMON_CODE_REQUIREMENT`].
     UntrustedDaemon,
     /// Reading from the socket failed or the peer closed it early.
     FailedToRead,
@@ -153,11 +180,10 @@ impl fmt::Display for DaemonError {
     }
 }
 
-/// A password plus the public salt to derive the key with. Wiped on drop.
+/// A password for the daemon to derive a key from. Wiped on drop.
+/// No `Debug` / `Clone`: it must not end up in logs or in a second copy.
 pub struct PasswordUpdate {
-    /// Argon2 salt (not secret, must be the same on every device).
-    pub salt: [u8; SALT_LEN],
-    /// The password, wiped on drop.
+    /// The password, exactly as typed (never trimmed), wiped on drop.
     pub password: Zeroizing<Vec<u8>>,
 }
 
@@ -202,16 +228,13 @@ pub enum Response {
     Peers(Vec<PeerInfo>),
 }
 
-/// Parses a `salt || password` payload.
-fn parse_password_update(payload: &[u8]) -> Option<PasswordUpdate> {
-    let (salt, password) = payload.split_first_chunk::<SALT_LEN>()?;
-
+/// Parses a `password` payload.
+fn parse_password_update(password: &[u8]) -> Option<PasswordUpdate> {
     if password.is_empty() || password.len() > MAX_PASSWORD_LEN {
         return None;
     }
 
     Some(PasswordUpdate {
-        salt: *salt,
         password: Zeroizing::new(password.to_vec()),
     })
 }
@@ -227,13 +250,12 @@ impl Request {
         };
 
         // sized up front so the buffer holding the password never reallocates
-        let len = update.map_or(0, |u| SALT_LEN.saturating_add(u.password.len()));
+        let len = update.map_or(0, |u| u.password.len());
         let mut body = Zeroizing::new(Vec::with_capacity(len.saturating_add(1)));
 
         body.push(kind);
 
         if let Some(update) = update {
-            body.extend_from_slice(&update.salt);
             body.extend_from_slice(&update.password);
         }
 
@@ -493,6 +515,16 @@ pub fn socket_path() -> Result<PathBuf, IpcErrors> {
 /// Sends `request` to the daemon at `path` and returns its answer.
 #[cfg(unix)]
 pub async fn request_at(path: &Path, request: &Request) -> Result<Response, IpcErrors> {
+    request_at_checked(path, request, DAEMON_CODE_REQUIREMENT).await
+}
+
+/// [`request_at`] with an explicit daemon code requirement (tests).
+#[cfg(unix)]
+async fn request_at_checked(
+    path: &Path,
+    request: &Request,
+    daemon_requirement: Option<&'static str>,
+) -> Result<Response, IpcErrors> {
     // the directory must still be private, or the socket could be someone else's
     check_private_dir(path.parent().ok_or(IpcErrors::FailedToPrepareSocket)?)?;
 
@@ -506,6 +538,13 @@ pub async fn request_at(path: &Path, request: &Request) -> Result<Response, IpcE
 
     if daemon.uid() != nix::unistd::geteuid().as_raw() {
         return Err(IpcErrors::UntrustedDaemon);
+    }
+
+    // macOS: ...and only to a daemon signed as required (fails closed elsewhere)
+    if let Some(requirement) = daemon_requirement {
+        crate::code_signature::verify_peer(&stream, requirement)
+            .await
+            .map_err(|_| IpcErrors::UntrustedDaemon)?;
     }
 
     write_frame(&mut stream, &request.encode()).await?;
@@ -533,7 +572,6 @@ mod tests {
 
     fn update(password: &[u8]) -> PasswordUpdate {
         PasswordUpdate {
-            salt: [7; SALT_LEN],
             password: Zeroizing::new(password.to_vec()),
         }
     }
@@ -546,6 +584,8 @@ mod tests {
             Request::ListPeers,
             Request::SetAuthPassword(update(b"hunter2")),
             Request::SetDataPassword(update(b"x")),
+            // spaces are part of the password, never trimmed
+            Request::SetAuthPassword(update(b" pass word ")),
         ] {
             let decoded = Request::decode(&req.encode()).unwrap();
             assert_eq!(decoded.encode().as_slice(), req.encode().as_slice());
@@ -558,20 +598,23 @@ mod tests {
         assert!(Request::decode(&[]).is_none());
         assert!(Request::decode(&[0x99]).is_none());
         assert!(Request::decode(&[REQ_STATUS, 0]).is_none());
-        // salt only, empty password
-        assert!(
-            Request::decode(&[&[REQ_SET_AUTH_PASSWORD][..], &[0; SALT_LEN]].concat()).is_none()
-        );
-        // salt cut short
-        assert!(Request::decode(&[REQ_SET_AUTH_PASSWORD, 1, 2, 3]).is_none());
+        // empty password
+        assert!(Request::decode(&[REQ_SET_AUTH_PASSWORD]).is_none());
+        // retired version-1 kinds (salt || password) are refused, not misread
+        for retired in [0x02u8, 0x03] {
+            let v1 = [&[retired][..], &[7; 32], b"password"].concat();
+            assert!(Request::decode(&v1).is_none());
+        }
         // password too long
         let long = [
             &[REQ_SET_DATA_PASSWORD][..],
-            &[0; SALT_LEN],
             &vec![b'a'; MAX_PASSWORD_LEN + 1],
         ]
         .concat();
         assert!(Request::decode(&long).is_none());
+        // longest allowed password still fits
+        let max = [&[REQ_SET_DATA_PASSWORD][..], &vec![b'a'; MAX_PASSWORD_LEN]].concat();
+        assert!(Request::decode(&max).is_some());
     }
 
     /// Test that every response kind round-trips
@@ -700,6 +743,56 @@ mod tests {
     async fn test_silent_peer_times_out() {
         let (_a, mut b) = tokio::io::duplex(64);
         assert_eq!(read_frame(&mut b).await.err(), Some(IpcErrors::Timeout));
+    }
+
+    /// Test that the UI checks the daemon's code signature before sending
+    /// anything (macOS; the test binary is not Apple-signed)
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn test_daemon_code_requirement_checked() {
+        let base = std::env::temp_dir().join(format!("cesa-ipc-sig-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let path = prepare_socket_dir(&base).unwrap();
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+
+        // fake daemon: answers Status, records whether it got any bytes
+        let server = tokio::spawn(async move {
+            let mut got_bytes = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let body = read_frame(&mut stream).await;
+                got_bytes.push(body.is_ok());
+                if body.is_ok() {
+                    let status = Response::Status(Status {
+                        auth_key_set: false,
+                        data_key_set: false,
+                        network_running: false,
+                        trusted_peers: 0,
+                    });
+                    write_frame(&mut stream, &status.encode()).await.unwrap();
+                }
+            }
+            got_bytes
+        });
+
+        let password = Request::SetAuthPassword(update(b"secret"));
+
+        // requirement not met: refused before a single byte is sent
+        assert_eq!(
+            request_at_checked(&path, &password, Some("anchor apple"))
+                .await
+                .err(),
+            Some(IpcErrors::UntrustedDaemon)
+        );
+        // requirement met: served
+        assert!(
+            request_at_checked(&path, &Request::Status, Some("! anchor apple"))
+                .await
+                .is_ok()
+        );
+
+        assert_eq!(server.await.unwrap(), vec![false, true]);
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// Test that the socket directory is created private and checked

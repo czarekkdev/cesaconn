@@ -315,13 +315,11 @@ dependencies = [
  "btleplug",
  "cesa_conn_crypto",
  "cesa_conn_system",
- "core-foundation",
  "hkdf",
  "libcrux-ml-dsa",
  "libcrux-ml-kem",
  "nix 0.31.3",
  "rand 0.10.3",
- "security-framework",
  "snow",
  "spake2",
  "subtle",
@@ -336,7 +334,9 @@ dependencies = [
 name = "cesa_conn_system"
 version = "0.1.0"
 dependencies = [
+ "core-foundation",
  "nix 0.31.3",
+ "security-framework",
  "tokio",
  "zeroize",
 ]
@@ -345,8 +345,10 @@ dependencies = [
 name = "cesa_conn_tui"
 version = "0.1.0"
 dependencies = [
+ "cesa_conn_system",
  "crossterm",
  "ratatui",
+ "tokio",
  "zeroize",
 ]
 

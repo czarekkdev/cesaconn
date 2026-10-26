@@ -1,7 +1,16 @@
 #![forbid(unsafe_code)]
 
 //! CesaConn terminal UI.
+//!
+//! Talks to the daemon over IPC ([`daemon_link`]): passwords go to the daemon,
+//! which derives and keeps the keys and their salts; the UI only shows status
+//! and paired devices. It keeps nothing key-related: a typed password lives in
+//! the zeroizing input buffer until Enter, is handed to the daemon link and
+//! wiped right away.
 
+mod daemon_link;
+
+use cesa_conn_system::ipc::{IpcErrors, PasswordUpdate, PeerInfo, Status};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
@@ -10,8 +19,20 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Tabs},
 };
-use std::{io, time::Duration};
+use std::{
+    io,
+    time::{Duration, Instant},
+};
 use zeroize::{Zeroize, Zeroizing};
+
+use daemon_link::{Command, DaemonLink, KeyKind, LinkEvent};
+
+/* setting labels the daemon link reads or writes */
+const AUTH_KEY_LABEL: &str = "Auth key";
+const DATA_KEY_LABEL: &str = "Data key";
+
+/// How often the daemon's status is asked for (seconds).
+const REFRESH_INTERVAL: u64 = 2;
 
 // ── Data types ────────────────────────────────────────────────────────────────
 
@@ -63,6 +84,19 @@ impl Setting {
     }
 }
 
+/// What the UI last heard from the daemon.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DaemonState {
+    /// Not asked yet.
+    Unknown,
+    /// Reachable, with its last status.
+    Up(Status),
+    /// Not reachable (not running, wrong user, ...).
+    Down(IpcErrors),
+    /// The link worker isn't running, nothing is sent any more.
+    NoLink,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Tab {
     Devices,
@@ -110,6 +144,14 @@ pub struct App {
     input_buf: Zeroizing<String>,
 
     pub should_quit: bool,
+
+    pub daemon: DaemonState,
+    /// Paired devices as reported by the daemon (public data only).
+    pub peers: Vec<PeerInfo>,
+    /// Commands waiting to be handed to the daemon link.
+    outbox: Vec<Command>,
+    /// A refresh is queued or running; don't stack more.
+    refresh_in_flight: bool,
 }
 
 impl App {
@@ -123,13 +165,13 @@ impl App {
             device_list_state,
             settings_basic: vec![
                 Setting {
-                    label: "Auth key",
+                    label: AUTH_KEY_LABEL,
                     kind: SettingKind::Secret { configured: false },
                     value: String::new(),
                     warn_message: None,
                 },
                 Setting {
-                    label: "Data key",
+                    label: DATA_KEY_LABEL,
                     kind: SettingKind::Secret { configured: false },
                     value: String::new(),
                     warn_message: None,
@@ -185,7 +227,26 @@ impl App {
             active_popup: ActivePopup::None,
             input_buf: Zeroizing::new(String::with_capacity(INPUT_CAPACITY)),
             should_quit: false,
+            daemon: DaemonState::Unknown,
+            peers: Vec::new(),
+            outbox: Vec::new(),
+            refresh_in_flight: false,
         }
+    }
+
+    /// Queues a status refresh unless one is already on its way.
+    fn request_refresh(&mut self) {
+        if !self.refresh_in_flight {
+            self.refresh_in_flight = true;
+            self.outbox.push(Command::Refresh);
+        }
+    }
+
+    fn setting_mut(&mut self, label: &str) -> Option<&mut Setting> {
+        self.settings_basic
+            .iter_mut()
+            .chain(self.settings_advanced.iter_mut())
+            .find(|s| s.label == label)
     }
 
     pub fn push_log(&mut self, msg: impl Into<String>) {
@@ -423,10 +484,14 @@ fn handle_edit_setting_input(app: &mut App, code: KeyCode) {
             clear_input(app);
         }
         KeyCode::Enter => {
-            // may be a password: the copy is zeroizing too
-            let new_value = Zeroizing::new(app.input_buf.trim().to_owned());
-            if !new_value.is_empty() {
-                apply_setting_edit(app, &new_value);
+            if selected_key_kind(app).is_some() {
+                // a password: exactly as typed (never trimmed), straight to the daemon
+                send_password_from_input(app);
+            } else {
+                let new_value = Zeroizing::new(app.input_buf.trim().to_owned());
+                if !new_value.is_empty() {
+                    apply_setting_edit(app, &new_value);
+                }
             }
             app.active_popup = ActivePopup::None;
             clear_input(app);
@@ -458,24 +523,107 @@ fn clear_input(app: &mut App) {
 fn apply_setting_edit(app: &mut App, new_value: &str) {
     let idx = app.settings_selected;
 
-    let (is_secret, is_text) = app
-        .active_settings()
-        .get(idx)
-        .map(|s| {
-            (
-                matches!(s.kind, SettingKind::Secret { .. }),
-                s.kind == SettingKind::Text,
-            )
-        })
-        .unwrap_or_default();
+    // secrets never come through here, see `send_password_from_input`
+    if let Some(s) = app.active_settings_mut().get_mut(idx)
+        && s.kind == SettingKind::Text
+    {
+        s.value = new_value.to_owned();
+    }
+}
 
-    if is_secret {
-        if let Some(s) = app.active_settings_mut().get_mut(idx) {
-            s.kind = SettingKind::Secret { configured: true };
+/// Which key the selected setting is, if it is one.
+fn selected_key_kind(app: &App) -> Option<KeyKind> {
+    match app.active_settings().get(app.settings_selected)?.label {
+        AUTH_KEY_LABEL => Some(KeyKind::Auth),
+        DATA_KEY_LABEL => Some(KeyKind::Data),
+        _ => None,
+    }
+}
+
+/// Hands the typed password to the daemon link. The only copy is an
+/// exact-size zeroizing buffer that the link drops right after sending; the
+/// caller wipes the input buffer. The daemon picks and keeps the salt.
+fn send_password_from_input(app: &mut App) {
+    let Some(kind) = selected_key_kind(app) else {
+        return;
+    };
+
+    if app.input_buf.is_empty() {
+        return;
+    }
+
+    let name = match kind {
+        KeyKind::Auth => "auth",
+        KeyKind::Data => "data",
+    };
+
+    app.outbox.push(Command::SetPassword {
+        kind,
+        update: PasswordUpdate {
+            password: Zeroizing::new(app.input_buf.as_bytes().to_vec()),
+        },
+    });
+    app.push_log(format!(
+        "[ INFO] Sending the {name} password to the daemon (deriving the key takes a moment)"
+    ));
+}
+
+/// Applies what the daemon link reported.
+fn handle_link_event(app: &mut App, event: LinkEvent) {
+    match event {
+        LinkEvent::Refreshed(Ok((status, peers))) => {
+            app.refresh_in_flight = false;
+
+            if !matches!(app.daemon, DaemonState::Up(_)) {
+                app.push_log("[ INFO] Connected to the daemon");
+            }
+
+            set_key_flags(app, status.auth_key_set, status.data_key_set);
+            app.peers = peers;
+            app.daemon = DaemonState::Up(status);
         }
-    } else if is_text {
-        if let Some(s) = app.active_settings_mut().get_mut(idx) {
-            s.value = new_value.to_owned();
+        LinkEvent::Refreshed(Err(e)) => {
+            app.refresh_in_flight = false;
+
+            // once per change, not every refresh
+            if app.daemon != DaemonState::Down(e) {
+                app.push_log(format!("[ WARN] Daemon not reachable: {e}"));
+            }
+
+            // nothing is known about keys or peers without the daemon
+            set_key_flags(app, false, false);
+            app.peers.clear();
+            app.daemon = DaemonState::Down(e);
+        }
+        LinkEvent::PasswordSet { kind, result } => {
+            let name = match kind {
+                KeyKind::Auth => "auth",
+                KeyKind::Data => "data",
+            };
+
+            match result {
+                Ok(()) => app.push_log(format!("[ INFO] The daemon set the {name} key")),
+                Err(e) => app.push_log(format!("[ERROR] Setting the {name} password failed: {e}")),
+            }
+
+            app.request_refresh();
+        }
+        LinkEvent::WorkerStopped => {
+            if app.daemon != DaemonState::NoLink {
+                app.push_log("[ERROR] The daemon link stopped, restart the UI");
+            }
+
+            set_key_flags(app, false, false);
+            app.peers.clear();
+            app.daemon = DaemonState::NoLink;
+        }
+    }
+}
+
+fn set_key_flags(app: &mut App, auth: bool, data: bool) {
+    for (label, configured) in [(AUTH_KEY_LABEL, auth), (DATA_KEY_LABEL, data)] {
+        if let Some(s) = app.setting_mut(label) {
+            s.kind = SettingKind::Secret { configured };
         }
     }
 }
@@ -564,8 +712,43 @@ fn render_content(frame: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn render_devices(frame: &mut Frame, area: Rect, app: &mut App) {
-    let [list_area, detail_area] =
+    let [left_area, detail_area] =
         Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).areas(area);
+
+    // paired devices come from the daemon; borders + at least one row
+    let paired_height = to_u16(app.peers.len().max(1).saturating_add(2)).min(left_area.height / 2);
+    let [paired_area, list_area] =
+        Layout::vertical([Constraint::Length(paired_height), Constraint::Min(0)]).areas(left_area);
+
+    let paired: Vec<ListItem> = if app.peers.is_empty() {
+        vec![ListItem::new(Span::styled(
+            "  none yet",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        app.peers
+            .iter()
+            .map(|p| {
+                ListItem::new(Line::from(vec![
+                    Span::styled("◆ ", Style::default().fg(Color::Green)),
+                    Span::raw(p.name.as_str()),
+                    Span::styled(
+                        format!("  {}", fingerprint_hex(&p.fingerprint)),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]))
+            })
+            .collect()
+    };
+
+    frame.render_widget(
+        List::new(paired).block(
+            Block::bordered()
+                .title(" Paired ")
+                .border_type(BorderType::Rounded),
+        ),
+        paired_area,
+    );
 
     let items: Vec<ListItem> = app
         .devices
@@ -751,7 +934,22 @@ fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
         .filter(|d| d.status == DeviceStatus::Connected)
         .count();
 
-    let right_str = format!(" {} connected ", connected);
+    let (daemon_str, daemon_color) = match &app.daemon {
+        DaemonState::Unknown => ("daemon: …".to_owned(), Color::DarkGray),
+        DaemonState::Up(s) => (
+            format!(
+                "daemon: keys {}/2, network {}, {} paired",
+                u8::from(s.auth_key_set).saturating_add(u8::from(s.data_key_set)),
+                if s.network_running { "on" } else { "off" },
+                s.trusted_peers
+            ),
+            Color::Green,
+        ),
+        DaemonState::Down(_) => ("daemon: not reachable".to_owned(), Color::Yellow),
+        DaemonState::NoLink => ("daemon: link stopped".to_owned(), Color::Red),
+    };
+
+    let right_str = format!(" {daemon_str}  {connected} connected ");
 
     let [help_area, right_area] = Layout::horizontal([
         Constraint::Min(0),
@@ -765,7 +963,7 @@ fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
     );
     frame.render_widget(
         Paragraph::new(right_str)
-            .style(Style::default().fg(Color::Green))
+            .style(Style::default().fg(daemon_color))
             .alignment(Alignment::Right),
         right_area,
     );
@@ -905,7 +1103,37 @@ fn render_security_warning_popup(
 // ── Main loop ─────────────────────────────────────────────────────────────────
 
 pub fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()> {
+    let link = match DaemonLink::spawn() {
+        Ok(link) => Some(link),
+        Err(e) => {
+            app.push_log(format!("[ERROR] Failed to start the daemon link: {e}"));
+            app.daemon = DaemonState::NoLink;
+            None
+        }
+    };
+    let mut last_refresh: Option<Instant> = None;
+
+    // say plainly how much the daemon is checked before a password goes to it
+    if !cesa_conn_system::ipc::daemon_requirement_valid() {
+        app.push_log(
+            "[ERROR] CESA_IPC_DAEMON_CODE_REQUIREMENT doesn't parse (or this platform has no \
+             code signing): every daemon is refused, rebuild with a valid requirement",
+        );
+    } else if !cesa_conn_system::ipc::daemon_signature_checked() {
+        app.push_log(if cfg!(target_os = "macos") {
+            "[ WARN] Daemon signature check disabled (built without \
+             CESA_IPC_DAEMON_CODE_REQUIREMENT): any process of this user holding the socket \
+             would receive your passwords"
+        } else {
+            "[ WARN] No OS code signing here: the daemon is checked by user id only"
+        });
+    }
+
     loop {
+        if let Some(link) = &link {
+            pump_link(app, link, &mut last_refresh);
+        }
+
         terminal.draw(|frame| ui(frame, app))?;
         if event::poll(Duration::from_millis(50))? {
             handle_input(app)?;
@@ -914,6 +1142,43 @@ pub fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result
             return Ok(());
         }
     }
+}
+
+/// Refreshes on schedule, hands queued commands to the link and applies
+/// whatever came back. Never blocks.
+fn pump_link(app: &mut App, link: &DaemonLink, last_refresh: &mut Option<Instant>) {
+    if app.daemon == DaemonState::NoLink {
+        return;
+    }
+
+    let due = last_refresh.is_none_or(|t| t.elapsed() >= Duration::from_secs(REFRESH_INTERVAL));
+    if due {
+        app.request_refresh();
+        *last_refresh = Some(Instant::now());
+    }
+
+    // taken out first; anything not sent (a password too) is wiped on drop
+    for command in std::mem::take(&mut app.outbox) {
+        if !link.send(command) {
+            handle_link_event(app, LinkEvent::WorkerStopped);
+            return;
+        }
+    }
+
+    while let Some(event) = link.try_recv() {
+        let stopped = event == LinkEvent::WorkerStopped;
+
+        handle_link_event(app, event);
+
+        if stopped {
+            return;
+        }
+    }
+}
+
+/// First bytes of a peer's key as hex, for display.
+fn fingerprint_hex(fingerprint: &[u8]) -> String {
+    fingerprint.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1067,6 +1332,183 @@ mod tests {
             warn_message: None,
         };
         assert_eq!(s.display_value().0, "0.0.0.0");
+    }
+
+    // ── daemon link ───────────────────────────────────────────────────────
+
+    fn select(app: &mut App, section: SettingsSection, label: &str) {
+        app.switch_settings_section(section);
+        app.settings_selected = app
+            .active_settings()
+            .iter()
+            .position(|s| s.label == label)
+            .unwrap();
+    }
+
+    fn up(auth: bool, data: bool) -> LinkEvent {
+        LinkEvent::Refreshed(Ok((
+            Status {
+                auth_key_set: auth,
+                data_key_set: data,
+                network_running: false,
+                trusted_peers: 1,
+            },
+            vec![PeerInfo {
+                fingerprint: [0xab; 8],
+                name: "laptop".into(),
+            }],
+        )))
+    }
+
+    fn type_and_enter(app: &mut App, text: &str) {
+        app.active_popup = ActivePopup::EditSetting;
+        for c in text.chars() {
+            handle_edit_setting_input(app, KeyCode::Char(c));
+        }
+        handle_edit_setting_input(app, KeyCode::Enter);
+    }
+
+    /// Test that a typed password goes out exactly as typed (spaces kept),
+    /// the input is wiped, nothing salt-like exists in the UI, the password is
+    /// never logged, and "configured" waits for the daemon
+    #[test]
+    fn test_password_sent_as_typed_and_wiped() {
+        let mut app = App::new();
+        select(&mut app, SettingsSection::Basic, AUTH_KEY_LABEL);
+
+        type_and_enter(&mut app, " hunter 2 ");
+
+        let [Command::SetPassword { kind, update }] = app.outbox.as_slice() else {
+            panic!("expected one SetPassword command");
+        };
+        assert_eq!(*kind, KeyKind::Auth);
+        assert_eq!(update.password.as_slice(), b" hunter 2 ");
+
+        assert!(app.input_buf.is_empty());
+        assert!(!app.logs.iter().any(|l| l.contains("hunter")));
+        assert!(
+            !app.settings_basic
+                .iter()
+                .chain(app.settings_advanced.iter())
+                .any(|s| s.label.to_lowercase().contains("salt") || s.value.contains("hunter"))
+        );
+        assert_eq!(
+            app.setting_mut(AUTH_KEY_LABEL).unwrap().kind,
+            SettingKind::Secret { configured: false }
+        );
+    }
+
+    /// Test that the data key setting sends a data password, and an empty one nothing
+    #[test]
+    fn test_data_password_and_empty_input() {
+        let mut app = App::new();
+        select(&mut app, SettingsSection::Basic, DATA_KEY_LABEL);
+
+        type_and_enter(&mut app, "");
+        assert!(app.outbox.is_empty());
+
+        type_and_enter(&mut app, "pw");
+        assert!(matches!(
+            app.outbox.as_slice(),
+            [Command::SetPassword {
+                kind: KeyKind::Data,
+                ..
+            }]
+        ));
+    }
+
+    /// Test that ordinary text settings are still trimmed and stored
+    #[test]
+    fn test_text_setting_still_trimmed() {
+        let mut app = App::new();
+        select(&mut app, SettingsSection::Advanced, "Listen port");
+
+        type_and_enter(&mut app, " 4000 ");
+
+        assert_eq!(app.setting_mut("Listen port").unwrap().value, "4000");
+        assert!(app.outbox.is_empty());
+    }
+
+    /// Test that daemon status drives the key flags and the paired list
+    #[test]
+    fn test_status_updates_flags_and_peers() {
+        let mut app = App::new();
+        app.request_refresh();
+
+        handle_link_event(&mut app, up(true, false));
+
+        assert!(matches!(app.daemon, DaemonState::Up(_)));
+        assert!(!app.refresh_in_flight);
+        assert_eq!(app.peers.len(), 1);
+        assert_eq!(
+            app.setting_mut(AUTH_KEY_LABEL).unwrap().kind,
+            SettingKind::Secret { configured: true }
+        );
+        assert_eq!(
+            app.setting_mut(DATA_KEY_LABEL).unwrap().kind,
+            SettingKind::Secret { configured: false }
+        );
+    }
+
+    /// Test that a lost daemon clears what we knew and is logged once, not per refresh
+    #[test]
+    fn test_daemon_down_clears_state_and_logs_once() {
+        let mut app = App::new();
+        handle_link_event(&mut app, up(true, true));
+
+        for _ in 0..3 {
+            handle_link_event(
+                &mut app,
+                LinkEvent::Refreshed(Err(IpcErrors::FailedToConnect)),
+            );
+        }
+
+        assert_eq!(app.daemon, DaemonState::Down(IpcErrors::FailedToConnect));
+        assert!(app.peers.is_empty());
+        assert_eq!(
+            app.setting_mut(AUTH_KEY_LABEL).unwrap().kind,
+            SettingKind::Secret { configured: false }
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|l| l.contains("not reachable"))
+                .count(),
+            1
+        );
+    }
+
+    /// Test that refreshes don't pile up while one is in flight
+    #[test]
+    fn test_refresh_not_stacked() {
+        let mut app = App::new();
+
+        app.request_refresh();
+        app.request_refresh();
+        assert_eq!(app.outbox.len(), 1);
+
+        handle_link_event(&mut app, up(false, false));
+        app.request_refresh();
+        assert_eq!(app.outbox.len(), 2);
+    }
+
+    /// Test that a finished password request triggers a fresh status
+    #[test]
+    fn test_password_result_refreshes() {
+        let mut app = App::new();
+
+        handle_link_event(
+            &mut app,
+            LinkEvent::PasswordSet {
+                kind: KeyKind::Auth,
+                result: Err(IpcErrors::Daemon(
+                    cesa_conn_system::ipc::DaemonError::KeyDerivationFailed,
+                )),
+            },
+        );
+
+        assert!(app.logs.iter().any(|l| l.contains("ERROR")));
+        assert!(matches!(app.outbox.as_slice(), [Command::Refresh]));
     }
 
     // ── push_log ──────────────────────────────────────────────────────────

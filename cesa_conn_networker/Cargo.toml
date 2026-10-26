@@ -31,13 +31,8 @@ subtle = "2.6.1"
 libcrux-ml-dsa = "0.0.11"
 
 [target.'cfg(unix)'.dependencies]
-# geteuid() / peer audit token without unsafe
-nix = { version = "0.31.3", features = ["socket", "user"] }
-
-# IPC client code-signature check (see ipc_server.rs)
-[target.'cfg(target_os = "macos")'.dependencies]
-core-foundation = "0.10.1"
-security-framework = "3.7.0"
+# geteuid() without unsafe (the code-signature check is in cesa_conn_system)
+nix = { version = "0.31.3", features = ["user"] }
 
 [dev-dependencies]
 # paused clock for lockout tests

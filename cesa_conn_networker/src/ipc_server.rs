@@ -20,7 +20,10 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use cesa_conn_system::ipc::{DaemonError, Request, Response, read_frame, write_frame};
+use cesa_conn_system::{
+    code_signature,
+    ipc::{DaemonError, Request, Response, read_frame, write_frame},
+};
 
 /// Most UI connections handled at the same time (password derivation is
 /// expensive, so this stays small).
@@ -95,7 +98,8 @@ impl ClientPolicy {
     pub fn new(requirement: Option<&'static str>) -> Result<Self, IpcServerErrors> {
         match requirement {
             Some(requirement) => {
-                validate_requirement(requirement)?;
+                code_signature::validate_requirement(requirement)
+                    .map_err(|_| IpcServerErrors::InvalidCodeRequirement)?;
                 info!(
                     requirement,
                     "IPC clients must satisfy this code requirement"
@@ -127,84 +131,13 @@ impl ClientPolicy {
         }
 
         if let Some(requirement) = self.requirement {
-            verify_code_signature(stream, requirement).await?;
+            code_signature::verify_peer(stream, requirement)
+                .await
+                .map_err(|_| IpcServerErrors::UntrustedCode)?;
         }
 
         Ok(())
     }
-}
-
-/// Checks that `requirement` parses (macOS); other platforms have no signing.
-#[cfg(target_os = "macos")]
-fn validate_requirement(requirement: &str) -> Result<(), IpcServerErrors> {
-    use security_framework::os::macos::code_signing::SecRequirement;
-    use std::str::FromStr;
-
-    SecRequirement::from_str(requirement)
-        .map(drop)
-        .map_err(|_| IpcServerErrors::InvalidCodeRequirement)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn validate_requirement(_requirement: &str) -> Result<(), IpcServerErrors> {
-    // a requirement that can never be checked must not look like protection
-    Err(IpcServerErrors::InvalidCodeRequirement)
-}
-
-/// Checks the peer's code signature against `requirement`.
-///
-/// The peer is identified by its audit token (pid + pid version), taken by
-/// the kernel when it connected, so neither a recycled pid nor a socket passed
-/// on to another process changes whose signature is checked.
-#[cfg(target_os = "macos")]
-async fn verify_code_signature(
-    stream: &UnixStream,
-    requirement: &'static str,
-) -> Result<(), IpcServerErrors> {
-    use nix::sys::socket::{getsockopt, sockopt::LocalPeerToken};
-
-    // the audit token identifies a process, it is not a secret
-    let audit = getsockopt(stream, LocalPeerToken).map_err(|_| IpcServerErrors::UntrustedCode)?;
-    let audit: Vec<u8> = audit.val.iter().flat_map(|v| v.to_ne_bytes()).collect();
-
-    // the Security framework may touch the disk: off the async workers
-    tokio::task::spawn_blocking(move || check_audit_token(&audit, requirement))
-        .await
-        .map_err(|_| IpcServerErrors::UntrustedCode)?
-}
-
-/// Looks the audit token up as a guest of the kernel and validates it.
-#[cfg(target_os = "macos")]
-fn check_audit_token(audit: &[u8], requirement: &str) -> Result<(), IpcServerErrors> {
-    use core_foundation::{base::TCFType, data::CFData};
-    use security_framework::os::macos::code_signing::{
-        Flags, GuestAttributes, SecCode, SecRequirement,
-    };
-    use std::str::FromStr;
-
-    let audit = CFData::from_buffer(audit);
-    let mut attributes = GuestAttributes::new();
-
-    // the dictionary retains `audit`, which also outlives this call
-    attributes.set_audit_token(audit.as_concrete_TypeRef());
-
-    let code = SecCode::copy_guest_with_attribues(None, &attributes, Flags::NONE)
-        .map_err(|_| IpcServerErrors::UntrustedCode)?;
-    let requirement =
-        SecRequirement::from_str(requirement).map_err(|_| IpcServerErrors::UntrustedCode)?;
-
-    // dynamic check: the running code must still match its signature
-    code.check_validity(Flags::NONE, &requirement)
-        .map_err(|_| IpcServerErrors::UntrustedCode)
-}
-
-#[cfg(not(target_os = "macos"))]
-async fn verify_code_signature(
-    _stream: &UnixStream,
-    _requirement: &'static str,
-) -> Result<(), IpcServerErrors> {
-    // unreachable: ClientPolicy::new refuses requirements off macOS
-    Err(IpcServerErrors::UntrustedCode)
 }
 
 /// Binds the daemon socket at `path` (its directory must already be private).
