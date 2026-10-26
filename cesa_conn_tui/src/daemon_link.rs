@@ -13,14 +13,13 @@ pairing prompt ("pair with X? code") once the daemon runs the networker
 //!
 //! Passwords only pass through here inside [`PasswordUpdate`] (zeroizing);
 //! the worker drops the request, and with it the password, right after sending.
+//! Nothing key-related is kept here: no keys, no salts (both are the daemon's).
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
-use cesa_conn_system::ipc::{
-    self, IpcErrors, PasswordUpdate, PeerInfo, Request, Response, SALT_LEN, Status,
-};
+use cesa_conn_system::ipc::{self, IpcErrors, PasswordUpdate, PeerInfo, Request, Response, Status};
 
 /// Which of the two keys a password is for.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -163,78 +162,10 @@ async fn send(socket: Option<&PathBuf>, request: &Request) -> Result<Response, I
     }
 }
 
-/* salts (public, shown to the user so other devices can use the same one) */
-
-/// Lower-case hex of a salt.
-pub fn salt_to_hex(salt: &[u8; SALT_LEN]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-
-    let mut out = String::with_capacity(SALT_LEN.saturating_mul(2));
-
-    for byte in salt {
-        for nibble in [byte >> 4, byte & 0x0f] {
-            if let Some(&digit) = DIGITS.get(usize::from(nibble)) {
-                out.push(char::from(digit));
-            }
-        }
-    }
-
-    out
-}
-
-/// Parses exactly `2 * SALT_LEN` hex digits (either case); anything else is `None`.
-pub fn salt_from_hex(text: &str) -> Option<[u8; SALT_LEN]> {
-    let digits = text.as_bytes();
-
-    if digits.len() != SALT_LEN.saturating_mul(2) {
-        return None;
-    }
-
-    let mut salt = [0u8; SALT_LEN];
-
-    let (pairs, _) = digits.as_chunks::<2>();
-
-    for (byte, [hi, lo]) in salt.iter_mut().zip(pairs) {
-        *byte = hex_value(*hi)? << 4 | hex_value(*lo)?;
-    }
-
-    Some(salt)
-}
-
-fn hex_value(digit: u8) -> Option<u8> {
-    char::from(digit)
-        .to_digit(16)
-        .and_then(|v| u8::try_from(v).ok())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use zeroize::Zeroizing;
-
-    /// Test that salts survive a hex round trip
-    #[test]
-    fn test_salt_hex_roundtrip() {
-        let salt: [u8; SALT_LEN] = core::array::from_fn(|i| u8::try_from(i * 7).unwrap());
-        let hex = salt_to_hex(&salt);
-
-        assert_eq!(hex.len(), SALT_LEN * 2);
-        assert_eq!(salt_from_hex(&hex), Some(salt));
-        assert_eq!(salt_from_hex(&hex.to_uppercase()), Some(salt));
-    }
-
-    /// Test that anything but exactly 64 hex digits is refused
-    #[test]
-    fn test_salt_hex_rejects_bad_input() {
-        let good = "ab".repeat(SALT_LEN);
-
-        assert_eq!(salt_from_hex(""), None);
-        assert_eq!(salt_from_hex(good.get(1..).unwrap()), None);
-        assert_eq!(salt_from_hex(&format!("{good}00")), None);
-        assert_eq!(salt_from_hex(&good.replacen('a', "g", 1)), None);
-        assert_eq!(salt_from_hex(&good.replacen("ab", "ą", 1)), None);
-        assert_eq!(salt_from_hex(&good.replacen('a', " ", 1)), None);
-    }
 
     /// Test that a missing daemon is reported, not hung on
     #[cfg(unix)]
@@ -322,7 +253,6 @@ mod tests {
         assert!(link.send(Command::SetPassword {
             kind: KeyKind::Data,
             update: PasswordUpdate {
-                salt: [5; SALT_LEN],
                 password: Zeroizing::new(b"hunter2".to_vec()),
             },
         }));
@@ -338,7 +268,6 @@ mod tests {
         else {
             panic!("expected a data password request");
         };
-        assert_eq!(sent.salt, [5; SALT_LEN]);
         assert_eq!(sent.password.as_slice(), b"hunter2");
 
         server.join().unwrap();

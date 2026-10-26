@@ -3,7 +3,10 @@
 //! CesaConn terminal UI.
 //!
 //! Talks to the daemon over IPC ([`daemon_link`]): passwords go to the daemon,
-//! which derives and keeps the keys; the UI only shows status and paired devices.
+//! which derives and keeps the keys and their salts; the UI only shows status
+//! and paired devices. It keeps nothing key-related: a typed password lives in
+//! the zeroizing input buffer until Enter, is handed to the daemon link and
+//! wiped right away.
 
 mod daemon_link;
 
@@ -22,13 +25,11 @@ use std::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
-use daemon_link::{Command, DaemonLink, KeyKind, LinkEvent, salt_from_hex, salt_to_hex};
+use daemon_link::{Command, DaemonLink, KeyKind, LinkEvent};
 
 /* setting labels the daemon link reads or writes */
 const AUTH_KEY_LABEL: &str = "Auth key";
 const DATA_KEY_LABEL: &str = "Data key";
-const AUTH_SALT_LABEL: &str = "Auth salt (hex)";
-const DATA_SALT_LABEL: &str = "Data salt (hex)";
 
 /// How often the daemon's status is asked for (seconds).
 const REFRESH_INTERVAL: u64 = 2;
@@ -215,20 +216,6 @@ impl App {
                     label: "UDP broadcast duration (s)",
                     kind: SettingKind::Text,
                     value: "3".into(),
-                    warn_message: None,
-                },
-                // public; must be the same on every device. Empty: a new one is
-                // generated when the password is set, to copy to the other devices
-                Setting {
-                    label: AUTH_SALT_LABEL,
-                    kind: SettingKind::Text,
-                    value: String::new(),
-                    warn_message: None,
-                },
-                Setting {
-                    label: DATA_SALT_LABEL,
-                    kind: SettingKind::Text,
-                    value: String::new(),
                     warn_message: None,
                 },
             ],
@@ -497,10 +484,14 @@ fn handle_edit_setting_input(app: &mut App, code: KeyCode) {
             clear_input(app);
         }
         KeyCode::Enter => {
-            // may be a password: the copy is zeroizing too
-            let new_value = Zeroizing::new(app.input_buf.trim().to_owned());
-            if !new_value.is_empty() {
-                apply_setting_edit(app, &new_value);
+            if selected_key_kind(app).is_some() {
+                // a password: exactly as typed (never trimmed), straight to the daemon
+                send_password_from_input(app);
+            } else {
+                let new_value = Zeroizing::new(app.input_buf.trim().to_owned());
+                if !new_value.is_empty() {
+                    apply_setting_edit(app, &new_value);
+                }
             }
             app.active_popup = ActivePopup::None;
             clear_input(app);
@@ -532,82 +523,44 @@ fn clear_input(app: &mut App) {
 fn apply_setting_edit(app: &mut App, new_value: &str) {
     let idx = app.settings_selected;
 
-    let Some((label, kind)) = app
-        .active_settings()
-        .get(idx)
-        .map(|s| (s.label, s.kind.clone()))
-    else {
-        return;
-    };
-
-    match kind {
-        // the password goes to the daemon; "configured" comes back from its status
-        SettingKind::Secret { .. } => match label {
-            AUTH_KEY_LABEL => request_password(app, KeyKind::Auth, new_value),
-            DATA_KEY_LABEL => request_password(app, KeyKind::Data, new_value),
-            _ => {}
-        },
-        SettingKind::Bool(_) => {}
-        SettingKind::Text if label == AUTH_SALT_LABEL || label == DATA_SALT_LABEL => {
-            if salt_from_hex(new_value).is_none() {
-                app.push_log("[ WARN] A salt is exactly 64 hex characters, not changed");
-            } else if let Some(s) = app.active_settings_mut().get_mut(idx) {
-                s.value = new_value.to_ascii_lowercase();
-                app.push_log("[ INFO] Salt changed, set the password again to use it");
-            }
-        }
-        SettingKind::Text => {
-            if let Some(s) = app.active_settings_mut().get_mut(idx) {
-                s.value = new_value.to_owned();
-            }
-        }
+    // secrets never come through here, see `send_password_from_input`
+    if let Some(s) = app.active_settings_mut().get_mut(idx)
+        && s.kind == SettingKind::Text
+    {
+        s.value = new_value.to_owned();
     }
 }
 
-/// Queues `password` for the daemon together with the salt of that key.
-/// With no salt set yet a new one is generated and shown: it is public and
-/// every device has to use the same one to end up with the same key.
-fn request_password(app: &mut App, kind: KeyKind, password: &str) {
-    let (salt_label, name) = match kind {
-        KeyKind::Auth => (AUTH_SALT_LABEL, "auth"),
-        KeyKind::Data => (DATA_SALT_LABEL, "data"),
+/// Which key the selected setting is, if it is one.
+fn selected_key_kind(app: &App) -> Option<KeyKind> {
+    match app.active_settings().get(app.settings_selected)?.label {
+        AUTH_KEY_LABEL => Some(KeyKind::Auth),
+        DATA_KEY_LABEL => Some(KeyKind::Data),
+        _ => None,
+    }
+}
+
+/// Hands the typed password to the daemon link. The only copy is an
+/// exact-size zeroizing buffer that the link drops right after sending; the
+/// caller wipes the input buffer. The daemon picks and keeps the salt.
+fn send_password_from_input(app: &mut App) {
+    let Some(kind) = selected_key_kind(app) else {
+        return;
     };
 
-    let current = app
-        .setting_mut(salt_label)
-        .map(|s| s.value.clone())
-        .unwrap_or_default();
-
-    let salt = if current.is_empty() {
-        let Ok(salt) = cesa_conn_crypto::salt::generate_salt() else {
-            app.push_log("[ERROR] Failed to generate a salt, password not sent");
-            return;
-        };
-        let hex = salt_to_hex(&salt);
-
-        if let Some(s) = app.setting_mut(salt_label) {
-            s.value = hex.clone();
-        }
-        app.push_log(format!(
-            "[ INFO] New {name} salt: {hex} (enter the same salt on your other devices)"
-        ));
-
-        salt
-    } else if let Some(salt) = salt_from_hex(&current) {
-        salt
-    } else {
-        app.push_log(format!(
-            "[ WARN] The {name} salt is not valid hex, password not sent"
-        ));
+    if app.input_buf.is_empty() {
         return;
+    }
+
+    let name = match kind {
+        KeyKind::Auth => "auth",
+        KeyKind::Data => "data",
     };
 
     app.outbox.push(Command::SetPassword {
         kind,
         update: PasswordUpdate {
-            salt,
-            // exact size, so this copy never reallocates; wiped on drop
-            password: Zeroizing::new(password.as_bytes().to_vec()),
+            password: Zeroizing::new(app.input_buf.as_bytes().to_vec()),
         },
     });
     app.push_log(format!(
@@ -1376,10 +1329,6 @@ mod tests {
             .unwrap();
     }
 
-    fn salt_value(app: &mut App, label: &str) -> String {
-        app.setting_mut(label).unwrap().value.clone()
-    }
-
     fn up(auth: bool, data: bool) -> LinkEvent {
         LinkEvent::Refreshed(Ok((
             Status {
@@ -1395,69 +1344,72 @@ mod tests {
         )))
     }
 
-    /// Test that the first password generates a salt, shows it, and queues the
-    /// password with exactly that salt; "configured" waits for the daemon
+    fn type_and_enter(app: &mut App, text: &str) {
+        app.active_popup = ActivePopup::EditSetting;
+        for c in text.chars() {
+            handle_edit_setting_input(app, KeyCode::Char(c));
+        }
+        handle_edit_setting_input(app, KeyCode::Enter);
+    }
+
+    /// Test that a typed password goes out exactly as typed (spaces kept),
+    /// the input is wiped, nothing salt-like exists in the UI, the password is
+    /// never logged, and "configured" waits for the daemon
     #[test]
-    fn test_first_password_generates_and_uses_salt() {
+    fn test_password_sent_as_typed_and_wiped() {
         let mut app = App::new();
         select(&mut app, SettingsSection::Basic, AUTH_KEY_LABEL);
 
-        apply_setting_edit(&mut app, "hunter2");
-
-        let hex = salt_value(&mut app, AUTH_SALT_LABEL);
-        let salt = salt_from_hex(&hex).unwrap();
-        assert!(app.logs.iter().any(|l| l.contains(&hex)));
-        assert!(salt_value(&mut app, DATA_SALT_LABEL).is_empty());
+        type_and_enter(&mut app, " hunter 2 ");
 
         let [Command::SetPassword { kind, update }] = app.outbox.as_slice() else {
             panic!("expected one SetPassword command");
         };
         assert_eq!(*kind, KeyKind::Auth);
-        assert_eq!(update.salt, salt);
-        assert_eq!(update.password.as_slice(), b"hunter2");
+        assert_eq!(update.password.as_slice(), b" hunter 2 ");
 
-        // the password never shows up in the logs
-        assert!(!app.logs.iter().any(|l| l.contains("hunter2")));
-
+        assert!(app.input_buf.is_empty());
+        assert!(!app.logs.iter().any(|l| l.contains("hunter")));
+        assert!(
+            !app.settings_basic
+                .iter()
+                .chain(app.settings_advanced.iter())
+                .any(|s| s.label.to_lowercase().contains("salt") || s.value.contains("hunter"))
+        );
         assert_eq!(
             app.setting_mut(AUTH_KEY_LABEL).unwrap().kind,
             SettingKind::Secret { configured: false }
         );
     }
 
-    /// Test that a salt entered by the user (from another device) is used as is
+    /// Test that the data key setting sends a data password, and an empty one nothing
     #[test]
-    fn test_entered_salt_is_used() {
+    fn test_data_password_and_empty_input() {
         let mut app = App::new();
-        let hex = "0F".repeat(32);
-
-        select(&mut app, SettingsSection::Advanced, DATA_SALT_LABEL);
-        apply_setting_edit(&mut app, &hex);
-        assert_eq!(salt_value(&mut app, DATA_SALT_LABEL), hex.to_lowercase());
-
         select(&mut app, SettingsSection::Basic, DATA_KEY_LABEL);
-        apply_setting_edit(&mut app, "pw");
 
-        let [Command::SetPassword { kind, update }] = app.outbox.as_slice() else {
-            panic!("expected one SetPassword command");
-        };
-        assert_eq!(*kind, KeyKind::Data);
-        assert_eq!(update.salt, [0x0f; 32]);
+        type_and_enter(&mut app, "");
+        assert!(app.outbox.is_empty());
+
+        type_and_enter(&mut app, "pw");
+        assert!(matches!(
+            app.outbox.as_slice(),
+            [Command::SetPassword {
+                kind: KeyKind::Data,
+                ..
+            }]
+        ));
     }
 
-    /// Test that a malformed salt is refused and no password is sent with it
+    /// Test that ordinary text settings are still trimmed and stored
     #[test]
-    fn test_bad_salt_refused() {
+    fn test_text_setting_still_trimmed() {
         let mut app = App::new();
+        select(&mut app, SettingsSection::Advanced, "Listen port");
 
-        select(&mut app, SettingsSection::Advanced, AUTH_SALT_LABEL);
-        apply_setting_edit(&mut app, "not hex");
-        assert!(salt_value(&mut app, AUTH_SALT_LABEL).is_empty());
+        type_and_enter(&mut app, " 4000 ");
 
-        // a broken value that got in anyway still blocks the password
-        app.setting_mut(AUTH_SALT_LABEL).unwrap().value = "zz".into();
-        select(&mut app, SettingsSection::Basic, AUTH_KEY_LABEL);
-        apply_setting_edit(&mut app, "pw");
+        assert_eq!(app.setting_mut("Listen port").unwrap().value, "4000");
         assert!(app.outbox.is_empty());
     }
 

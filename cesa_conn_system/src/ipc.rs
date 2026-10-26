@@ -1,8 +1,9 @@
 //! UI <-> daemon IPC: wire protocol, socket location and the client side.
 //!
 //! Security model
-//! * The daemon owns `a_key` / `d_key` and NEVER sends them out. The UI only
-//!   sends passwords (once, to set them) and gets status back.
+//! * The daemon owns `a_key` / `d_key` and their salts and NEVER sends them
+//!   out. The UI only sends passwords (once, to set them) and gets status back;
+//!   it holds nothing to keep.
 //! * The socket lives in a private directory (owner only, `0700`) that is
 //!   checked on every use, and is itself `0600`.
 //! * The daemon accepts a connection only from a process of the same user
@@ -14,7 +15,8 @@
 //!
 //! Request body: `kind (1) || payload`
 //! * `0x01` Status
-//! * `0x02` SetAuthPassword: `salt (32) || password (1..=MAX_PASSWORD_LEN)`
+//! * `0x02` SetAuthPassword: `password (1..=MAX_PASSWORD_LEN)`; the daemon
+//!   picks the salt
 //! * `0x03` SetDataPassword: same
 //! * `0x04` ListPeers
 //!
@@ -42,15 +44,13 @@ pub const MAX_PASSWORD_LEN: usize = 1024;
 pub const MAX_LISTED_PEERS: usize = 256;
 /// Timeout for every single read / write (seconds).
 pub const IO_TIMEOUT: Duration = Duration::from_secs(5);
-/// Argon2 salt length (bytes).
-pub const SALT_LEN: usize = 32;
 /// Bytes of a peer's key shown as its fingerprint.
 pub const FINGERPRINT_LEN: usize = 8;
 
 /// longest `ListPeers` body: status + count + every peer at full name length
 const MAX_PEERS_BODY: usize = 1 + 2 + MAX_LISTED_PEERS * (FINGERPRINT_LEN + 1 + 255);
-/// longest request body: kind + salt + password
-const MAX_REQUEST_BODY: usize = 1 + SALT_LEN + MAX_PASSWORD_LEN;
+/// longest request body: kind + password
+const MAX_REQUEST_BODY: usize = 1 + MAX_PASSWORD_LEN;
 
 const _: () = assert!(MAX_PEERS_BODY <= MAX_FRAME_LEN as usize);
 const _: () = assert!(MAX_REQUEST_BODY <= MAX_FRAME_LEN as usize);
@@ -153,11 +153,10 @@ impl fmt::Display for DaemonError {
     }
 }
 
-/// A password plus the public salt to derive the key with. Wiped on drop.
+/// A password for the daemon to derive a key from. Wiped on drop.
+/// No `Debug` / `Clone`: it must not end up in logs or in a second copy.
 pub struct PasswordUpdate {
-    /// Argon2 salt (not secret, must be the same on every device).
-    pub salt: [u8; SALT_LEN],
-    /// The password, wiped on drop.
+    /// The password, exactly as typed (never trimmed), wiped on drop.
     pub password: Zeroizing<Vec<u8>>,
 }
 
@@ -202,16 +201,13 @@ pub enum Response {
     Peers(Vec<PeerInfo>),
 }
 
-/// Parses a `salt || password` payload.
-fn parse_password_update(payload: &[u8]) -> Option<PasswordUpdate> {
-    let (salt, password) = payload.split_first_chunk::<SALT_LEN>()?;
-
+/// Parses a `password` payload.
+fn parse_password_update(password: &[u8]) -> Option<PasswordUpdate> {
     if password.is_empty() || password.len() > MAX_PASSWORD_LEN {
         return None;
     }
 
     Some(PasswordUpdate {
-        salt: *salt,
         password: Zeroizing::new(password.to_vec()),
     })
 }
@@ -227,13 +223,12 @@ impl Request {
         };
 
         // sized up front so the buffer holding the password never reallocates
-        let len = update.map_or(0, |u| SALT_LEN.saturating_add(u.password.len()));
+        let len = update.map_or(0, |u| u.password.len());
         let mut body = Zeroizing::new(Vec::with_capacity(len.saturating_add(1)));
 
         body.push(kind);
 
         if let Some(update) = update {
-            body.extend_from_slice(&update.salt);
             body.extend_from_slice(&update.password);
         }
 
@@ -533,7 +528,6 @@ mod tests {
 
     fn update(password: &[u8]) -> PasswordUpdate {
         PasswordUpdate {
-            salt: [7; SALT_LEN],
             password: Zeroizing::new(password.to_vec()),
         }
     }
@@ -546,6 +540,8 @@ mod tests {
             Request::ListPeers,
             Request::SetAuthPassword(update(b"hunter2")),
             Request::SetDataPassword(update(b"x")),
+            // spaces are part of the password, never trimmed
+            Request::SetAuthPassword(update(b" pass word ")),
         ] {
             let decoded = Request::decode(&req.encode()).unwrap();
             assert_eq!(decoded.encode().as_slice(), req.encode().as_slice());
@@ -558,20 +554,18 @@ mod tests {
         assert!(Request::decode(&[]).is_none());
         assert!(Request::decode(&[0x99]).is_none());
         assert!(Request::decode(&[REQ_STATUS, 0]).is_none());
-        // salt only, empty password
-        assert!(
-            Request::decode(&[&[REQ_SET_AUTH_PASSWORD][..], &[0; SALT_LEN]].concat()).is_none()
-        );
-        // salt cut short
-        assert!(Request::decode(&[REQ_SET_AUTH_PASSWORD, 1, 2, 3]).is_none());
+        // empty password
+        assert!(Request::decode(&[REQ_SET_AUTH_PASSWORD]).is_none());
         // password too long
         let long = [
             &[REQ_SET_DATA_PASSWORD][..],
-            &[0; SALT_LEN],
             &vec![b'a'; MAX_PASSWORD_LEN + 1],
         ]
         .concat();
         assert!(Request::decode(&long).is_none());
+        // longest allowed password still fits
+        let max = [&[REQ_SET_DATA_PASSWORD][..], &vec![b'a'; MAX_PASSWORD_LEN]].concat();
+        assert!(Request::decode(&max).is_some());
     }
 
     /// Test that every response kind round-trips

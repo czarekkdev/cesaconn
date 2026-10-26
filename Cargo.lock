@@ -345,7 +345,6 @@ dependencies = [
 name = "cesa_conn_tui"
 version = "0.1.0"
 dependencies = [
- "cesa_conn_crypto",
  "cesa_conn_system",
  "crossterm",
  "ratatui",

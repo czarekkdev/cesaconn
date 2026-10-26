@@ -2,12 +2,16 @@
 TODO:
 start the networker once both keys are set (needs persisted DeviceKeypairs, see auth_snow)
 pairing prompt over IPC (UI command set is defined together with the UI)
+salt syncing: salts are random per daemon run, so two devices can't agree on keys yet (design doc first)
+keep keys + salts in the OS keychain / an encrypted file once that storage is decided
  */
 
 //! The daemon: owns `a_key` / `d_key` and answers UI requests over IPC.
 //!
 //! Keys only ever enter the daemon as passwords (derived here with Argon2)
 //! and never leave it; the UI gets status and public peer info only.
+//! The salts are the daemon's too: generated here, kept in zeroizing memory,
+//! never sent to the UI.
 
 use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore};
@@ -15,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use zeroize::Zeroizing;
 
-use cesa_conn_crypto::pswd_manager::derive_key;
+use cesa_conn_crypto::{crand::random_array, pswd_manager::derive_key};
 use cesa_conn_system::ipc::{
     DaemonError, MAX_LISTED_PEERS, PasswordUpdate, PeerInfo, Request, Response, Status, socket_path,
 };
@@ -25,11 +29,18 @@ use crate::{
     ipc_server::{self, ClientPolicy},
 };
 
-/// The keys the user has set so far (each one is set separately).
+/// Argon2 salt, owned by the daemon; wiped on drop like the keys.
+type Salt = Zeroizing<[u8; 32]>;
+
+/// The keys the user has set so far (each one is set separately), and the
+/// salt each was derived with. A salt is made on first use and kept for the
+/// daemon's lifetime, so setting the same password again gives the same key.
 #[derive(Default)]
 struct KeySlots {
     a_key: Option<AuthKey>,
     d_key: Option<DataKey>,
+    a_salt: Option<Salt>,
+    d_salt: Option<Salt>,
 }
 
 /// Everything the daemon owns. Shared between IPC handlers.
@@ -96,17 +107,48 @@ impl Daemon {
             .collect()
     }
 
+    /// The salt for `kind`, made (and kept) on first use.
+    async fn salt_for(&self, kind: KeyKind) -> Option<Salt> {
+        // one write guard for check-then-create, no await while holding it
+        let mut keys = self.keys.write().await;
+
+        let slot = match kind {
+            KeyKind::Auth => &mut keys.a_salt,
+            KeyKind::Data => &mut keys.d_salt,
+        };
+
+        if slot.is_none() {
+            // filled in place inside a zeroizing buffer
+            match random_array::<32>() {
+                Ok(salt) => *slot = Some(salt),
+                Err(e) => {
+                    error!(error = %e, "failed to generate a salt");
+                    return None;
+                }
+            }
+        }
+
+        let salt = slot.clone();
+        drop(keys);
+
+        salt
+    }
+
     /// Derives the key from the password (off the async workers) and stores it.
     async fn set_password(&self, kind: KeyKind, update: PasswordUpdate) -> Vec<u8> {
+        let Some(salt) = self.salt_for(kind).await else {
+            return Response::encode_error(DaemonError::Internal);
+        };
+
         let Ok(slot) = self.derive_slot.clone().acquire_owned().await else {
             return Response::encode_error(DaemonError::Internal);
         };
 
         // the slot moves into the blocking task: if this request hits its
         // deadline, the slot stays taken until Argon2 really finished.
-        // `update` (and with it the password) is dropped and wiped inside
+        // `update` (the password) and `salt` are dropped and wiped inside
         let derived = tokio::task::spawn_blocking(move || {
-            let key = derive_key(&update.password, &update.salt);
+            let key = derive_key(&update.password, &salt);
             drop(slot);
             key
         })
@@ -199,11 +241,10 @@ pub async fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cesa_conn_system::ipc::{IpcErrors, SALT_LEN, prepare_socket_dir, request_at};
+    use cesa_conn_system::ipc::{IpcErrors, prepare_socket_dir, request_at};
 
     fn update(password: &[u8]) -> PasswordUpdate {
         PasswordUpdate {
-            salt: [3; SALT_LEN],
             password: Zeroizing::new(password.to_vec()),
         }
     }
@@ -247,11 +288,60 @@ mod tests {
         );
 
         let keys = daemon.keys.read().await;
-        let expected = derive_key(b"auth pw", &[3; SALT_LEN]).unwrap();
+        let expected = derive_key(b"auth pw", keys.a_salt.as_ref().unwrap()).unwrap();
         assert_eq!(**keys.a_key.as_ref().unwrap().expose(), *expected);
         assert_ne!(
             **keys.a_key.as_ref().unwrap().expose(),
             **keys.d_key.as_ref().unwrap().expose()
+        );
+    }
+
+    /// Test that the daemon makes one salt per key and keeps it: the same
+    /// password set twice gives the same key, and auth / data salts differ
+    #[tokio::test]
+    async fn test_salts_owned_and_stable() {
+        let daemon = Daemon::default();
+
+        assert!(daemon.keys.read().await.a_salt.is_none());
+
+        daemon.handle(Request::SetAuthPassword(update(b"pw"))).await;
+        let (first_salt, first_key) = {
+            let keys = daemon.keys.read().await;
+            (
+                keys.a_salt.clone().unwrap(),
+                **keys.a_key.as_ref().unwrap().expose(),
+            )
+        };
+
+        daemon.handle(Request::SetAuthPassword(update(b"pw"))).await;
+        daemon.handle(Request::SetDataPassword(update(b"pw"))).await;
+
+        let keys = daemon.keys.read().await;
+        assert_eq!(*keys.a_salt.clone().unwrap(), *first_salt);
+        assert_eq!(**keys.a_key.as_ref().unwrap().expose(), first_key);
+        assert_ne!(*keys.d_salt.clone().unwrap(), *first_salt);
+        // same password, different salt: different key
+        assert_ne!(**keys.d_key.as_ref().unwrap().expose(), first_key);
+    }
+
+    /// Test that the password is used exactly as sent (no trimming)
+    #[tokio::test]
+    async fn test_password_not_trimmed() {
+        let daemon = Daemon::default();
+
+        daemon
+            .handle(Request::SetAuthPassword(update(b" pw ")))
+            .await;
+
+        let keys = daemon.keys.read().await;
+        let salt = keys.a_salt.as_ref().unwrap();
+        assert_eq!(
+            **keys.a_key.as_ref().unwrap().expose(),
+            *derive_key(b" pw ", salt).unwrap()
+        );
+        assert_ne!(
+            **keys.a_key.as_ref().unwrap().expose(),
+            *derive_key(b"pw", salt).unwrap()
         );
     }
 
@@ -284,11 +374,21 @@ mod tests {
             .await
             .unwrap();
 
-        let key = **daemon.keys.read().await.a_key.as_ref().unwrap().expose();
+        let (key, a_salt, d_salt) = {
+            let keys = daemon.keys.read().await;
+            (
+                **keys.a_key.as_ref().unwrap().expose(),
+                *keys.a_salt.clone().unwrap(),
+                *keys.d_salt.clone().unwrap(),
+            )
+        };
 
+        // neither keys nor salts ever leave the daemon
         for request in [Request::Status, Request::ListPeers] {
             let body = daemon.handle(request).await;
-            assert!(!body.windows(32).any(|w| w == key));
+            for secret in [key, a_salt, d_salt] {
+                assert!(!body.windows(32).any(|w| w == secret));
+            }
         }
 
         // a malformed password request changes nothing
