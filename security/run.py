@@ -366,7 +366,7 @@ def check_tsan() -> ToolResult:
     broken = []
     for crate in CRATES:
         code, out, err = run(["cargo", "+nightly", "test", "-Zbuild-std", "--target", target, "-p", crate,
-                              "--lib", "--bins", "--tests"], env=env,
+                              "--all-targets"], env=env,
                              timeout=int(os.environ.get("CESA_TSAN_TIMEOUT", "1800")))
         text = out + err
         if code != 0 and not PASSED_RE.search(text):
