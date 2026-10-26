@@ -1,9 +1,3 @@
-/*
-TODO:
-
-add tests
-*/
-
 use std::time::Duration;
 
 use crate::{
@@ -425,4 +419,78 @@ pub async fn hybrid_kex_client(
         x25519_ss,
         mlkem_ss,
     })
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    /// Connected localhost pair: (server side, client side).
+    async fn pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, server) = tokio::join!(TcpStream::connect(addr), listener.accept());
+
+        (server.unwrap().0, client.unwrap())
+    }
+
+    /// Test that both sides agree on both secrets and on the transcript
+    #[tokio::test]
+    async fn test_hybrid_kex_agrees() {
+        let (mut s, mut c) = pair().await;
+        let mut st = Zeroizing::new(Vec::new());
+        let mut ct = Zeroizing::new(Vec::new());
+
+        let (sr, cr) = tokio::join!(
+            hybrid_kex_server(&mut s, &mut st),
+            hybrid_kex_client(&mut c, &mut ct)
+        );
+        let (sr, cr) = (sr.unwrap(), cr.unwrap());
+
+        assert_eq!(*sr.x25519_ss, *cr.x25519_ss);
+        assert_eq!(*sr.mlkem_ss, *cr.mlkem_ss);
+        assert_ne!(*sr.x25519_ss, *sr.mlkem_ss);
+        assert_ne!(*sr.x25519_ss, [0u8; 32]);
+        assert_eq!(*st, *ct);
+    }
+
+    /// Test that every run produces new secrets (ephemeral keys)
+    #[tokio::test]
+    async fn test_hybrid_kex_fresh_secrets() {
+        let mut secrets = Vec::new();
+
+        for _ in 0..2 {
+            let (mut s, mut c) = pair().await;
+            let mut st = Zeroizing::new(Vec::new());
+            let mut ct = Zeroizing::new(Vec::new());
+
+            let (sr, _) = tokio::join!(
+                hybrid_kex_server(&mut s, &mut st),
+                hybrid_kex_client(&mut c, &mut ct)
+            );
+            secrets.push(sr.unwrap());
+        }
+
+        assert_ne!(*secrets[0].x25519_ss, *secrets[1].x25519_ss);
+        assert_ne!(*secrets[0].mlkem_ss, *secrets[1].mlkem_ss);
+    }
+
+    /// Test that garbage instead of a client key makes the server fail, not hang or panic
+    #[tokio::test]
+    async fn test_server_rejects_garbage() {
+        let (mut s, mut c) = pair().await;
+        let mut st = Zeroizing::new(Vec::new());
+
+        let server = hybrid_kex_server(&mut s, &mut st);
+        let client = async {
+            c.write_all(&[0xFFu8; 64]).await.unwrap();
+            drop(c);
+        };
+        let (sr, _) = tokio::join!(server, client);
+
+        assert_eq!(sr.err(), Some(AuthSnowErrors::KexFailed));
+    }
 }

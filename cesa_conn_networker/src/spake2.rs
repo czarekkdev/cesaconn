@@ -1,9 +1,3 @@
-/*
-TODO:
-
-add tests
-*/
-
 use std::time::Duration;
 
 use crate::{
@@ -275,4 +269,93 @@ pub async fn spake2_confirm_mutual_auth_client(
     transcript.extend_from_slice(&confirm_received);
 
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use tokio::net::TcpListener;
+
+    /// Connected localhost pair: (server side, client side).
+    async fn pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, server) = tokio::join!(TcpStream::connect(addr), listener.accept());
+
+        (server.unwrap().0, client.unwrap())
+    }
+
+    /// Runs exchange + confirmation on both sides with the given passwords.
+    async fn run(
+        server_key: [u8; 32],
+        client_key: [u8; 32],
+    ) -> (
+        Result<bool, AuthSnowErrors>,
+        Result<bool, AuthSnowErrors>,
+        Zeroizing<Vec<u8>>,
+        Zeroizing<Vec<u8>>,
+    ) {
+        let (mut s, mut c) = pair().await;
+        let (sk, ck) = (Zeroizing::new(server_key), Zeroizing::new(client_key));
+        let mut st = Zeroizing::new(Vec::new());
+        let mut ct = Zeroizing::new(Vec::new());
+
+        let server = async {
+            let key1 = spake2_exchange_server(&mut s, &sk, &mut st).await?;
+            spake2_confirm_mutual_auth_server(&mut s, &key1, &mut st).await
+        };
+        let client = async {
+            let key1 = spake2_exchange_client(&mut c, &ck, &mut ct).await?;
+            spake2_confirm_mutual_auth_client(&mut c, &key1, &mut ct).await
+        };
+        let (sr, cr) = tokio::join!(server, client);
+
+        (sr, cr, st, ct)
+    }
+
+    /// Test that the same password confirms on both sides with equal transcripts
+    #[tokio::test]
+    async fn test_same_password_confirms() {
+        let (sr, cr, st, ct) = run([7u8; 32], [7u8; 32]).await;
+
+        assert_eq!(sr, Ok(true));
+        assert_eq!(cr, Ok(true));
+        assert_eq!(*st, *ct);
+        assert!(!st.is_empty());
+    }
+
+    /// Test that a different password is caught by the server before it confirms
+    #[tokio::test]
+    async fn test_wrong_password_rejected_by_server() {
+        let (sr, cr, _, _) = run([7u8; 32], [8u8; 32]).await;
+
+        assert_eq!(sr, Ok(false));
+        // the server never sends its value, the client sees EOF / error
+        assert_ne!(cr, Ok(true));
+    }
+
+    /// Test that the exchange gives a fresh key1 every run (ephemeral scalars)
+    #[tokio::test]
+    async fn test_session_keys_are_fresh() {
+        let mut keys = Vec::new();
+
+        for _ in 0..2 {
+            let (mut s, mut c) = pair().await;
+            let k = Zeroizing::new([7u8; 32]);
+            let mut st = Zeroizing::new(Vec::new());
+            let mut ct = Zeroizing::new(Vec::new());
+
+            let (sk1, ck1) = tokio::join!(
+                spake2_exchange_server(&mut s, &k, &mut st),
+                spake2_exchange_client(&mut c, &k, &mut ct)
+            );
+            let (sk1, ck1) = (sk1.unwrap(), ck1.unwrap());
+
+            assert_eq!(*sk1, *ck1);
+            keys.push(sk1);
+        }
+
+        assert_ne!(*keys[0], *keys[1]);
+    }
 }

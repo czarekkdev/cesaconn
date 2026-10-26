@@ -1,6 +1,5 @@
 /*
 TODO:
-add tests
 persist DeviceKeypairs (private keys encrypted / in the OS keychain)
 sync the trusted peer list between devices, allow revoking one device
  */
