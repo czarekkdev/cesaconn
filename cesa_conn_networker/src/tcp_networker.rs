@@ -12,8 +12,8 @@ use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
 
 use crate::auth_snow::{
-    DeviceKeypairs, Keys, SecureConnection, Tags, TrustedPeer, TrustedPeers, auth_incoming,
-    auth_outgoing,
+    AuthSnowErrors, DATA_LAYER_OVERHEAD, DeviceKeypairs, Keys, SecureConnection, Tags, TrustedPeer,
+    TrustedPeers, auth_incoming, auth_outgoing,
 };
 
 /// Identifies what kind of action/data is being sent in a packet.
@@ -117,6 +117,8 @@ pub enum TcpNetworkerErrors {
     FailedToWriteToStream,
     /// Data packet larger than `MAX_DATA_PACKET_LEN` — rejected before allocating / sending.
     DataTooLarge,
+    /// The payload failed the `d_key` layer: the peer uses a different data password.
+    FailedToDecryptData,
 }
 
 impl fmt::Display for TcpNetworkerErrors {
@@ -131,6 +133,9 @@ impl fmt::Display for TcpNetworkerErrors {
             TcpNetworkerErrors::FailedToConnect => write!(f, "failed to make a connection request"),
             TcpNetworkerErrors::FailedToWriteToStream => write!(f, "failed to write to stream"),
             TcpNetworkerErrors::DataTooLarge => write!(f, "declared data packet is too large"),
+            TcpNetworkerErrors::FailedToDecryptData => {
+                write!(f, "failed to decrypt data (different d_key?)")
+            }
         }
     }
 }
@@ -159,10 +164,13 @@ async fn read_secure(
 ///
 /// 1. authentication ([`auth_incoming`]): SPAKE2 + hybrid KEX + Noise +
 ///    ML-DSA signatures; unknown devices are paired only if both users confirm
-/// 2. <- init header (9 bytes): [0] = ActionType, [1..9] = payload length (u64 LE)
-/// 3. <- payload in chunks ([`SecureConnection::read_chunked`]), if the length is not 0
+/// 2. <- init header (9 bytes): [0] = ActionType, [1..9] = encrypted payload
+///    length (u64 LE, plaintext + [`DATA_LAYER_OVERHEAD`]), 0 = no payload
+/// 3. <- payload, encrypted with a key derived from `d_key`, in chunks
+///    ([`SecureConnection::read_encrypted`])
 ///
-/// Everything after step 1 is encrypted and authenticated by the Noise transport.
+/// Everything after step 1 is encrypted and authenticated by the Noise
+/// transport; the payload additionally by the `d_key` layer.
 ///
 /// Returns `Ok(None)` if the peer doesn't know `a_key` (closed without data).
 pub async fn recv_handler(
@@ -172,6 +180,8 @@ pub async fn recv_handler(
     let (stream, peer_addr) = incoming_connection;
 
     debug!(%peer_addr, "recv_handler started, authenticating peer");
+
+    let context_keys = context.keys.clone();
 
     // 1. authentication
     let Some((mut secure_connection, peer)) = auth_incoming(
@@ -207,7 +217,7 @@ pub async fn recv_handler(
     );
 
     // the size comes from the peer: bound it before allocating
-    if size > MAX_DATA_PACKET_LEN {
+    if size > MAX_DATA_PACKET_LEN.saturating_add(DATA_LAYER_OVERHEAD as u64) {
         warn!(%peer_addr, size, max = MAX_DATA_PACKET_LEN, "declared data packet too large, rejecting");
         return Err(TcpNetworkerErrors::DataTooLarge);
     }
@@ -218,13 +228,23 @@ pub async fn recv_handler(
     let action_type = ActionType::from_u8(*action_byte).unwrap_or(ActionType::Default);
 
     // 3. payload (size bounded above)
-    let data = secure_connection
-        .read_chunked(size, Tags::Regular)
-        .await
-        .map_err(|e| {
-            warn!(%peer_addr, error = %e, "failed to read data packet from peer");
-            TcpNetworkerErrors::FailedToReadFromStream
-        })?;
+    let data = if size == 0 {
+        Zeroizing::new(Vec::new())
+    } else {
+        // cloned, so the read lock is released before any network I/O
+        let d_key = context_keys.read().await.d_key.clone();
+
+        secure_connection
+            .read_encrypted(size, &d_key, Tags::Regular)
+            .await
+            .map_err(|e| {
+                warn!(%peer_addr, error = %e, "failed to read data packet from peer");
+                match e {
+                    AuthSnowErrors::FailedToDecryptData => TcpNetworkerErrors::FailedToDecryptData,
+                    _ => TcpNetworkerErrors::FailedToReadFromStream,
+                }
+            })?
+    };
 
     info!(
         %peer_addr,
@@ -310,8 +330,9 @@ pub async fn recv(
 /// sends one packet.
 ///
 /// 1. authentication ([`auth_outgoing`]), pairs the device if needed
-/// 2. -> init header (9 bytes): [0] = ActionType, [1..9] = payload length (u64 LE)
-/// 3. -> payload in chunks ([`SecureConnection::write_chunked`]), if not empty
+/// 2. -> init header (9 bytes): [0] = ActionType, [1..9] = encrypted payload length (u64 LE)
+/// 3. -> payload encrypted with the `d_key` layer, in chunks
+///    ([`SecureConnection::write_encrypted`]), if not empty
 ///
 /// `ConnectNewDevice` only pairs: it sends a header with length 0 and no payload.
 pub async fn connect_handler(
@@ -330,6 +351,9 @@ pub async fn connect_handler(
         warn!(%connect_addr, size, max = MAX_DATA_PACKET_LEN, "data packet too large, not sending");
         return Err(TcpNetworkerErrors::DataTooLarge);
     }
+
+    // cloned, so the read lock is released before any network I/O
+    let d_key = context.keys.read().await.d_key.clone();
 
     // 1. authentication
     let Some((mut secure_connection, peer)) = auth_outgoing(
@@ -351,10 +375,11 @@ pub async fn connect_handler(
 
     debug!(%connect_addr, peer = %peer.name(), "peer authenticated, sending init header");
 
-    let size = if action_type == ActionType::ConnectNewDevice {
+    // what goes on the wire: plaintext + nonce + GCM tag, or nothing
+    let size = if action_type == ActionType::ConnectNewDevice || size == 0 {
         0
     } else {
-        size
+        size.saturating_add(DATA_LAYER_OVERHEAD as u64)
     };
 
     // 2. init header
@@ -374,7 +399,7 @@ pub async fn connect_handler(
     // 3. payload
     if size > 0 {
         secure_connection
-            .write_chunked(&data, Tags::Regular)
+            .write_encrypted(&data, &d_key, Tags::Regular)
             .await
             .map_err(|e| {
                 error!(%connect_addr, error = %e, "failed to send data packet");
@@ -464,8 +489,17 @@ mod tests {
         a_key: [u8; 32],
         pair_fallback: fn(&String, &[u8; 32]) -> bool,
     ) -> NetworkerContext {
+        make_context_d(a_key, TEST_D_KEY, pair_fallback)
+    }
+
+    /// Like [`make_context`] with an explicit `d_key`.
+    fn make_context_d(
+        a_key: [u8; 32],
+        d_key: [u8; 32],
+        pair_fallback: fn(&String, &[u8; 32]) -> bool,
+    ) -> NetworkerContext {
         NetworkerContext {
-            keys: Arc::new(RwLock::new(Keys::new(&a_key, &TEST_D_KEY))),
+            keys: Arc::new(RwLock::new(Keys::new(&a_key, &d_key))),
             device_keypairs: Arc::new(DeviceKeypairs::generate().unwrap()),
             trusted_peers: Arc::new(RwLock::new(Vec::new())),
             pair_fallback,
@@ -534,6 +568,7 @@ mod tests {
             TcpNetworkerErrors::FailedToConnect,
             TcpNetworkerErrors::FailedToWriteToStream,
             TcpNetworkerErrors::DataTooLarge,
+            TcpNetworkerErrors::FailedToDecryptData,
         ];
 
         for e in errors {
@@ -666,6 +701,25 @@ mod tests {
         assert_eq!(client_result, Err(TcpNetworkerErrors::FailedToAuthenticate));
         assert!(server_peers.read().await.is_empty());
         assert!(client_peers.read().await.is_empty());
+    }
+
+    /// Test that a peer with the right a_key but a different d_key can pair,
+    /// but its data is rejected
+    #[tokio::test]
+    async fn test_different_d_key_data_rejected() {
+        let (server_result, client_result) = exchange(
+            make_context(TEST_A_KEY, accept_all),
+            make_context_d(TEST_A_KEY, [0x22; 32], accept_all),
+            ActionType::ClipboardSync,
+            b"clipboard",
+        )
+        .await;
+
+        assert_eq!(client_result, Ok(()));
+        assert_eq!(
+            server_result.err(),
+            Some(TcpNetworkerErrors::FailedToDecryptData)
+        );
     }
 
     /// Test that cancelling before connect() returns Ok(()) without connecting

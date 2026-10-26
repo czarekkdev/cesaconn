@@ -3,7 +3,6 @@ TODO:
 add tests
 persist DeviceKeypairs (private keys encrypted / in the OS keychain)
 sync the trusted peer list between devices, allow revoking one device
-add encrypting/decrypting data with aes256 in SecureConnection with d_key
  */
 
 /* Constant variables for noise protocol */
@@ -43,6 +42,7 @@ use crate::{
 };
 use blake2::Blake2s256;
 use cesa_conn_crypto::{
+    aes::{decrypt, encrypt},
     crand::random_array,
     x25519_cesa::{X25519KeyPair, generate_new_key_pair},
 };
@@ -133,6 +133,10 @@ pub enum AuthSnowErrors {
     PeerKeyMismatch,
     /// A message is bigger than one [`SecureConnection`] message can carry.
     MessageTooLarge,
+    /// Encrypting a payload with the `d_key` data layer failed.
+    FailedToEncryptData,
+    /// The `d_key` data layer failed to decrypt: wrong `d_key` or tampered data.
+    FailedToDecryptData,
 }
 
 impl fmt::Display for AuthSnowErrors {
@@ -236,6 +240,15 @@ impl fmt::Display for AuthSnowErrors {
             AuthSnowErrors::MessageTooLarge => {
                 write!(f, "message is too large for one secure connection message")
             }
+            AuthSnowErrors::FailedToEncryptData => {
+                write!(f, "failed to encrypt data with d_key")
+            }
+            AuthSnowErrors::FailedToDecryptData => {
+                write!(
+                    f,
+                    "failed to decrypt data with d_key (wrong d_key or tampered data)"
+                )
+            }
         }
     }
 }
@@ -292,15 +305,108 @@ pub struct SecureConnection {
     pub connection: IncomingConnection,
     /// Noise transport state holding the send/receive cipher keys and nonces.
     pub ts: TransportState,
+    /// Noise handshake hash, unique per connection; salts the `d_key` data keys.
+    handshake_hash: Zeroizing<[u8; 32]>,
+    /// `true` if we opened the connection (client), picks the data key direction.
+    is_initiator: bool,
 }
+
+/// Bytes the `d_key` data layer adds to a payload: AES-GCM nonce (12) + tag (16).
+pub const DATA_LAYER_OVERHEAD: usize = 12 + 16;
 
 impl SecureConnection {
     /// Wraps an already-handshaken stream and its transport state.
-    pub fn new(connection: IncomingConnection, ts: TransportState) -> Self {
+    pub fn new(
+        connection: IncomingConnection,
+        ts: TransportState,
+        handshake_hash: Zeroizing<[u8; 32]>,
+        is_initiator: bool,
+    ) -> Self {
         Self {
-            connection: connection,
-            ts: ts,
+            connection,
+            ts,
+            handshake_hash,
+            is_initiator,
         }
+    }
+
+    /// Per-connection, per-direction key for the `d_key` data layer:
+    /// HKDF(ikm = d_key, salt = handshake hash, info = direction label).
+    ///
+    /// Bound to this connection, so a payload can't be replayed into another
+    /// one, and each direction has its own key.
+    fn data_key(
+        &self,
+        d_key: &Zeroizing<[u8; 32]>,
+        sending: bool,
+    ) -> Result<Zeroizing<[u8; 32]>, AuthSnowErrors> {
+        let label: &[u8] = if sending == self.is_initiator {
+            b"CPQHA-data-client-to-server"
+        } else {
+            b"CPQHA-data-server-to-client"
+        };
+
+        let mut key = Zeroizing::new([0u8; 32]);
+
+        SimpleHkdf::<Blake2s256>::new(Some(self.handshake_hash.as_slice()), d_key.as_slice())
+            .expand(label, key.as_mut_slice())
+            .map_err(|_| AuthSnowErrors::FailedToExpandHkdf)?;
+
+        Ok(key)
+    }
+
+    /// Encrypts `data` with AES-256-GCM under a key derived from `d_key`
+    /// ([`Self::data_key`]) and sends `nonce (12) || ciphertext` in chunks.
+    ///
+    /// This is the inner layer: even with the Noise session broken, the data
+    /// stays unreadable without the second password (`d_key`).
+    /// The receiver needs the length, i.e. `data.len() + DATA_LAYER_OVERHEAD`.
+    pub async fn write_encrypted(
+        &mut self,
+        data: &[u8],
+        d_key: &Zeroizing<[u8; 32]>,
+        tag: Tags,
+    ) -> Result<(), AuthSnowErrors> {
+        let key = self.data_key(d_key, true)?;
+
+        let (ciphertext, nonce) =
+            encrypt(&key, data).map_err(|_| AuthSnowErrors::FailedToEncryptData)?;
+
+        let mut packet = Zeroizing::new(Vec::with_capacity(
+            ciphertext.len().saturating_add(nonce.len()),
+        ));
+
+        packet.extend_from_slice(&nonce);
+        packet.extend_from_slice(&ciphertext);
+
+        self.write_chunked(&packet, tag).await
+    }
+
+    /// Receives `len` bytes sent with [`Self::write_encrypted`] and decrypts them.
+    ///
+    /// `len` includes [`DATA_LAYER_OVERHEAD`]; the caller must bound it first.
+    pub async fn read_encrypted(
+        &mut self,
+        len: usize,
+        d_key: &Zeroizing<[u8; 32]>,
+        tag: Tags,
+    ) -> Result<Zeroizing<Vec<u8>>, AuthSnowErrors> {
+        if len < DATA_LAYER_OVERHEAD {
+            return Err(AuthSnowErrors::FailedToDecryptData);
+        }
+
+        let packet = self.read_chunked(len, tag).await?;
+        let key = self.data_key(d_key, false)?;
+
+        let (nonce, ciphertext) = packet.split_at(12);
+        let nonce: &[u8; 12] = nonce
+            .try_into()
+            .map_err(|_| AuthSnowErrors::FailedToConvertToArray)?;
+
+        // GCM tag check: wrong d_key or tampered data fails here
+        Ok(Zeroizing::new(
+            decrypt(&key, ciphertext, nonce).map_err(|_| AuthSnowErrors::FailedToDecryptData)?,
+        ))
     }
 
     /// Tags `src`, encrypts it and sends it to the peer.
@@ -1146,7 +1252,12 @@ async fn snow_handshake_server(
         .into_transport_mode()
         .map_err(|_| AuthSnowErrors::FailedToEnterTransportMode)?;
 
-    let secure_connection = SecureConnection::new(incoming_connection, transport);
+    let secure_connection = SecureConnection::new(
+        incoming_connection,
+        transport,
+        handshake_hash.clone(),
+        false,
+    );
 
     authenticate_peer(
         secure_connection,
@@ -1268,7 +1379,8 @@ async fn snow_handshake_client(
         .into_transport_mode()
         .map_err(|_| AuthSnowErrors::FailedToEnterTransportMode)?;
 
-    let secure_connection = SecureConnection::new(outgoing_connection, transport);
+    let secure_connection =
+        SecureConnection::new(outgoing_connection, transport, handshake_hash.clone(), true);
 
     authenticate_peer(
         secure_connection,
@@ -1755,6 +1867,78 @@ mod tests {
         drop(client_conn);
 
         assert!(server_conn.read_chunked(200, Tags::Regular).await.is_err());
+    }
+
+    /// Test that the d_key layer round-trips in both directions
+    #[tokio::test]
+    async fn test_encrypted_roundtrip_both_directions() {
+        let server = Device::new(TEST_A_KEY);
+        let client = Device::new(TEST_A_KEY);
+
+        let (s, c) = handshake(&server, &client, accept_all, accept_all).await;
+        let (mut server_conn, _) = s.unwrap().unwrap();
+        let (mut client_conn, _) = c.unwrap().unwrap();
+
+        let d_key = server.keys.read().await.d_key.clone();
+        let data: Vec<u8> = (0..=250u8).cycle().take(200_000).collect();
+        let len = data.len() + DATA_LAYER_OVERHEAD;
+
+        let send = client_conn.write_encrypted(&data, &d_key, Tags::Regular);
+        let recv = server_conn.read_encrypted(len, &d_key, Tags::Regular);
+        let (sent, received) = tokio::join!(send, recv);
+        sent.unwrap();
+        assert_eq!(received.unwrap().as_slice(), data.as_slice());
+
+        let send = server_conn.write_encrypted(b"back", &d_key, Tags::Regular);
+        let recv = client_conn.read_encrypted(4 + DATA_LAYER_OVERHEAD, &d_key, Tags::Regular);
+        let (sent, received) = tokio::join!(send, recv);
+        sent.unwrap();
+        assert_eq!(received.unwrap().as_slice(), b"back");
+    }
+
+    /// Test that a different d_key on the receiver fails decryption
+    #[tokio::test]
+    async fn test_encrypted_wrong_d_key_fails() {
+        let server = Device::new(TEST_A_KEY);
+        let client = Device::new(TEST_A_KEY);
+
+        let (s, c) = handshake(&server, &client, accept_all, accept_all).await;
+        let (mut server_conn, _) = s.unwrap().unwrap();
+        let (mut client_conn, _) = c.unwrap().unwrap();
+
+        let send_key = Zeroizing::new([1u8; 32]);
+        let recv_key = Zeroizing::new([2u8; 32]);
+
+        let send = client_conn.write_encrypted(b"clipboard", &send_key, Tags::Regular);
+        let recv = server_conn.read_encrypted(9 + DATA_LAYER_OVERHEAD, &recv_key, Tags::Regular);
+        let (_, received) = tokio::join!(send, recv);
+
+        assert_eq!(received.err(), Some(AuthSnowErrors::FailedToDecryptData));
+    }
+
+    /// Test that the data keys differ per direction and per connection
+    #[tokio::test]
+    async fn test_data_keys_bound_to_direction_and_connection() {
+        let server = Device::new(TEST_A_KEY);
+        let client = Device::new(TEST_A_KEY);
+        let d_key = Zeroizing::new([9u8; 32]);
+
+        let (s, c) = handshake(&server, &client, accept_all, accept_all).await;
+        let (server_conn, _) = s.unwrap().unwrap();
+        let (client_conn, _) = c.unwrap().unwrap();
+
+        let c2s_client = client_conn.data_key(&d_key, true).unwrap();
+        let c2s_server = server_conn.data_key(&d_key, false).unwrap();
+        let s2c_client = client_conn.data_key(&d_key, false).unwrap();
+
+        // both ends agree per direction, directions differ
+        assert_eq!(*c2s_client, *c2s_server);
+        assert_ne!(*c2s_client, *s2c_client);
+
+        // a new connection gets new keys (new handshake hash)
+        let (_s2, c2) = handshake(&server, &client, accept_all, accept_all).await;
+        let (client_conn2, _) = c2.unwrap().unwrap();
+        assert_ne!(*client_conn2.data_key(&d_key, true).unwrap(), *c2s_client);
     }
 
     /// Test that both roles derive the same PSK from the same inputs
