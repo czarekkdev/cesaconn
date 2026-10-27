@@ -297,16 +297,23 @@ daemon is RAM only: keys are gone after a restart, `Unlock` and
 
 `Unlock(pw2)` (only while Locked; otherwise `BadRequest` if open, `NotSaved`
 if there is no vault):
-1. read the salts from the keychain (missing or unreadable: `StorageFailed`);
-2. wait `unlock_delay(failures)`: 0 for the first 5 wrong passwords, then 1 s
-   doubling to 60 s. The change slot stays taken while waiting, so parallel
-   guesses wait behind it (and are dropped at the 10 s IPC deadline);
+1. inside the unlock delay: refused at once with `UnlockDelayed`, before any
+   keychain access or Argon2, and not counted as another guess;
+2. read the salts from the keychain (missing or unreadable: `StorageFailed`);
 3. `d_key = Argon2id(pw2, d_salt)`, `KEK = HKDF(...)`, open the vault;
-4. wrong password = the DEK wrap fails its GCM tag -> `WrongPassword` and the
-   counter goes up; a damaged file is `StorageFailed`, never `WrongPassword`;
-5. success: load `a_key`, `a_salt`, identity, config, peers; counter reset.
+4. wrong password = the DEK wrap fails its GCM tag -> `WrongPassword`, the
+   counter goes up and the next attempt is refused for `unlock_delay(failures)`:
+   nothing for the first 5 wrong passwords, then 1 s doubling to 60 s. A
+   damaged file is `StorageFailed`, never `WrongPassword`;
+5. success: load `a_key`, `a_salt`, identity, config, peers; counter and
+   delay reset.
 
-Known bug: long delays outlast the IPC deadline, see 18.10.
+The delay is a "not before" time, not a sleep: a sleep held the change slot
+and outlasted the 10 s IPC deadline from the 10th attempt on, so the UI got a
+timeout even for the right password. `Status` reports the seconds left
+(`unlock_wait_secs`); the TUI shows them in the status bar and doesn't open
+the password field until the wait is over. The guessing rate is the same as
+with the sleep: one Argon2 attempt per delay.
 
 The failure counter is in RAM, so a daemon restart resets it. That is
 accepted: every attempt still costs a 64 MiB Argon2 run, and a process that
@@ -393,7 +400,7 @@ Frames that carry a request are read into `Zeroizing` buffers (a request may
 hold a password). Compile-time asserts keep the largest request and the
 largest `ListPeers` answer under `MAX_FRAME_LEN`.
 
-### 7.4 Wire format, version 2 **[built]**
+### 7.4 Wire format, version 3 **[built]**
 
 ```
 frame    = length (u32 LE, 1..=MAX_FRAME_LEN) || body
@@ -404,7 +411,7 @@ response = 0x00 || payload        (success)
 
 | Kind | Request | Payload | Success payload |
 |---|---|---|---|
-| `0x01` | Status | none | `flags (1) \|\| trusted peers (u32 LE)` |
+| `0x01` | Status | none | `flags (1) \|\| trusted peers (u32 LE) \|\| unlock wait (u16 LE, seconds)` |
 | `0x04` | ListPeers | none | `count (u16 LE) \|\| count * (fingerprint (8) \|\| name len (1) \|\| name)` |
 | `0x05` | SetAuthPassword | `password` | empty |
 | `0x06` | SetDataPassword | `password` | empty |
@@ -414,6 +421,9 @@ response = 0x00 || payload        (success)
 
 Status flags: bit 0 auth key set, 1 data key set, 2 network running, 3 vault
 locked, 4 keys saved, 5 automatic login. Any other bit set is `Malformed`.
+Unlock wait: seconds until `Unlock` is accepted again (0 = now). Version 2
+had no unlock wait; a version 2 status is `Malformed`, so a mismatched UI and
+daemon fail loudly.
 
 A fingerprint is the first 8 bytes of the peer's X25519 static public key,
 for telling devices apart in the UI; it is not a security check. Names are cut
@@ -421,7 +431,7 @@ to 255 bytes on a char boundary.
 
 Error codes: `0x01` BadRequest, `0x02` KeyDerivationFailed, `0x03` Internal,
 `0x04` WrongPassword, `0x05` Locked, `0x06` StorageFailed, `0x07` NotSaved,
-`0x08` WeakPassword.
+`0x08` WeakPassword, `0x09` UnlockDelayed.
 
 Decoding is strict: anything not exactly well-formed is refused (`BadRequest`
 from the daemon, `Malformed` in the client), and responses are decoded for
@@ -1094,7 +1104,9 @@ decided after an audit.
 
 Tests (`cargo test --workspace --all-features`):
 - daemon: setup, restart, unlock, wrong password, automatic login, password
-  changes, keychain failure, damaged vault, unlock delay and counter, minimum
+  changes, keychain failure, damaged vault, unlock delay and counter, unlocks
+  inside the delay refused at once (also the 60 s delay over a real socket,
+  within the IPC deadline), minimum
   length in characters, identity and peers surviving restarts, RAM-only mode,
   no key or salt in any response over a real socket, a waiting change holding
   no task;
@@ -1152,20 +1164,11 @@ Stated plainly so nobody relies on a property that isn't there.
 6. **Protocol fingerprint**: pre-Noise traffic has fixed sizes and tags, so a
    network observer can tell that a CesaConn handshake is happening (not
    who, and nothing secret).
-7. **Unlock counter resets on restart** (6.4).
+7. **Unlock counter and delay reset on restart** (6.4).
 8. **Display names** are socket addresses for now, so the pairing prompt can
    only show where the request comes from, not which device it claims to be.
 9. **The transcript after Noise** (signatures) is appended but no longer used;
    harmless, noted so nobody assumes it binds anything.
-10. **Unlock delay vs the IPC deadline (bug).** Once 9 wrong passwords are
-    counted, the delay before each further attempt (16 s, 32 s, 60 s) is
-    longer than the 10 s `REQUEST_DEADLINE` (after 8 it is 8 s plus Argon2,
-    borderline).
-    The unlock still runs to the end in its own task, but the UI gets a
-    timeout instead of the answer, even for the right password, and only a
-    later `Status` shows the result. Fix options: answer at once with the
-    remaining delay and let the UI retry, or give `Unlock` its own deadline
-    of `MAX_UNLOCK_DELAY` + Argon2 + margin. **[open]**
 
 ---
 
@@ -1196,7 +1199,6 @@ Open:
 - group rotation, trusted-peer sync and revocation protocol;
 - device names exchanged during pairing;
 - a post-quantum PAKE (18.1);
-- the fix for the unlock delay outlasting the IPC deadline (18.10);
 - the Bluetooth dependency: design it or drop it (9.3).
 
 ---

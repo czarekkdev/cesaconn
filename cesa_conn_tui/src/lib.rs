@@ -462,6 +462,13 @@ fn handle_settings_enter(app: &mut App) {
                 *v = !*v;
             }
         }
+    } else if matches!(
+        app.active_settings().get(idx).map(|s| &s.kind),
+        Some(SettingKind::Locked)
+    ) && unlock_wait(app) > 0
+    {
+        // the daemon would refuse it: don't let a password be typed for nothing
+        log_unlock_wait(app);
     } else if let Some(kind) = selected_key_kind(app)
         && matches!(
             app.active_settings().get(idx).map(|s| &s.kind),
@@ -474,6 +481,21 @@ fn handle_settings_enter(app: &mut App) {
         clear_input(app);
         app.active_popup = ActivePopup::EditSetting;
     }
+}
+
+/// Seconds the daemon still refuses `Unlock` (0 = now, or unknown).
+fn unlock_wait(app: &App) -> u16 {
+    match &app.daemon {
+        DaemonState::Up(status) if status.locked => status.unlock_wait_secs,
+        _ => 0,
+    }
+}
+
+fn log_unlock_wait(app: &mut App) {
+    let secs = unlock_wait(app);
+    app.push_log(format!(
+        "[ WARN] Too many wrong data passwords: try again in {secs} s"
+    ));
 }
 
 /// y: go on to typing the new password; anything that cancels: nothing changes.
@@ -602,7 +624,10 @@ fn send_password_from_input(app: &mut App) {
     let locked = matches!(&app.daemon, DaemonState::Up(status) if status.locked);
 
     if locked {
-        if kind == KeyKind::Data {
+        if kind == KeyKind::Data && unlock_wait(app) > 0 {
+            // the daemon would refuse it without looking at the password
+            log_unlock_wait(app);
+        } else if kind == KeyKind::Data {
             app.outbox.push(Command::Unlock(PasswordUpdate {
                 password: Zeroizing::new(app.input_buf.as_bytes().to_vec()),
             }));
@@ -695,6 +720,9 @@ fn handle_link_event(app: &mut App, event: LinkEvent) {
                 Err(IpcErrors::Daemon(DaemonError::WrongPassword)) => {
                     app.push_log("[ERROR] Wrong data password")
                 }
+                Err(IpcErrors::Daemon(DaemonError::UnlockDelayed)) => app.push_log(
+                    "[ WARN] Too many wrong data passwords: wait (see the status bar), then try again",
+                ),
                 Err(e) => app.push_log(format!("[ERROR] Unlocking failed: {e}")),
             }
             app.request_refresh();
@@ -1059,6 +1087,13 @@ fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
 
     let (daemon_str, daemon_color) = match &app.daemon {
         DaemonState::Unknown => ("daemon: …".to_owned(), Color::DarkGray),
+        DaemonState::Up(s) if s.locked && s.unlock_wait_secs > 0 => (
+            format!(
+                "daemon: locked, too many wrong passwords: try again in {} s",
+                s.unlock_wait_secs
+            ),
+            Color::Red,
+        ),
         DaemonState::Up(s) if s.locked => (
             "daemon: locked, enter the data password".to_owned(),
             Color::Yellow,
@@ -1718,6 +1753,59 @@ mod tests {
             LinkEvent::Unlocked(Err(IpcErrors::Daemon(DaemonError::WrongPassword))),
         );
         assert!(app.logs.iter().any(|l| l.contains("Wrong data password")));
+        assert!(matches!(app.outbox.as_slice(), [Command::Refresh]));
+    }
+
+    /// Test that while the daemon refuses unlocks, the unlock field doesn't
+    /// open and nothing is sent; the status bar shows the wait
+    #[test]
+    fn test_unlock_wait_blocks_unlock() {
+        let mut app = App::new();
+        handle_link_event(
+            &mut app,
+            LinkEvent::Refreshed(Ok((
+                Status {
+                    locked: true,
+                    saved: true,
+                    unlock_wait_secs: 32,
+                    ..Status::default()
+                },
+                Vec::new(),
+            ))),
+        );
+        app.outbox.clear();
+        app.active_tab = Tab::Settings;
+        select(&mut app, SettingsSection::Basic, DATA_KEY_LABEL);
+
+        handle_settings_enter(&mut app);
+        assert_eq!(app.active_popup, ActivePopup::None);
+        assert!(app.logs.iter().any(|l| l.contains("try again in 32 s")));
+
+        // a field opened just before the wait started sends nothing either
+        type_and_enter(&mut app, "data password 1");
+        assert!(app.outbox.is_empty());
+        assert!(app.input_buf.is_empty());
+
+        // once the wait is over, unlocking works again
+        handle_link_event(&mut app, up_locked(true, false));
+        app.outbox.clear();
+        type_and_enter(&mut app, "data password 1");
+        assert!(matches!(app.outbox.as_slice(), [Command::Unlock(_)]));
+    }
+
+    /// Test that a refused (delayed) unlock is reported as a wait, not a failure
+    #[test]
+    fn test_delayed_unlock_reported() {
+        let mut app = App::new();
+        handle_link_event(
+            &mut app,
+            LinkEvent::Unlocked(Err(IpcErrors::Daemon(DaemonError::UnlockDelayed))),
+        );
+        assert!(
+            app.logs
+                .iter()
+                .any(|l| l.contains("Too many wrong data passwords"))
+        );
         assert!(matches!(app.outbox.as_slice(), [Command::Refresh]));
     }
 
