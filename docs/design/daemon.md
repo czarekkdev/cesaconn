@@ -1116,10 +1116,13 @@ builds): `servertest <pw>` prints fresh random salts and listens on 3232;
 pairs (8 hex bytes of the handshake hash, `y/N`) and sends one Debug packet.
 
 The security gate (`security/README.md`) runs on every push: zeroize, lock and
-network rules (semgrep), clippy, ThreadSanitizer, Miri on the crypto crate,
-cargo-audit / cargo-deny, gitleaks. Only critical findings block; reviewed
-upstream-only dependency findings go in `security/accepted.json`, never in
-`deny.toml`. Code that doesn't build is reported as not analysed, never as clean.
+network rules (semgrep), clippy (every rustc and clippy warning), ThreadSanitizer,
+Miri on the crypto crate, cargo-audit / cargo-deny, gitleaks. Every critical
+finding, every warning and every coverage gap blocks; `unwrap` / `expect`
+outside tests are critical. Only notes pass: reviewed upstream-only dependency
+findings in `security/accepted.json` (never in `deny.toml`) and unused code
+(visible until the networking code is wired up). Code that doesn't build is a
+coverage gap, never clean.
 
 ---
 

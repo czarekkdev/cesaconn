@@ -90,7 +90,10 @@ fn salts_from_hex(hex: &str) -> Option<[u8; SALTS_LEN]> {
 
     let mut out = [0u8; SALTS_LEN];
 
-    for (byte, pair) in out.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
+    // the length is checked above, so there is no remainder
+    let (pairs, _) = hex.as_bytes().as_chunks::<2>();
+
+    for (byte, pair) in out.iter_mut().zip(pairs) {
         *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
     }
 

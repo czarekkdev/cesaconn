@@ -17,5 +17,7 @@ ratatui = "0.30"
 crossterm = "0.29"
 zeroize = "1.8.2"
 cesa_conn_system = { path = "../cesa_conn_system" }
-# runs IPC requests on the link worker thread, off the UI loop
-tokio = { version = "1.50.0", features = ["rt", "net", "time"] }
+# runs IPC requests on the link worker thread, off the UI loop; "sync" makes
+# the tokio guard types in clippy.toml resolvable here, so the guard-across-
+# .await lint config is valid in every crate (an unresolved path is a warning)
+tokio = { version = "1.50.0", features = ["rt", "net", "time", "sync"] }
