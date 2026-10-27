@@ -303,8 +303,9 @@ if there is no vault):
 3. `d_key = Argon2id(pw2, d_salt)`, `KEK = HKDF(...)`, open the vault;
 4. wrong password = the DEK wrap fails its GCM tag -> `WrongPassword`, the
    counter goes up and the next attempt is refused for `unlock_delay(failures)`:
-   nothing for the first 5 wrong passwords, then 1 s doubling to 60 s. A
-   damaged file is `StorageFailed`, never `WrongPassword`;
+   the first 5 attempts run back to back, after the 5th wrong password it is
+   1 s, doubling to 60 s. A damaged file is `StorageFailed`, never
+   `WrongPassword`;
 5. success: load `a_key`, `a_salt`, identity, config, peers; counter and
    delay reset.
 

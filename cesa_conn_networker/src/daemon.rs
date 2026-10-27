@@ -89,14 +89,15 @@ struct KeySlots {
 }
 
 /* unlock guessing */
-/// Wrong unlock passwords allowed before every attempt is delayed.
+/// Unlock attempts that run back to back; after this many wrong passwords
+/// every further attempt has to wait.
 const FREE_UNLOCK_ATTEMPTS: u32 = 5;
-/// Longest delay before an unlock attempt (seconds).
+/// Longest time unlocks are refused after a wrong password (seconds).
 const MAX_UNLOCK_DELAY: u64 = 60;
 
 /// How long after the `failures`-th wrong password the next unlock attempt
-/// is refused: not at all for the first [`FREE_UNLOCK_ATTEMPTS`], then 1 s
-/// doubling up to [`MAX_UNLOCK_DELAY`]. On top of Argon2's own cost, this
+/// is refused: not at all below [`FREE_UNLOCK_ATTEMPTS`] (those attempts run
+/// back to back), then 1 s doubling up to [`MAX_UNLOCK_DELAY`]. On top of Argon2's own cost, this
 /// slows a local process guessing through the IPC.
 ///
 /// Attempts inside the delay are refused at once ([`DaemonError::UnlockDelayed`])
@@ -653,13 +654,10 @@ impl Daemon {
                 Err(DaemonError::WrongPassword) => {
                     keys.unlock_failures = keys.unlock_failures.saturating_add(1);
                     let delay = unlock_delay(keys.unlock_failures);
-                    // an overflowing deadline means "as long as possible"
+                    // can't overflow: the delay is at most MAX_UNLOCK_DELAY and an
+                    // Instant a minute from now always fits
                     let now = Instant::now();
-                    keys.unlock_not_before = Some(
-                        now.checked_add(delay)
-                            .or_else(|| now.checked_add(Duration::from_secs(MAX_UNLOCK_DELAY)))
-                            .unwrap_or(now),
-                    );
+                    keys.unlock_not_before = Some(now.checked_add(delay).unwrap_or(now));
                     warn!(
                         failures = keys.unlock_failures,
                         delay_secs = delay.as_secs(),
@@ -1426,6 +1424,7 @@ mod tests {
         );
 
         token.cancel();
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Test that the minimum counts characters, not bytes (12 bytes of
