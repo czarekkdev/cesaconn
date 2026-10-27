@@ -1,6 +1,6 @@
 # Code-hygiene rules that matter for security review.
 # severity ERROR   = critical -> fails CI / blocks push
-# severity WARNING = reported, does not block
+# severity WARNING = warning -> blocks too (every warning fails the gate)
 
 rules:
   - id: cesa.hygiene.allow-dead-code
@@ -12,3 +12,14 @@ rules:
       silently stopped being called looks exactly like this. Delete it, wire
       it in, or let the compiler warning stay visible until it is.
     pattern-regex: '#!?\[\s*(allow|expect)\s*\([^\]]*\b(dead_code|unused[a-z_]*)\b'
+
+  - id: cesa.hygiene.allow-unwrap
+    severity: ERROR
+    languages: [rust]
+    message: >-
+      `unwrap()` / `expect()` are forbidden outside tests (clippy
+      `unwrap_used` / `expect_used` are critical), and so is switching the
+      lint off. A panic in the daemon is a crash: any input that reaches one
+      is a denial of service. Return an error with `?` / `ok_or(..)` instead.
+      Tests may unwrap without this attribute (clippy.toml allow-*-in-tests).
+    pattern-regex: '#!?\[[^\]]*\b(allow|expect)\s*\([^\]]*\bclippy::(unwrap_used|expect_used)\b'

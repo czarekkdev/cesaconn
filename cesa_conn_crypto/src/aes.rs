@@ -41,7 +41,7 @@ pub fn encrypt(key: &[u8; 32], data: &[u8]) -> Result<(Vec<u8>, [u8; 12]), AESEr
     // Generate a cryptographically secure random nonce using OS entropy source
     // Nonce MUST be unique for every encryption with the same key
     let mut nonce_bytes = [0u8; 12];
-    let mut rng = SysRng::default();
+    let mut rng = SysRng;
 
     rng.try_fill_bytes(&mut nonce_bytes).map_err(|e| {
         error!(error = %e, "OS failed to generate random nonce for AES-256-GCM");

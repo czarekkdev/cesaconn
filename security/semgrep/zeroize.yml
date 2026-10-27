@@ -1,6 +1,6 @@
 # Secret-handling rules for CesaConn.
 # severity ERROR   = critical -> fails CI / blocks push
-# severity WARNING = reported, does not block
+# severity WARNING = warning -> blocks too (every warning fails the gate)
 #
 # "Secret-like" names: key, secret, psk, seed, password/pswd/pwd, shared
 # secret (ss), private, token. Public keys / verification keys are excluded.

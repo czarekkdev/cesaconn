@@ -3,7 +3,8 @@
 CesaConn security gate.
 
 Runs every security check, writes a Markdown report + a SARIF file, and exits
-non-zero ONLY when a CRITICAL finding exists. Everything else is reported.
+non-zero on ANY critical finding, ANY warning, or ANY coverage gap: the code
+has to be perfect. Only notes (reviewed upstream exceptions, unused code) pass.
 
     python3 security/run.py              # full run (CI): + Miri + ThreadSanitizer
     python3 security/run.py --fast       # pre-push hook: static checks only
@@ -11,7 +12,8 @@ non-zero ONLY when a CRITICAL finding exists. Everything else is reported.
 
 Checks
   semgrep   security/semgrep/*.yml  - zeroize, lock/guard misuse, races
-  clippy    per crate, security lint set (+ clippy.toml tokio guard config)
+  clippy    per crate: every rustc + clippy warning, security lint set on top
+            (+ clippy.toml tokio guard config)
   audit     cargo-audit (RustSec)     - vulnerabilities / unsound crates
   deny      cargo-deny                - registry sources, licenses, bans
   gitleaks  committed secrets
@@ -20,9 +22,11 @@ Checks
 
 Severity
   critical  -> blocks (exit 1)
-  warning   -> reported only
-  info      -> a tool could not run / partial analysis, or a reviewed dependency
-               exception from security/accepted.json (reported, never blocks)
+  warning   -> blocks (exit 1)
+  info      -> a NOTE if it is a reviewed dependency exception from
+               security/accepted.json or unused code (dead_code, unused_*: the
+               networking code isn't wired up yet, and allow(dead_code) is
+               forbidden); every other info is a coverage gap and blocks
 """
 
 from __future__ import annotations
@@ -49,7 +53,9 @@ MIRI_CRATES = ["cesa_conn_crypto"]
 MIRI_SKIP = ["pswd_manager::", "test_large_data"]
 
 # ---- clippy lint policy -----------------------------------------------------
-# Denied lints -> critical. Everything listed in WARN -> warning.
+# Every rustc / clippy warning (clippy's default groups included) blocks.
+# Denied lints -> critical. CRITICAL -> critical. Everything else -> warning.
+# UNUSED_CODE -> note (visible, doesn't block).
 CLIPPY_DENY = [
     "clippy::await_holding_lock",          # std/parking_lot guard across .await
     "clippy::await_holding_refcell_ref",
@@ -59,6 +65,20 @@ CLIPPY_DENY = [
     "unsafe_op_in_unsafe_fn",
     "clippy::correctness",
 ]
+# Critical as well, but run as warnings and classified here: a denied lint
+# stops the build, so crates that depend on the offending one would go
+# unlinted. A panic is a crash, and in the daemon any input that reaches one
+# is a denial of service; expect() is unwrap() with a message. Tests may use
+# both (clippy.toml allow-*-in-tests).
+CLIPPY_CRITICAL = [
+    "clippy::unwrap_used",
+    "clippy::expect_used",
+]
+# Unused code: reported as notes. It's expected while the networking code
+# isn't started by the daemon, and hiding it with allow(dead_code) is
+# forbidden, so it stays visible without failing the run.
+UNUSED_CODE = {"dead_code", "unused_imports", "unused_variables", "unused_assignments",
+               "unused_mut", "unused_macros"}
 CLIPPY_WARN = [
     "clippy::await_holding_invalid_type",  # tokio guards across .await (clippy.toml)
     "clippy::significant_drop_tightening", # guard lives longer than needed
@@ -68,8 +88,6 @@ CLIPPY_WARN = [
     "clippy::mutex_atomic",
     "clippy::mutex_integer",
     "clippy::rc_mutex",
-    "clippy::unwrap_used",
-    "clippy::expect_used",
     "clippy::panic",
     "clippy::indexing_slicing",
     "clippy::arithmetic_side_effects",
@@ -83,7 +101,7 @@ CLIPPY_WARN = [
     "clippy::suspicious",
     "unsafe_code",
 ]
-CLIPPY_REPORTED = {l.split("::")[-1] for l in CLIPPY_DENY + CLIPPY_WARN}
+CLIPPY_CRITICAL_SHORT = {l.split("::")[-1] for l in CLIPPY_CRITICAL}
 
 SEV_ORDER = {"critical": 0, "warning": 1, "info": 2}
 
@@ -167,7 +185,8 @@ def check_semgrep() -> ToolResult:
         r.findings.append(Finding("semgrep", "parse-error", "info", e.get("message", "")[:400],
                                   rel(e.get("path", "") or "")))
     for res in data.get("results", []):
-        sev = {"ERROR": "critical", "WARNING": "warning"}.get(res["extra"]["severity"], "info")
+        # every finding blocks; INFO rules (none today) count as warnings, not gaps
+        sev = "critical" if res["extra"]["severity"] == "ERROR" else "warning"
         rid = res["check_id"].split("cesa.", 1)[-1]
         r.findings.append(Finding("semgrep", rid, sev, " ".join(res["extra"]["message"].split()),
                                   rel(res["path"]), res["start"]["line"],
@@ -178,12 +197,16 @@ def check_semgrep() -> ToolResult:
 # ---- clippy -----------------------------------------------------------------
 def check_clippy() -> ToolResult:
     r = ToolResult("clippy")
-    flags = ["-A", "clippy::style", "-A", "clippy::complexity", "-A", "clippy::perf"]
-    for l in CLIPPY_WARN:
+    flags = []
+    for l in CLIPPY_WARN + CLIPPY_CRITICAL:
         flags += ["-W", l]
     for l in CLIPPY_DENY:
         flags += ["-D", l]
     broken = []
+    # a finding is reported once, even when another crate's run compiles the
+    # same file; unused code is collected into one note per lint
+    seen = set()
+    unused: dict[str, list[str]] = {}
     for crate in CRATES:
         # both feature sets: code behind a feature (e.g. test-commands) and code
         # behind cfg(not(feature)) (the default build) must each be analysed
@@ -193,7 +216,9 @@ def check_clippy() -> ToolResult:
                            "--message-format=json", "--", *flags], timeout=1800)
             out += o + "\n"
         build_errors = 0
-        seen = set()
+        # compile errors count per crate: a broken dependency also leaves
+        # this crate unanalysed
+        seen_errors = set()
         for line in out.splitlines():
             try:
                 msg = json.loads(line)
@@ -202,32 +227,41 @@ def check_clippy() -> ToolResult:
             if msg.get("reason") != "compiler-message":
                 continue
             m = msg["message"]
+            if m["level"] not in ("warning", "error"):
+                continue
             lint = (m.get("code") or {}).get("code") or ""
             short = lint.split("::")[-1]
             span = next((s for s in m.get("spans", []) if s.get("is_primary")), None)
             if not span:
                 continue
             path = span["file_name"]
-            if not path.startswith(crate + "/") and not path.startswith(crate):
+            if path.endswith("clippy.toml"):
+                path = "clippy.toml"  # a config problem silently disables lints
+            elif not path.startswith(crate + "/") and not path.startswith(crate):
                 # dependency or another crate's file compiled as part of this one
                 if not any(path.startswith(c) for c in CRATES):
                     continue
             key = (lint, path, span["line_start"], m["message"])
+            if m["level"] == "error" and (not lint or lint.startswith("E")):
+                if key not in seen_errors:
+                    seen_errors.add(key)
+                    build_errors += 1
+                continue
             if key in seen:
                 continue
             seen.add(key)
-            if m["level"] == "error" and (not lint or lint.startswith("E")):
-                build_errors += 1
+            if short in UNUSED_CODE and m["level"] == "warning":
+                unused.setdefault(short, []).append(f"{path}:{span['line_start']}")
                 continue
-            if short not in CLIPPY_REPORTED and not lint.startswith("clippy::"):
-                continue
-            if short not in CLIPPY_REPORTED:
-                continue  # default style lints - not security
-            sev = "critical" if m["level"] == "error" else "warning"
-            r.findings.append(Finding("clippy", lint or "error", sev, m["message"],
+            sev = "critical" if m["level"] == "error" or short in CLIPPY_CRITICAL_SHORT else "warning"
+            r.findings.append(Finding("clippy", lint or m["level"], sev, m["message"],
                                       path, span["line_start"], (span.get("text") or [{}])[0].get("text", "").strip()[:200]))
         if build_errors:
             broken.append(f"{crate} ({build_errors} compile errors)")
+    for lint, locs in sorted(unused.items()):
+        shown = ", ".join(locs[:10]) + (f", ... ({len(locs) - 10} more)" if len(locs) > 10 else "")
+        r.findings.append(Finding("clippy", "unused-code", "info",
+                                  f"{len(locs)} x `{lint}` (unused code, not blocking): {shown}"))
     if broken:
         r.findings.append(Finding("clippy", "does-not-compile", "info",
                                   "Clippy could not fully analyse: " + ", ".join(broken) +
@@ -455,13 +489,16 @@ def apply_accepted(results: list[ToolResult]) -> None:
     ran = {r.name for r in results}
     if stale and {"cargo-deny", "cargo-audit"} <= ran:
         results.append(ToolResult("accepted", "findings", findings=[
-            Finding("accepted", "stale-exception", "info",
+            Finding("accepted", "stale-exception", "warning",
                     f"{x} in security/accepted.json no longer matches (fixed or version changed) - remove it",
                     "security/accepted.json") for x in stale]))
 
 
 # ---- report -----------------------------------------------------------------
-GAP_RULES = {"does-not-compile", "not-tested", "tool-failed", "timeout"}
+def is_note(f: Finding) -> bool:
+    """Info that passes: reviewed upstream exceptions and unused code. Every
+    other info means something was not analysed, which blocks."""
+    return f.severity == "info" and (f.rule.startswith("accepted:") or f.rule == "unused-code")
 
 
 def coverage_gaps(results: list[ToolResult]) -> list[str]:
@@ -472,26 +509,28 @@ def coverage_gaps(results: list[ToolResult]) -> list[str]:
         if r.status == "skipped":
             gaps.append(f"{r.name}: skipped ({r.note})")
         for f in r.findings:
-            if f.rule in GAP_RULES and f.severity == "info":
-                gaps.append(f"{r.name}: {f.message.splitlines()[0]}")
+            if f.severity == "info" and not is_note(f):
+                gaps.append(f"{r.name}: {f.message.splitlines()[0] if f.message else f.rule}")
     return gaps
 
 
-def write_report(results: list[ToolResult], mode: str) -> tuple[int, str]:
+def write_report(results: list[ToolResult], mode: str) -> tuple[int, int, str]:
     allf = [f for r in results for f in r.findings]
     allf.sort(key=lambda f: (SEV_ORDER[f.severity], f.tool, f.path, f.line))
     crit = sum(f.severity == "critical" for f in allf)
     warn = sum(f.severity == "warning" for f in allf)
-    info = sum(f.severity == "info" for f in allf)
+    notes = sum(is_note(f) for f in allf)
 
     sha = run(["git", "rev-parse", "--short", "HEAD"])[1].strip()
     gaps = coverage_gaps(results)
-    verdict = "❌ BLOCKED" if crit else ("⚠️ PASSED - PARTIAL COVERAGE" if gaps else "✅ PASSED")
+    verdict = ("❌ BLOCKED" if crit or warn else
+               "❌ BLOCKED - PARTIAL COVERAGE" if gaps else "✅ PASSED")
     lines = [f"# CesaConn security report ({mode}) - `{sha}`", "",
-             f"**{verdict}** - {crit} critical, {warn} warnings, {info} notes", ""]
+             f"**{verdict}** - {crit} critical, {warn} warnings, {len(gaps)} coverage gaps, "
+             f"{notes} notes", ""]
     if gaps:
-        lines += ["> [!WARNING]",
-                  "> **Not everything was analysed.** A pass only covers what actually ran:",
+        lines += ["> [!CAUTION]",
+                  "> **Not everything was analysed, so this run fails:**",
                   *[f"> - {g}" for g in gaps], ""]
     lines += [
              "| Tool | Status | Critical | Warnings | Time |", "|---|---|---|---|---|"]
@@ -500,7 +539,8 @@ def write_report(results: list[ToolResult], mode: str) -> tuple[int, str]:
         w = sum(f.severity == "warning" for f in r.findings)
         st = r.status if r.status in ("skipped", "failed") else ("findings" if r.findings else "clean")
         lines.append(f"| {r.name} | {st}{(' - ' + r.note) if r.note else ''} | {c} | {w} | {r.seconds:.0f}s |")
-    for sev, title in (("critical", "🔴 Critical (blocking)"), ("warning", "🟡 Warnings"), ("info", "ℹ️ Notes")):
+    for sev, title in (("critical", "🔴 Critical (blocking)"), ("warning", "🟠 Warnings (blocking)"),
+                       ("info", "ℹ️ Notes and coverage gaps")):
         group = [f for f in allf if f.severity == sev]
         if not group:
             continue
@@ -542,7 +582,7 @@ def write_report(results: list[ToolResult], mode: str) -> tuple[int, str]:
                      "results": res})
     (OUT / "security.sarif").write_text(json.dumps(
         {"$schema": "https://json.schemastore.org/sarif-2.1.0.json", "version": "2.1.0", "runs": runs}, indent=1))
-    return crit, md
+    return crit, warn, md
 
 
 def main() -> int:
@@ -579,30 +619,26 @@ def main() -> int:
         results.append(res)
 
     apply_accepted(results)
-    crit, md = write_report(results, "fast" if a.fast else "full")
+    crit, warn, md = write_report(results, "fast" if a.fast else "full")
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
             fh.write(md)
     print()
-    for f in [f for r in results for f in r.findings if f.severity == "critical"]:
+    for f in [f for r in results for f in r.findings if f.severity in ("critical", "warning")]:
         loc = f"{f.path}:{f.line}" if f.line else f.path
-        print(f"  CRITICAL  {f.tool}/{f.rule}  {loc}\n            {f.message[:220]}")
+        print(f"  {f.severity.upper():8}  {f.tool}/{f.rule}  {loc}\n            {f.message[:220]}")
     gaps = coverage_gaps(results)
     for g in gaps:
         print(f"  NOT ANALYSED  {g}")
         if os.environ.get("GITHUB_ACTIONS"):
-            # shows up as a yellow annotation on the run and in the PR checks
+            # shows up as a red annotation on the run and in the PR checks
             msg = g.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-            print(f"::warning title=Security gate - partial coverage::{msg}")
-    strict = os.environ.get("CESA_REQUIRE_FULL_COVERAGE") == "1"
+            print(f"::error title=Security gate - not analysed::{msg}")
     print(f"\nReport: {OUT / 'report.md'}")
-    if crit:
-        print("RESULT: BLOCKED", f"({crit} critical)")
+    if crit or warn or gaps:
+        print("RESULT: BLOCKED", f"({crit} critical, {warn} warnings, {len(gaps)} coverage gaps)")
         return 1
-    if gaps:
-        print("RESULT: PASSED - PARTIAL COVERAGE", f"({len(gaps)} gaps{', strict mode -> failing' if strict else ''})")
-        return 1 if strict else 0
-    print("RESULT: PASSED (0 critical, full coverage)")
+    print("RESULT: PASSED (0 critical, 0 warnings, full coverage)")
     return 0
 
 

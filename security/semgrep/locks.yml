@@ -1,6 +1,6 @@
 # Lock / guard / race rules for CesaConn (tokio::sync::RwLock & friends).
 # severity ERROR   = critical -> fails CI / blocks push
-# severity WARNING = reported, does not block
+# severity WARNING = warning -> blocks too (every warning fails the gate)
 #
 # Background: tokio's RwLock is fair and write-preferring and is NOT
 # re-entrant. A task that holds a guard and asks for the same lock again

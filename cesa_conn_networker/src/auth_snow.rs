@@ -892,10 +892,10 @@ fn verify_peer_signature(
     handshake_hash: &Zeroizing<[u8; 32]>,
     context: &[u8],
 ) -> Result<(), AuthSnowErrors> {
-    if let Some(stored_key) = stored_key {
-        if stored_key.ct_eq(received_key).unwrap_u8() != 1 {
-            return Err(AuthSnowErrors::PeerKeyMismatch);
-        }
+    if let Some(stored_key) = stored_key
+        && stored_key.ct_eq(received_key).unwrap_u8() != 1
+    {
+        return Err(AuthSnowErrors::PeerKeyMismatch);
     }
 
     verify(
@@ -1478,18 +1478,18 @@ async fn handshake_server(
     device_keypairs: &DeviceKeypairs,
     trusted_peers: &TrustedPeers,
 ) -> Result<Option<Identified>, AuthSnowErrors> {
-    let mut stream = &mut incoming_connection.stream;
+    let stream = &mut incoming_connection.stream;
     // every message exchanged before Noise is appended here so the
     // derived PSK is bound to the whole pre-handshake conversation;
     // the signature exchange after Noise is appended too
     let mut transcript = Zeroizing::new(Vec::new());
 
     // 1. SPAKE2
-    let key1 = spake2_exchange_server(&mut stream, a_key, &mut transcript)
+    let key1 = spake2_exchange_server(stream, a_key, &mut transcript)
         .await
         .map_err(|_| AuthSnowErrors::FailedToExchangeSpake2)?;
 
-    if !spake2_confirm_mutual_auth_server(&mut stream, &key1, &mut transcript)
+    if !spake2_confirm_mutual_auth_server(stream, &key1, &mut transcript)
         .await
         .map_err(|_| AuthSnowErrors::FailedToConfirmMutualAuthSpake2)?
     {
@@ -1497,7 +1497,7 @@ async fn handshake_server(
     }
 
     // 2. hybrid KEX (classic + post-quantum)
-    let hybrid_kep = hybrid_kex_server(&mut stream, &mut transcript)
+    let hybrid_kep = hybrid_kex_server(stream, &mut transcript)
         .await
         .map_err(|_| AuthSnowErrors::KexFailed)?;
 
@@ -1533,15 +1533,15 @@ async fn handshake_client(
     device_keypairs: &DeviceKeypairs,
     trusted_peers: &TrustedPeers,
 ) -> Result<Option<Identified>, AuthSnowErrors> {
-    let mut stream = &mut outgoing_connection.stream;
+    let stream = &mut outgoing_connection.stream;
     let mut transcript = Zeroizing::new(Vec::new());
 
     // 1. SPAKE2
-    let key1 = spake2_exchange_client(&mut stream, a_key, &mut transcript)
+    let key1 = spake2_exchange_client(stream, a_key, &mut transcript)
         .await
         .map_err(|_| AuthSnowErrors::FailedToExchangeSpake2)?;
 
-    if !spake2_confirm_mutual_auth_client(&mut stream, &key1, &mut transcript)
+    if !spake2_confirm_mutual_auth_client(stream, &key1, &mut transcript)
         .await
         .map_err(|_| AuthSnowErrors::FailedToConfirmMutualAuthSpake2)?
     {
@@ -1549,7 +1549,7 @@ async fn handshake_client(
     }
 
     // 2. hybrid KEX (classic + post-quantum)
-    let hybrid_kep = hybrid_kex_client(&mut stream, &mut transcript)
+    let hybrid_kep = hybrid_kex_client(stream, &mut transcript)
         .await
         .map_err(|_| AuthSnowErrors::KexFailed)?;
 
@@ -1762,9 +1762,9 @@ mod tests {
         assert_eq!(client.peers.read().await.len(), 1);
 
         // the transport works in both directions
-        let mut msg = b"ping".to_vec();
+        let msg = b"ping".to_vec();
         client_conn
-            .write_timeout(&mut msg, Tags::Regular)
+            .write_timeout(&msg, Tags::Regular)
             .await
             .unwrap();
 
@@ -1775,9 +1775,9 @@ mod tests {
             .unwrap();
         assert_eq!(buf, b"ping");
 
-        let mut msg = b"pong".to_vec();
+        let msg = b"pong".to_vec();
         server_conn
-            .write_timeout(&mut msg, Tags::Regular)
+            .write_timeout(&msg, Tags::Regular)
             .await
             .unwrap();
 
@@ -1889,9 +1889,9 @@ mod tests {
         let (_s, c) = handshake(&server, &client, accept_all, accept_all).await;
         let (mut conn, _) = c.unwrap().unwrap();
 
-        let mut too_big = vec![0u8; SECURE_MSG_MAX_PAYLOAD + 1];
+        let too_big = vec![0u8; SECURE_MSG_MAX_PAYLOAD + 1];
         assert_eq!(
-            conn.write(&mut too_big, Tags::Regular).await.err(),
+            conn.write(&too_big, Tags::Regular).await.err(),
             Some(AuthSnowErrors::MessageTooLarge)
         );
 
@@ -1912,8 +1912,8 @@ mod tests {
         let (mut server_conn, _) = s.unwrap().unwrap();
         let (mut client_conn, _) = c.unwrap().unwrap();
 
-        let mut msg = b"x".to_vec();
-        client_conn.write(&mut msg, Tags::IsSavedTag).await.unwrap();
+        let msg = b"x".to_vec();
+        client_conn.write(&msg, Tags::IsSavedTag).await.unwrap();
 
         let mut buf = vec![0u8; 1 + 1];
         assert_eq!(

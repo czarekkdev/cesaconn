@@ -165,6 +165,12 @@ pub struct App {
     refresh_in_flight: bool,
 }
 
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl App {
     pub fn new() -> Self {
         let mut device_list_state = ListState::default();
@@ -457,10 +463,10 @@ fn handle_settings_enter(app: &mut App) {
             // turning it off: the daemon deletes d_key from the keychain
             app.outbox.push(Command::SetAutoLogin(false));
             app.push_log("[ INFO] Turning automatic login off");
-        } else if let Some(s) = app.active_settings_mut().get_mut(idx) {
-            if let SettingKind::Bool(ref mut v) = s.kind {
-                *v = !*v;
-            }
+        } else if let Some(s) = app.active_settings_mut().get_mut(idx)
+            && let SettingKind::Bool(ref mut v) = s.kind
+        {
+            *v = !*v;
         }
     } else if matches!(
         app.active_settings().get(idx).map(|s| &s.kind),
@@ -790,10 +796,10 @@ fn handle_security_warning_input(
                 SettingsSection::Basic => &mut app.settings_basic,
                 SettingsSection::Advanced => &mut app.settings_advanced,
             };
-            if let Some(s) = settings.get_mut(idx) {
-                if let SettingKind::Bool(ref mut v) = s.kind {
-                    *v = true;
-                }
+            if let Some(s) = settings.get_mut(idx)
+                && let SettingKind::Bool(ref mut v) = s.kind
+            {
+                *v = true;
             }
             app.active_popup = ActivePopup::None;
         }

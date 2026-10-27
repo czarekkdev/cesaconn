@@ -81,7 +81,7 @@ enum Counted {
     /// limiter full of active sources, failure not recorded
     NotTracked,
     /// failure recorded, no lockout yet
-    Counted,
+    Recorded,
     /// failure recorded and the source is now locked for this long
     LockedOut(Duration),
 }
@@ -109,7 +109,7 @@ fn count_failure(entries: &mut HashMap<Source, Entry>, source: Source, now: Inst
     entry.last_failure = now;
 
     if entry.failures < MAX_FAILURES {
-        return Counted::Counted;
+        return Counted::Recorded;
     }
 
     entry.failures = 0;
@@ -166,7 +166,7 @@ impl GuessLimiter {
             Counted::LockedOut(duration) => {
                 warn!(%ip, lockout_secs = duration.as_secs(), "too many wrong passwords, locked out");
             }
-            Counted::Counted => {}
+            Counted::Recorded => {}
         }
     }
 

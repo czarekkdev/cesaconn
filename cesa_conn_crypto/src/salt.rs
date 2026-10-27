@@ -31,7 +31,7 @@ pub fn generate_salt() -> Result<[u8; 32], SaltError> {
 
     // SysRng uses OS cryptographic random source
     // Most secure RNG available in software
-    let mut rng = SysRng::default();
+    let mut rng = SysRng;
 
     rng.try_fill_bytes(&mut salt).map_err(|e| {
         error!(error = %e, "OS failed to provide random bytes for salt generation");

@@ -1,6 +1,6 @@
 # Network / protocol rules for CesaConn (TCP, UDP, IPC, handshake code).
 # severity ERROR   = critical -> fails CI / blocks push
-# severity WARNING = reported, does not block
+# severity WARNING = warning -> blocks too (every warning fails the gate)
 #
 # Threat model: everything read from a socket is attacker-controlled - even
 # after authentication (a paired device can be compromised, and a bug before
