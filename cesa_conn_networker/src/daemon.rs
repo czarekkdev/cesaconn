@@ -23,7 +23,9 @@ data-protection keychain (WhenUnlockedThisDeviceOnly) together with release sign
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{RwLock, Semaphore};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use zeroize::Zeroizing;
@@ -82,29 +84,46 @@ struct KeySlots {
     auto_login: bool,
     /// Wrong unlock passwords since the last success (see [`unlock_delay`]).
     unlock_failures: u32,
+    /// No unlock attempt is accepted before this moment.
+    unlock_not_before: Option<Instant>,
 }
 
 /* unlock guessing */
-/// Wrong unlock passwords allowed before every attempt is delayed.
+/// Unlock attempts that run back to back; after this many wrong passwords
+/// every further attempt has to wait.
 const FREE_UNLOCK_ATTEMPTS: u32 = 5;
-/// Longest delay before an unlock attempt (seconds).
+/// Longest time unlocks are refused after a wrong password (seconds).
 const MAX_UNLOCK_DELAY: u64 = 60;
 
-/// Delay before the next unlock attempt after `failures` wrong passwords:
-/// none for the first [`FREE_UNLOCK_ATTEMPTS`], then 1 s doubling up to
-/// [`MAX_UNLOCK_DELAY`]. On top of Argon2's own cost, this slows a local
-/// process guessing through the IPC.
-fn unlock_delay(failures: u32) -> std::time::Duration {
+/// How long after the `failures`-th wrong password the next unlock attempt
+/// is refused: not at all below [`FREE_UNLOCK_ATTEMPTS`] (those attempts run
+/// back to back), then 1 s doubling up to [`MAX_UNLOCK_DELAY`]. On top of
+/// Argon2's own cost, this slows a local process guessing through the IPC.
+///
+/// Attempts inside the delay are refused at once ([`DaemonError::UnlockDelayed`])
+/// instead of waiting: a wait would outlast the IPC deadline, and the UI
+/// would get a timeout even for the right password.
+fn unlock_delay(failures: u32) -> Duration {
     let over = failures.saturating_sub(FREE_UNLOCK_ATTEMPTS);
     if failures < FREE_UNLOCK_ATTEMPTS {
-        return std::time::Duration::ZERO;
+        return Duration::ZERO;
     }
 
     let secs = 1u64
         .checked_shl(over)
         .unwrap_or(u64::MAX)
         .min(MAX_UNLOCK_DELAY);
-    std::time::Duration::from_secs(secs)
+    Duration::from_secs(secs)
+}
+
+/// Whole seconds left until `not_before` (rounded up, so 0 really means now).
+fn wait_secs(not_before: Option<Instant>, now: Instant) -> u16 {
+    let left = not_before.map_or(Duration::ZERO, |t| t.saturating_duration_since(now));
+    let secs = left
+        .as_secs()
+        .saturating_add(u64::from(left.subsec_nanos() > 0));
+
+    u16::try_from(secs).unwrap_or(u16::MAX)
 }
 
 /// Everything the daemon owns. Shared between IPC handlers.
@@ -286,6 +305,7 @@ impl Daemon {
                 locked: keys.locked,
                 saved: keys.vault.is_some(),
                 auto_login: keys.auto_login,
+                unlock_wait_secs: wait_secs(keys.unlock_not_before, Instant::now()),
             }
         };
         let trusted_peers = self.trusted_peers.read().await.len();
@@ -599,6 +619,12 @@ impl Daemon {
                     DaemonError::NotSaved
                 });
             }
+
+            // too soon after wrong passwords: refused at once, before any
+            // keychain access or Argon2, and not counted as another guess
+            if wait_secs(keys.unlock_not_before, Instant::now()) > 0 {
+                return Err(DaemonError::UnlockDelayed);
+            }
         }
 
         let store = storage.store.clone();
@@ -614,10 +640,6 @@ impl Daemon {
             }
         };
 
-        // guessing is slowed down, the change slot stays taken while waiting
-        let failures = self.keys.read().await.unlock_failures;
-        tokio::time::sleep(unlock_delay(failures)).await;
-
         let d_key = self.derive(update, salts.d_salt.clone()).await?;
 
         let result = self.unlock_with(DataKey::new(d_key)).await;
@@ -625,10 +647,22 @@ impl Daemon {
         {
             let mut keys = self.keys.write().await;
             match result {
-                Ok(()) => keys.unlock_failures = 0,
+                Ok(()) => {
+                    keys.unlock_failures = 0;
+                    keys.unlock_not_before = None;
+                }
                 Err(DaemonError::WrongPassword) => {
                     keys.unlock_failures = keys.unlock_failures.saturating_add(1);
-                    warn!(failures = keys.unlock_failures, "wrong data password");
+                    let delay = unlock_delay(keys.unlock_failures);
+                    // can't overflow: the delay is at most MAX_UNLOCK_DELAY and an
+                    // Instant a minute from now always fits
+                    let now = Instant::now();
+                    keys.unlock_not_before = Some(now.checked_add(delay).unwrap_or(now));
+                    warn!(
+                        failures = keys.unlock_failures,
+                        delay_secs = delay.as_secs(),
+                        "wrong data password"
+                    );
                 }
                 Err(_) => {}
             }
@@ -921,6 +955,7 @@ mod tests {
                     0x06 => DaemonError::StorageFailed,
                     0x07 => DaemonError::NotSaved,
                     0x08 => DaemonError::WeakPassword,
+                    0x09 => DaemonError::UnlockDelayed,
                     _ => DaemonError::Internal,
                 }),
                 _ => panic!("unexpected response"),
@@ -1294,6 +1329,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(daemon.keys.read().await.unlock_failures, 0);
+    }
+
+    /// Test that inside the delay an unlock is refused at once, even with the
+    /// right password: no Argon2, not counted as another guess, still locked;
+    /// the status says how long to wait, and after it the password works
+    #[tokio::test]
+    async fn test_unlock_inside_delay_refused_at_once() {
+        let storage = TestStorage::new("delayed");
+        let daemon = storage.daemon().await;
+        setup(&daemon).await;
+        drop(daemon);
+
+        let daemon = storage.daemon().await;
+        // one wrong password away from the first delay (1 s)
+        daemon.keys.write().await.unlock_failures = FREE_UNLOCK_ATTEMPTS - 1;
+        assert_eq!(
+            ask(&daemon, Request::Unlock(update(b"wrong password!"))).await,
+            Err(DaemonError::WrongPassword)
+        );
+        assert_eq!(daemon.status().await.unlock_wait_secs, 1);
+
+        // the Argon2 slot is taken: an unlock that tried to derive would hang
+        let busy = daemon.derive_slot.clone().acquire_owned().await.unwrap();
+        let answer = tokio::time::timeout(
+            Duration::from_millis(500),
+            ask(&daemon, Request::Unlock(update(DATA_PW))),
+        )
+        .await;
+        assert_eq!(answer, Ok(Err(DaemonError::UnlockDelayed)));
+        drop(busy);
+
+        assert!(daemon.status().await.locked);
+        assert_eq!(
+            daemon.keys.read().await.unlock_failures,
+            FREE_UNLOCK_ATTEMPTS
+        );
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(daemon.status().await.unlock_wait_secs, 0);
+        ask(&daemon, Request::Unlock(update(DATA_PW)))
+            .await
+            .unwrap();
+
+        let status = daemon.status().await;
+        assert!(!status.locked && status.unlock_wait_secs == 0);
+        assert_eq!(daemon.keys.read().await.unlock_failures, 0);
+    }
+
+    /// Test that the longest delay (longer than the IPC deadline) is still
+    /// answered well within the deadline, over a real socket
+    #[tokio::test]
+    async fn test_long_delay_answered_within_ipc_deadline() {
+        let storage = TestStorage::new("longdelay");
+        let daemon = storage.daemon().await;
+        setup(&daemon).await;
+        drop(daemon);
+
+        let daemon = storage.daemon().await;
+        // the next wrong password starts the longest delay
+        daemon.keys.write().await.unlock_failures = FREE_UNLOCK_ATTEMPTS + 9;
+        assert_eq!(
+            ask(&daemon, Request::Unlock(update(b"wrong password!"))).await,
+            Err(DaemonError::WrongPassword)
+        );
+        let wait = daemon.status().await.unlock_wait_secs;
+        assert_eq!(u64::from(wait), MAX_UNLOCK_DELAY);
+        assert!(Duration::from_secs(u64::from(wait)) > ipc_server::REQUEST_DEADLINE);
+
+        let base = std::env::temp_dir().join(format!("cesa-daemon-ld-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let path = prepare_socket_dir(&base).unwrap();
+        let state = daemon.clone();
+        let token = CancellationToken::new();
+        let handler = move |request: Request| {
+            let daemon = state.clone();
+            async move { daemon.handle(request).await }
+        };
+        tokio::spawn(ipc_server::serve(
+            ipc_server::bind(&path).unwrap(),
+            ClientPolicy::new(None).unwrap(),
+            handler,
+            token.clone(),
+        ));
+
+        let answer = tokio::time::timeout(
+            Duration::from_secs(2),
+            request_at(&path, &Request::Unlock(update(DATA_PW))),
+        )
+        .await;
+        assert_eq!(
+            answer,
+            Ok(Err(IpcErrors::Daemon(DaemonError::UnlockDelayed)))
+        );
+
+        token.cancel();
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Test that the minimum counts characters, not bytes (12 bytes of

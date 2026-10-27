@@ -13,7 +13,7 @@
 //!   a daemon of the same user, and on macOS only to one whose signature
 //!   satisfies [`DAEMON_CODE_REQUIREMENT`].
 //!
-//! Wire format (version 2), one request and one response per connection:
+//! Wire format (version 3), one request and one response per connection:
 //! `frame = length (u32 LE, 1..=MAX_FRAME_LEN) || body`
 //!
 //! Request body: `kind (1) || payload`
@@ -30,9 +30,12 @@
 //!   deriving a key from the wrong bytes.
 //!
 //! Response body: `0x00 || payload` on success, `0x01 || error code (1)` on error
-//! * Status: `flags (1) || trusted peers (u32 LE)`; flags bit 0 = auth key set,
-//!   bit 1 = data key set, bit 2 = network running, bit 3 = vault locked,
-//!   bit 4 = keys saved (encrypted vault), bit 5 = automatic login on
+//! * Status: `flags (1) || trusted peers (u32 LE) || unlock wait (u16 LE)`;
+//!   flags bit 0 = auth key set, bit 1 = data key set, bit 2 = network running,
+//!   bit 3 = vault locked, bit 4 = keys saved (encrypted vault), bit 5 =
+//!   automatic login on; unlock wait = seconds until `Unlock` is accepted again
+//!   after too many wrong data passwords (0 = now). Version 2 had no unlock
+//!   wait, so a mismatched UI and daemon fail with `Malformed`.
 //! * SetAuthPassword / SetDataPassword / Unlock / SetAutoLogin: empty
 //! * ListPeers: `count (u16 LE) || count * (fingerprint (8) || name len (1) || name)`
 
@@ -178,6 +181,9 @@ pub enum DaemonError {
     NotSaved = 0x07,
     /// A new password is shorter than [`MIN_NEW_PASSWORD_LEN`].
     WeakPassword = 0x08,
+    /// Unlock: too many wrong data passwords, try again later (refused before
+    /// any key derivation; `Status` says how long to wait).
+    UnlockDelayed = 0x09,
 }
 
 impl DaemonError {
@@ -191,6 +197,7 @@ impl DaemonError {
             0x06 => Some(Self::StorageFailed),
             0x07 => Some(Self::NotSaved),
             0x08 => Some(Self::WeakPassword),
+            0x09 => Some(Self::UnlockDelayed),
             _ => None,
         }
     }
@@ -210,6 +217,9 @@ impl fmt::Display for DaemonError {
                 f,
                 "password too short (at least {MIN_NEW_PASSWORD_LEN} characters)"
             ),
+            DaemonError::UnlockDelayed => {
+                write!(f, "too many wrong data passwords, try again later")
+            }
         }
     }
 }
@@ -250,6 +260,8 @@ pub struct Status {
     pub saved: bool,
     /// `d_key` is kept in the OS keychain (automatic login).
     pub auto_login: bool,
+    /// Seconds until `Unlock` is accepted again (0 = now).
+    pub unlock_wait_secs: u16,
 }
 
 /// A paired device as shown to the user (public data only).
@@ -346,6 +358,7 @@ impl Response {
 
                 body.push(flags);
                 body.extend_from_slice(&s.trusted_peers.to_le_bytes());
+                body.extend_from_slice(&s.unlock_wait_secs.to_le_bytes());
             }
             Response::Done => {}
             Response::Peers(peers) => {
@@ -397,8 +410,12 @@ impl Response {
 
         match request {
             Request::Status => {
-                let (flags, peers) = match payload {
-                    [flags, a, b, c, d] => (*flags, u32::from_le_bytes([*a, *b, *c, *d])),
+                let (flags, peers, unlock_wait_secs) = match payload {
+                    [flags, a, b, c, d, w0, w1] => (
+                        *flags,
+                        u32::from_le_bytes([*a, *b, *c, *d]),
+                        u16::from_le_bytes([*w0, *w1]),
+                    ),
                     _ => return Err(IpcErrors::Malformed),
                 };
 
@@ -414,6 +431,7 @@ impl Response {
                     saved: flags & 0b1_0000 != 0,
                     auto_login: flags & 0b10_0000 != 0,
                     trusted_peers: peers,
+                    unlock_wait_secs,
                 }))
             }
             Request::SetAuthPassword(_)
@@ -706,6 +724,7 @@ mod tests {
             DaemonError::StorageFailed,
             DaemonError::NotSaved,
             DaemonError::WeakPassword,
+            DaemonError::UnlockDelayed,
         ] {
             assert_eq!(
                 Response::decode(&Request::Status, &Response::encode_error(e)),
@@ -715,7 +734,13 @@ mod tests {
 
         // bit 6 is not defined
         assert_eq!(
-            Response::decode(&Request::Status, &[RESP_OK, 0b100_0000, 0, 0, 0, 0]),
+            Response::decode(&Request::Status, &[RESP_OK, 0b100_0000, 0, 0, 0, 0, 0, 0]),
+            Err(IpcErrors::Malformed)
+        );
+
+        // a version 2 status (no unlock wait) is refused, not misread
+        assert_eq!(
+            Response::decode(&Request::Status, &[RESP_OK, 0, 0, 0, 0, 0]),
             Err(IpcErrors::Malformed)
         );
     }
@@ -731,6 +756,7 @@ mod tests {
             locked: false,
             saved: true,
             auto_login: true,
+            unlock_wait_secs: 0x1234,
         });
         assert_eq!(
             Response::decode(&Request::Status, &status.encode()),
