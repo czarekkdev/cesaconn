@@ -97,8 +97,8 @@ const MAX_UNLOCK_DELAY: u64 = 60;
 
 /// How long after the `failures`-th wrong password the next unlock attempt
 /// is refused: not at all below [`FREE_UNLOCK_ATTEMPTS`] (those attempts run
-/// back to back), then 1 s doubling up to [`MAX_UNLOCK_DELAY`]. On top of Argon2's own cost, this
-/// slows a local process guessing through the IPC.
+/// back to back), then 1 s doubling up to [`MAX_UNLOCK_DELAY`]. On top of
+/// Argon2's own cost, this slows a local process guessing through the IPC.
 ///
 /// Attempts inside the delay are refused at once ([`DaemonError::UnlockDelayed`])
 /// instead of waiting: a wait would outlast the IPC deadline, and the UI
