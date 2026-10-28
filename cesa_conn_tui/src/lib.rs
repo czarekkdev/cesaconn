@@ -11,8 +11,9 @@
 mod daemon_link;
 
 use cesa_conn_system::ipc::{
-    DaemonError, IpcErrors, MIN_NEW_PASSWORD_LEN, PasswordUpdate, PeerInfo, Status,
+    DaemonError, IpcErrors, MIN_NEW_PASSWORD_LEN, PairingPrompt, PasswordUpdate, PeerInfo, Status,
 };
+use cesa_conn_system::pairing_code;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
@@ -33,6 +34,7 @@ use daemon_link::{Command, DaemonLink, KeyKind, LinkEvent};
 const AUTH_KEY_LABEL: &str = "Auth key";
 const DATA_KEY_LABEL: &str = "Data key";
 const AUTO_LOGIN_LABEL: &str = "Automatic login";
+const SYNC_LABEL: &str = "Sync";
 
 /// How often the daemon's status is asked for (seconds).
 const REFRESH_INTERVAL: u64 = 2;
@@ -121,7 +123,8 @@ enum SettingsSection {
 #[derive(Debug, Clone, PartialEq)]
 enum ActivePopup {
     None,
-    AddDevice,
+    /// A new device wants to pair: compare the code, then y / n.
+    Pairing(PairingPrompt),
     EditSetting,
     SecurityWarning {
         section: SettingsSection,
@@ -203,6 +206,12 @@ impl App {
                          anyone who can unlock your session can use it.\n\
                          We can't vouch for that.",
                     ),
+                },
+                Setting {
+                    label: SYNC_LABEL,
+                    kind: SettingKind::Bool(false),
+                    value: String::new(),
+                    warn_message: None,
                 },
                 Setting {
                     label: "Auto-connect",
@@ -368,8 +377,8 @@ fn handle_input(app: &mut App) -> io::Result<()> {
 
     let popup = app.active_popup.clone();
     match popup {
-        ActivePopup::AddDevice => {
-            handle_add_device_input(app, key.code);
+        ActivePopup::Pairing(prompt) => {
+            handle_pairing_input(app, key.code, &prompt);
             return Ok(());
         }
         ActivePopup::EditSetting => {
@@ -398,7 +407,7 @@ fn handle_input(app: &mut App) -> io::Result<()> {
         Tab::Devices => match key.code {
             KeyCode::Up | KeyCode::Char('k') => app.prev_device(),
             KeyCode::Down | KeyCode::Char('j') => app.next_device(),
-            KeyCode::Char('n') => app.active_popup = ActivePopup::AddDevice,
+            KeyCode::Char('n') => start_add_device(app),
             KeyCode::Char('d') => {
                 let selected = app.device_list_state.selected();
                 let addr_str = selected
@@ -463,6 +472,14 @@ fn handle_settings_enter(app: &mut App) {
             // turning it off: the daemon deletes d_key from the keychain
             app.outbox.push(Command::SetAutoLogin(false));
             app.push_log("[ INFO] Turning automatic login off");
+        } else if is_sync(app, section, idx) {
+            // the daemon decides and saves it; the switch follows its status
+            app.outbox.push(Command::SetSync(!currently_on));
+            app.push_log(if currently_on {
+                "[ INFO] Turning sync off"
+            } else {
+                "[ INFO] Turning sync on"
+            });
         } else if let Some(s) = app.active_settings_mut().get_mut(idx)
             && let SettingKind::Bool(ref mut v) = s.kind
         {
@@ -518,33 +535,48 @@ fn handle_confirm_change_input(app: &mut App, code: KeyCode) {
     }
 }
 
-fn handle_add_device_input(app: &mut App, code: KeyCode) {
-    match code {
-        KeyCode::Esc => {
-            app.active_popup = ActivePopup::None;
-            clear_input(app);
+/// Asks the daemon to open its "Add device" window, if networking runs.
+fn start_add_device(app: &mut App) {
+    match &app.daemon {
+        DaemonState::Up(status) if status.network_running => {
+            app.outbox.push(Command::AddDevice);
+            app.push_log(
+                "[ INFO] Searching for devices: press n on the other device now too, then compare the code",
+            );
         }
-        KeyCode::Enter => {
-            let addr_str = app.input_buf.trim().to_string();
-            if !addr_str.is_empty() {
-                if addr_str.parse::<std::net::SocketAddr>().is_ok() {
-                    app.devices.push(Device {
-                        addr: addr_str,
-                        status: DeviceStatus::Connecting,
-                    });
-                } else {
-                    app.push_log(format!("[ WARN] Invalid address: {}", addr_str));
-                }
-            }
-            app.active_popup = ActivePopup::None;
-            clear_input(app);
-        }
-        KeyCode::Backspace => {
-            app.input_buf.pop();
-        }
-        KeyCode::Char(c) => push_input(app, c),
-        _ => {}
+        _ => app.push_log("[ WARN] Turn Sync on first (Settings > Sync)"),
     }
+}
+
+/// y: the codes match, pair; n / Esc: reject. Anything else waits.
+fn handle_pairing_input(app: &mut App, code: KeyCode, prompt: &PairingPrompt) {
+    let accept = match code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => true,
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => false,
+        _ => return,
+    };
+
+    // the code goes along: the daemon only takes the answer for exactly
+    // the pairing the user looked at
+    app.outbox.push(Command::AnswerPairing {
+        id: prompt.id,
+        code: prompt.code,
+        accept,
+    });
+    app.active_popup = ActivePopup::None;
+}
+
+/// The pairing code as `emoji name` cells (the name is always shown: an
+/// emoji can look different, or like a box, in another terminal).
+fn pairing_code_cells(prompt: &PairingPrompt) -> Vec<String> {
+    prompt
+        .code
+        .iter()
+        .map(|&index| match pairing_code::symbol(index) {
+            Some((emoji, name)) => format!("{emoji} {name}"),
+            None => "?".to_owned(),
+        })
+        .collect()
 }
 
 fn handle_edit_setting_input(app: &mut App, code: KeyCode) {
@@ -666,7 +698,7 @@ fn send_password_from_input(app: &mut App) {
 /// Applies what the daemon link reported.
 fn handle_link_event(app: &mut App, event: LinkEvent) {
     match event {
-        LinkEvent::Refreshed(Ok((status, peers))) => {
+        LinkEvent::Refreshed(Ok((status, peers, pairing))) => {
             app.refresh_in_flight = false;
 
             if !matches!(app.daemon, DaemonState::Up(_)) {
@@ -691,8 +723,12 @@ fn handle_link_event(app: &mut App, event: LinkEvent) {
             if let Some(s) = app.setting_mut(AUTO_LOGIN_LABEL) {
                 s.kind = SettingKind::Bool(status.auto_login);
             }
+            if let Some(s) = app.setting_mut(SYNC_LABEL) {
+                s.kind = SettingKind::Bool(status.sync_enabled);
+            }
             app.peers = peers;
             app.daemon = DaemonState::Up(status);
+            show_pairing(app, pairing);
         }
         LinkEvent::Refreshed(Err(e)) => {
             app.refresh_in_flight = false;
@@ -706,6 +742,7 @@ fn handle_link_event(app: &mut App, event: LinkEvent) {
             set_key_flags(app, false, false);
             app.peers.clear();
             app.daemon = DaemonState::Down(e);
+            show_pairing(app, None);
         }
         LinkEvent::PasswordSet { kind, result } => {
             let name = match kind {
@@ -747,6 +784,37 @@ fn handle_link_event(app: &mut App, event: LinkEvent) {
             }
             app.request_refresh();
         }
+        LinkEvent::SyncSet { on, result } => {
+            match (on, result) {
+                (true, Ok(())) => app.push_log(
+                    "[ INFO] Sync on: listening for paired devices (n on Devices adds one)",
+                ),
+                (false, Ok(())) => app.push_log("[ INFO] Sync off: networking stopped"),
+                (_, Err(IpcErrors::Daemon(DaemonError::NotSaved))) => {
+                    app.push_log("[ WARN] Sync needs saved keys: set both passwords first")
+                }
+                (_, Err(e)) => app.push_log(format!("[ERROR] Changing sync failed: {e}")),
+            }
+            app.request_refresh();
+        }
+        LinkEvent::AddDeviceStarted(result) => {
+            if let Err(e) = result {
+                app.push_log(format!("[ERROR] Add device failed: {e}"));
+            }
+            app.request_refresh();
+        }
+        LinkEvent::PairingAnswered { accept, result } => {
+            match (accept, result) {
+                (true, Ok(())) => app
+                    .push_log("[ INFO] Pairing accepted: paired once the other device accepts too"),
+                (false, Ok(())) => app.push_log("[ INFO] Pairing rejected"),
+                (_, Err(IpcErrors::Daemon(DaemonError::PairingExpired))) => {
+                    app.push_log("[ WARN] Too late: that pairing request expired")
+                }
+                (_, Err(e)) => app.push_log(format!("[ERROR] Answering the pairing failed: {e}")),
+            }
+            app.request_refresh();
+        }
         LinkEvent::WorkerStopped => {
             if app.daemon != DaemonState::NoLink {
                 app.push_log("[ERROR] The daemon link stopped, restart the UI");
@@ -755,7 +823,31 @@ fn handle_link_event(app: &mut App, event: LinkEvent) {
             set_key_flags(app, false, false);
             app.peers.clear();
             app.daemon = DaemonState::NoLink;
+            show_pairing(app, None);
         }
+    }
+}
+
+/// Shows the pairing the daemon reports. Never on top of another popup (a
+/// half-typed password stays untouched): it waits for the next refresh. A
+/// shown prompt that the daemon no longer has expired and is closed.
+fn show_pairing(app: &mut App, pairing: Option<PairingPrompt>) {
+    match (&app.active_popup, pairing) {
+        // the whole prompt, not just the id: ids start again after a
+        // daemon restart, and the user must see the code they answer
+        (ActivePopup::Pairing(shown), Some(prompt)) if *shown == prompt => {}
+        (ActivePopup::Pairing(_) | ActivePopup::None, Some(prompt)) => {
+            app.push_log(format!(
+                "[ INFO] {} wants to pair: compare the code with the other device",
+                prompt.name
+            ));
+            app.active_popup = ActivePopup::Pairing(prompt);
+        }
+        (ActivePopup::Pairing(_), None) => {
+            app.push_log("[ WARN] The pairing request expired");
+            app.active_popup = ActivePopup::None;
+        }
+        _ => {}
     }
 }
 
@@ -765,6 +857,15 @@ fn set_key_flags(app: &mut App, auth: bool, data: bool) {
             s.kind = SettingKind::Secret { configured };
         }
     }
+}
+
+/// Whether `idx` in `section` is the Sync switch.
+fn is_sync(app: &App, section: SettingsSection, idx: usize) -> bool {
+    let settings = match section {
+        SettingsSection::Basic => &app.settings_basic,
+        SettingsSection::Advanced => &app.settings_advanced,
+    };
+    matches!(settings.get(idx).map(|s| s.label), Some(SYNC_LABEL))
 }
 
 /// Whether `idx` in `section` is the automatic-login switch.
@@ -827,7 +928,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
     render_statusbar(frame, statusbar, app);
 
     match app.active_popup.clone() {
-        ActivePopup::AddDevice => render_add_popup(frame, area, app),
+        ActivePopup::Pairing(prompt) => render_pairing_popup(frame, area, &prompt),
         ActivePopup::EditSetting => render_edit_setting_popup(frame, area, app),
         ActivePopup::SecurityWarning { section, idx } => {
             render_security_warning_popup(frame, area, section, idx, app)
@@ -1080,7 +1181,7 @@ fn render_logs(frame: &mut Frame, area: Rect, app: &mut App) {
 
 fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
     let help = match app.active_tab {
-        Tab::Devices => " q:Quit  Tab:Switch  ↑↓:Navigate  n:Add  d:Disconnect ",
+        Tab::Devices => " q:Quit  Tab:Switch  ↑↓:Navigate  n:Add device  d:Disconnect ",
         Tab::Settings => " q:Quit  Tab:Switch  ←→:Section  ↑↓:Navigate  Enter:Edit ",
         Tab::Logs => " q:Quit  Tab:Switch  ↑↓:Scroll  f:Follow ",
     };
@@ -1113,7 +1214,13 @@ fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
                 } else {
                     "(memory only)"
                 },
-                if s.network_running { "on" } else { "off" },
+                match (s.network_running, s.adding_device, s.sync_enabled) {
+                    (true, true, _) => "on, adding a device",
+                    (true, false, _) => "on",
+                    // switched on, but the listener couldn't start (see the daemon log)
+                    (false, _, true) => "failed",
+                    (false, _, false) => "off",
+                },
                 s.trusted_peers
             ),
             Color::Green,
@@ -1142,30 +1249,79 @@ fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn render_add_popup(frame: &mut Frame, area: Rect, app: &App) {
-    let w = 52u16.min(area.width);
-    let h = 5u16.min(area.height);
+fn render_pairing_popup(frame: &mut Frame, area: Rect, prompt: &PairingPrompt) {
+    let w = 68u16.min(area.width);
+    let h = 13u16.min(area.height);
     let popup = centered_rect(area, w, h);
+
+    let cells = pairing_code_cells(prompt);
+    let code_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    // two rows of four, each cell padded so the columns line up
+    let code_line = |row: &[String]| {
+        Line::from(Span::styled(
+            format!(
+                "  {}",
+                row.iter()
+                    .map(|cell| format!("{cell:<14}"))
+                    .collect::<String>()
+            ),
+            code_style,
+        ))
+    };
+    let (first, second) = cells.split_at(cells.len().min(4));
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(prompt.name.as_str(), Style::default().fg(Color::Yellow)),
+            Span::raw(" wants to pair with this device."),
+        ]),
+        Line::from("  Check that the other device shows exactly this code:"),
+        Line::from(""),
+        code_line(first),
+        code_line(second),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Different code, or you didn't start this? Reject it.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(vec![
+            Span::styled(
+                "  y",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                ": they match, pair   ",
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                "n/Esc",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(": reject", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(Span::styled(
+            "  No answer within 60 s rejects.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
 
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(format!(" {}", app.input_buf.as_str())).block(
+        Paragraph::new(lines).block(
             Block::bordered()
-                .title(" Add Device — IP:port ")
+                .title(" Pair new device? ")
                 .title_alignment(Alignment::Center)
                 .border_type(BorderType::Double)
                 .style(Style::default().fg(Color::Cyan)),
         ),
         popup,
     );
-
-    frame.set_cursor_position((
-        popup
-            .x
-            .saturating_add(2)
-            .saturating_add(to_u16(app.input_buf.chars().count())),
-        popup.y.saturating_add(1),
-    ));
 }
 
 fn render_edit_setting_popup(frame: &mut Frame, area: Rect, app: &App) {
@@ -1588,6 +1744,7 @@ mod tests {
                 fingerprint: [0xab; 8],
                 name: "laptop".into(),
             }],
+            None,
         )))
     }
 
@@ -1659,6 +1816,7 @@ mod tests {
                 ..Status::default()
             },
             Vec::new(),
+            None,
         )))
     }
 
@@ -1777,6 +1935,7 @@ mod tests {
                     ..Status::default()
                 },
                 Vec::new(),
+                None,
             ))),
         );
         app.outbox.clear();
@@ -1930,6 +2089,172 @@ mod tests {
         handle_link_event(&mut app, up(false, false));
         app.request_refresh();
         assert_eq!(app.outbox.len(), 2);
+    }
+
+    /// A refresh where networking runs and `pairing` waits for the user.
+    fn up_network(sync: bool, pairing: Option<PairingPrompt>) -> LinkEvent {
+        LinkEvent::Refreshed(Ok((
+            Status {
+                auth_key_set: true,
+                data_key_set: true,
+                saved: true,
+                network_running: sync,
+                sync_enabled: sync,
+                pending_pairings: u8::from(pairing.is_some()),
+                ..Status::default()
+            },
+            Vec::new(),
+            pairing,
+        )))
+    }
+
+    fn prompt(id: u32) -> PairingPrompt {
+        PairingPrompt {
+            id,
+            name: "192.168.1.7:50123".into(),
+            code: [0, 9, 18, 27, 36, 45, 54, 63],
+        }
+    }
+
+    /// Test that the Sync switch follows the daemon and Enter asks the
+    /// daemon to flip it (nothing changes locally)
+    #[test]
+    fn test_sync_switch_goes_through_daemon() {
+        let mut app = App::new();
+        handle_link_event(&mut app, up_network(true, None));
+        assert_eq!(
+            app.setting_mut(SYNC_LABEL).unwrap().kind,
+            SettingKind::Bool(true)
+        );
+
+        app.outbox.clear();
+        select(&mut app, SettingsSection::Basic, SYNC_LABEL);
+        handle_settings_enter(&mut app);
+        assert!(matches!(app.outbox.as_slice(), [Command::SetSync(false)]));
+        // still on until the daemon says otherwise
+        assert_eq!(
+            app.setting_mut(SYNC_LABEL).unwrap().kind,
+            SettingKind::Bool(true)
+        );
+
+        handle_link_event(&mut app, up_network(false, None));
+        app.outbox.clear();
+        handle_settings_enter(&mut app);
+        assert!(matches!(app.outbox.as_slice(), [Command::SetSync(true)]));
+    }
+
+    /// Test that "Add device" goes to the daemon only while networking runs
+    #[test]
+    fn test_add_device_needs_networking() {
+        let mut app = App::new();
+        handle_link_event(&mut app, up_network(false, None));
+        app.outbox.clear();
+
+        start_add_device(&mut app);
+        assert!(app.outbox.is_empty());
+        assert!(app.logs.iter().any(|l| l.contains("Turn Sync on")));
+
+        handle_link_event(&mut app, up_network(true, None));
+        app.outbox.clear();
+        start_add_device(&mut app);
+        assert!(matches!(app.outbox.as_slice(), [Command::AddDevice]));
+    }
+
+    /// Test that a waiting pairing opens the prompt with every symbol's
+    /// name, y / n answer exactly that pairing, and other keys do nothing
+    #[test]
+    fn test_pairing_prompt_answered() {
+        let mut app = App::new();
+        handle_link_event(&mut app, up_network(true, Some(prompt(4))));
+        assert_eq!(app.active_popup, ActivePopup::Pairing(prompt(4)));
+
+        let cells = pairing_code_cells(&prompt(4));
+        assert_eq!(cells.len(), 8);
+        assert_eq!(cells[0], "🐶 dog");
+        assert_eq!(cells[7], "👑 crown");
+
+        app.outbox.clear();
+        handle_pairing_input(&mut app, KeyCode::Char('x'), &prompt(4));
+        assert!(app.outbox.is_empty());
+        assert_eq!(app.active_popup, ActivePopup::Pairing(prompt(4)));
+
+        handle_pairing_input(&mut app, KeyCode::Char('y'), &prompt(4));
+        assert!(matches!(
+            app.outbox.as_slice(),
+            [Command::AnswerPairing {
+                id: 4,
+                code: [0, 9, 18, 27, 36, 45, 54, 63],
+                accept: true
+            }]
+        ));
+        assert_eq!(app.active_popup, ActivePopup::None);
+
+        // the next one, rejected with Esc
+        handle_link_event(&mut app, up_network(true, Some(prompt(5))));
+        app.outbox.clear();
+        handle_pairing_input(&mut app, KeyCode::Esc, &prompt(5));
+        assert!(matches!(
+            app.outbox.as_slice(),
+            [Command::AnswerPairing {
+                id: 5,
+                code: [0, 9, 18, 27, 36, 45, 54, 63],
+                accept: false
+            }]
+        ));
+    }
+
+    /// Test that the drawn prompt shows the peer and every symbol's name
+    /// (names survive terminals that draw emoji as boxes)
+    #[test]
+    fn test_pairing_popup_renders_names() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        handle_link_event(&mut app, up_network(true, Some(prompt(3))));
+
+        terminal.draw(|frame| ui(frame, &mut app)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(screen.contains("Pair new device?"));
+        assert!(screen.contains("192.168.1.7:50123"));
+        for (_, name) in prompt(3)
+            .code
+            .iter()
+            .filter_map(|&i| pairing_code::symbol(i))
+        {
+            assert!(screen.contains(name), "{name} not on screen");
+        }
+    }
+
+    /// Test that a pairing never covers a half-typed password, and that a
+    /// shown prompt the daemon dropped (expired) is closed
+    #[test]
+    fn test_pairing_prompt_waits_and_expires() {
+        let mut app = App::new();
+        app.active_popup = ActivePopup::EditSetting;
+        handle_link_event(&mut app, up_network(true, Some(prompt(1))));
+        assert_eq!(app.active_popup, ActivePopup::EditSetting);
+
+        app.active_popup = ActivePopup::None;
+        handle_link_event(&mut app, up_network(true, Some(prompt(1))));
+        assert_eq!(app.active_popup, ActivePopup::Pairing(prompt(1)));
+
+        // same id, another pairing (daemon restarted): the new code is shown
+        let mut other = prompt(1);
+        other.code = [1; 8];
+        handle_link_event(&mut app, up_network(true, Some(other.clone())));
+        assert_eq!(app.active_popup, ActivePopup::Pairing(other));
+
+        handle_link_event(&mut app, up_network(true, None));
+        assert_eq!(app.active_popup, ActivePopup::None);
+        assert!(app.logs.iter().any(|l| l.contains("expired")));
     }
 
     /// Test that a finished password request triggers a fresh status

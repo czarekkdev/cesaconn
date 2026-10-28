@@ -1,8 +1,3 @@
-/*
-TODO:
-pairing prompt ("pair with X? code") once the daemon runs the networker
-*/
-
 //! The TUI's link to the daemon over IPC (`cesa_conn_system::ipc`).
 //!
 //! The UI loop is synchronous and Argon2 in the daemon takes a while, so
@@ -19,7 +14,10 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
-use cesa_conn_system::ipc::{self, IpcErrors, PasswordUpdate, PeerInfo, Request, Response, Status};
+use cesa_conn_system::{
+    ipc::{self, IpcErrors, PairingPrompt, PasswordUpdate, PeerInfo, Request, Response, Status},
+    pairing_code::PairingCode,
+};
 
 /// Which of the two keys a password is for.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -43,13 +41,27 @@ pub enum Command {
     Unlock(PasswordUpdate),
     /// Turn automatic login on (d_key into the OS keychain) or off.
     SetAutoLogin(bool),
+    /// Turn networking on or off (saved by the daemon).
+    SetSync(bool),
+    /// Open the daemon's "Add device" window.
+    AddDevice,
+    /// The user's answer to a pairing prompt.
+    AnswerPairing {
+        id: u32,
+        code: PairingCode,
+        accept: bool,
+    },
 }
+
+/// What a refresh brings back: status, paired devices and the pairing
+/// waiting for the user (asked for only when the status says one waits).
+pub type Refresh = (Status, Vec<PeerInfo>, Option<PairingPrompt>);
 
 /// What the worker reports back.
 #[derive(Debug, PartialEq)]
 pub enum LinkEvent {
     /// Answer to [`Command::Refresh`].
-    Refreshed(Result<(Status, Vec<PeerInfo>), IpcErrors>),
+    Refreshed(Result<Refresh, IpcErrors>),
     /// Answer to [`Command::SetPassword`].
     PasswordSet {
         kind: KeyKind,
@@ -60,6 +72,18 @@ pub enum LinkEvent {
     /// Answer to [`Command::SetAutoLogin`].
     AutoLoginSet {
         on: bool,
+        result: Result<(), IpcErrors>,
+    },
+    /// Answer to [`Command::SetSync`].
+    SyncSet {
+        on: bool,
+        result: Result<(), IpcErrors>,
+    },
+    /// Answer to [`Command::AddDevice`].
+    AddDeviceStarted(Result<(), IpcErrors>),
+    /// Answer to [`Command::AnswerPairing`].
+    PairingAnswered {
+        accept: bool,
         result: Result<(), IpcErrors>,
     },
     /// The worker is gone (its runtime couldn't start, or it panicked).
@@ -148,6 +172,17 @@ async fn run_command(socket: Option<&PathBuf>, command: Command) -> LinkEvent {
             on,
             result: send_done(socket, Request::SetAutoLogin(on)).await,
         },
+        Command::SetSync(on) => LinkEvent::SyncSet {
+            on,
+            result: send_done(socket, Request::SetSync(on)).await,
+        },
+        Command::AddDevice => {
+            LinkEvent::AddDeviceStarted(send_done(socket, Request::AddDevice).await)
+        }
+        Command::AnswerPairing { id, code, accept } => LinkEvent::PairingAnswered {
+            accept,
+            result: send_done(socket, Request::AnswerPairing { id, code, accept }).await,
+        },
     }
 }
 
@@ -165,8 +200,9 @@ async fn send_done(socket: Option<&PathBuf>, request: Request) -> Result<(), Ipc
     result
 }
 
-/// Status first, then the paired devices.
-async fn refresh(socket: Option<&PathBuf>) -> Result<(Status, Vec<PeerInfo>), IpcErrors> {
+/// Status first, then the paired devices, then the waiting pairing (if
+/// the status says there is one).
+async fn refresh(socket: Option<&PathBuf>) -> Result<Refresh, IpcErrors> {
     let Response::Status(status) = send(socket, &Request::Status).await? else {
         return Err(IpcErrors::Malformed);
     };
@@ -175,7 +211,16 @@ async fn refresh(socket: Option<&PathBuf>) -> Result<(Status, Vec<PeerInfo>), Ip
         return Err(IpcErrors::Malformed);
     };
 
-    Ok((status, peers))
+    let pairing = if status.pending_pairings > 0 {
+        let Response::Pairing(pairing) = send(socket, &Request::PendingPairing).await? else {
+            return Err(IpcErrors::Malformed);
+        };
+        pairing
+    } else {
+        None
+    };
+
+    Ok((status, peers, pairing))
 }
 
 async fn send(socket: Option<&PathBuf>, request: &Request) -> Result<Response, IpcErrors> {
@@ -224,19 +269,26 @@ mod tests {
         let status = Status {
             auth_key_set: true,
             data_key_set: false,
-            network_running: false,
+            network_running: true,
             trusted_peers: 1,
+            pending_pairings: 1,
             ..Status::default()
         };
         let peer = PeerInfo {
             fingerprint: [0xab; ipc::FINGERPRINT_LEN],
             name: "laptop".into(),
         };
+        let prompt = PairingPrompt {
+            id: 9,
+            name: "10.0.0.2:50000".into(),
+            code: [1, 2, 3, 4, 5, 6, 7, 8],
+        };
 
-        // fake daemon: answers 3 requests, hands the 3rd one back to the test
+        // fake daemon: answers every request, hands the changes back to the test
         let (seen_tx, seen_rx) = mpsc::channel::<Vec<u8>>();
         let server_path = path.clone();
         let answer_peer = peer.clone();
+        let answer_prompt = prompt.clone();
         let server = thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -246,17 +298,23 @@ mod tests {
             rt.block_on(async move {
                 let listener = UnixListener::bind(&server_path).unwrap();
 
-                for _ in 0..5 {
+                for _ in 0..9 {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     let body = ipc::read_frame(&mut stream).await.unwrap();
 
                     let answer = match Request::decode(&body).unwrap() {
                         Request::Status => Response::Status(status).encode(),
                         Request::ListPeers => Response::Peers(vec![answer_peer.clone()]).encode(),
+                        Request::PendingPairing => {
+                            Response::Pairing(Some(answer_prompt.clone())).encode()
+                        }
                         Request::SetAuthPassword(_)
                         | Request::SetDataPassword(_)
                         | Request::Unlock(_)
-                        | Request::SetAutoLogin(_) => {
+                        | Request::SetAutoLogin(_)
+                        | Request::SetSync(_)
+                        | Request::AddDevice
+                        | Request::AnswerPairing { .. } => {
                             seen_tx.send(body.to_vec()).unwrap();
                             Response::Done.encode()
                         }
@@ -279,10 +337,11 @@ mod tests {
 
         let link = DaemonLink::spawn_with(Some(path)).unwrap();
 
+        // the status says a pairing waits, so the refresh brings it along
         assert!(link.send(Command::Refresh));
         assert_eq!(
             wait_for_event(&link),
-            LinkEvent::Refreshed(Ok((status, vec![peer])))
+            LinkEvent::Refreshed(Ok((status, vec![peer], Some(prompt))))
         );
 
         assert!(link.send(Command::SetPassword {
@@ -326,6 +385,48 @@ mod tests {
         assert!(matches!(
             Request::decode(&seen_rx.recv().unwrap()).unwrap(),
             Request::SetAutoLogin(true)
+        ));
+
+        // sync, add device and the pairing answer reach the daemon as such
+        assert!(link.send(Command::SetSync(true)));
+        assert_eq!(
+            wait_for_event(&link),
+            LinkEvent::SyncSet {
+                on: true,
+                result: Ok(())
+            }
+        );
+        assert!(matches!(
+            Request::decode(&seen_rx.recv().unwrap()).unwrap(),
+            Request::SetSync(true)
+        ));
+
+        assert!(link.send(Command::AddDevice));
+        assert_eq!(wait_for_event(&link), LinkEvent::AddDeviceStarted(Ok(())));
+        assert!(matches!(
+            Request::decode(&seen_rx.recv().unwrap()).unwrap(),
+            Request::AddDevice
+        ));
+
+        assert!(link.send(Command::AnswerPairing {
+            id: 9,
+            code: [1, 2, 3, 4, 5, 6, 7, 8],
+            accept: true
+        }));
+        assert_eq!(
+            wait_for_event(&link),
+            LinkEvent::PairingAnswered {
+                accept: true,
+                result: Ok(())
+            }
+        );
+        assert!(matches!(
+            Request::decode(&seen_rx.recv().unwrap()).unwrap(),
+            Request::AnswerPairing {
+                id: 9,
+                code: [1, 2, 3, 4, 5, 6, 7, 8],
+                accept: true
+            }
         ));
 
         server.join().unwrap();

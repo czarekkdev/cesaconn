@@ -13,7 +13,7 @@
 //!   a daemon of the same user, and on macOS only to one whose signature
 //!   satisfies [`DAEMON_CODE_REQUIREMENT`].
 //!
-//! Wire format (version 3), one request and one response per connection:
+//! Wire format (version 4), one request and one response per connection:
 //! `frame = length (u32 LE, 1..=MAX_FRAME_LEN) || body`
 //!
 //! Request body: `kind (1) || payload`
@@ -25,19 +25,32 @@
 //! * `0x07` Unlock: `password (1..=MAX_PASSWORD_LEN)`, the data password that
 //!   opens the encrypted vault after a restart
 //! * `0x08` SetAutoLogin: `on (1)`, exactly `0x00` or `0x01`
+//! * `0x09` SetSync: `on (1)`, exactly `0x00` or `0x01`; networking on/off,
+//!   saved in the vault
+//! * `0x0A` AddDevice: none; opens the "Add device" window (search the LAN,
+//!   pair with what answers)
+//! * `0x0B` PendingPairing: none; the pairing waiting for the user, if any
+//! * `0x0C` AnswerPairing: `id (u32 LE) || code (8) || accept (1)`, accept
+//!   exactly `0x00` or `0x01`; the code must be the one shown, so an answer
+//!   can never land on another pairing (ids start again after a restart)
 //! * `0x02` / `0x03` are retired (version 1 sent `salt || password` there).
 //!   They are refused, so a mismatched UI and daemon fail loudly instead of
 //!   deriving a key from the wrong bytes.
 //!
 //! Response body: `0x00 || payload` on success, `0x01 || error code (1)` on error
-//! * Status: `flags (1) || trusted peers (u32 LE) || unlock wait (u16 LE)`;
-//!   flags bit 0 = auth key set, bit 1 = data key set, bit 2 = network running,
-//!   bit 3 = vault locked, bit 4 = keys saved (encrypted vault), bit 5 =
-//!   automatic login on; unlock wait = seconds until `Unlock` is accepted again
-//!   after too many wrong data passwords (0 = now). Version 2 had no unlock
-//!   wait, so a mismatched UI and daemon fail with `Malformed`.
-//! * SetAuthPassword / SetDataPassword / Unlock / SetAutoLogin: empty
+//! * Status: `flags (1) || trusted peers (u32 LE) || unlock wait (u16 LE) ||
+//!   pending pairings (u8)`; flags bit 0 = auth key set, bit 1 = data key set,
+//!   bit 2 = network running, bit 3 = vault locked, bit 4 = keys saved
+//!   (encrypted vault), bit 5 = automatic login on, bit 6 = Sync switched on,
+//!   bit 7 = "Add device" window open; unlock wait = seconds until `Unlock` is
+//!   accepted again after too many wrong data passwords (0 = now). Versions 2
+//!   and 3 were shorter, so a mismatched UI and daemon fail with `Malformed`.
+//! * SetAuthPassword / SetDataPassword / Unlock / SetAutoLogin / SetSync /
+//!   AddDevice / AnswerPairing: empty
 //! * ListPeers: `count (u16 LE) || count * (fingerprint (8) || name len (1) || name)`
+//! * PendingPairing: `0x00` (none) or `0x01 || id (u32 LE) || code (8) ||
+//!   name len (1) || name`; every code byte is below
+//!   [`crate::pairing_code::PAIRING_SYMBOLS`], the name has no control characters
 
 use core::fmt;
 #[cfg(unix)]
@@ -47,6 +60,8 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 use zeroize::Zeroizing;
+
+use crate::pairing_code::{self, PAIRING_CODE_LEN, PairingCode};
 
 /// Largest frame body accepted in either direction (bytes); fits the
 /// biggest message, a full `ListPeers` answer (checked below).
@@ -100,6 +115,10 @@ const REQ_SET_AUTH_PASSWORD: u8 = 0x05;
 const REQ_SET_DATA_PASSWORD: u8 = 0x06;
 const REQ_UNLOCK: u8 = 0x07;
 const REQ_SET_AUTO_LOGIN: u8 = 0x08;
+const REQ_SET_SYNC: u8 = 0x09;
+const REQ_ADD_DEVICE: u8 = 0x0A;
+const REQ_PENDING_PAIRING: u8 = 0x0B;
+const REQ_ANSWER_PAIRING: u8 = 0x0C;
 
 /// Shortest new password the daemon accepts (characters; bytes if not UTF-8). Anyone holding the vault
 /// file and the keychain salts can guess the data password offline, so short
@@ -184,6 +203,12 @@ pub enum DaemonError {
     /// Unlock: too many wrong data passwords, try again later (refused before
     /// any key derivation; `Status` says how long to wait).
     UnlockDelayed = 0x09,
+    /// AddDevice: networking isn't running (Sync off, or the keys aren't
+    /// saved and unlocked).
+    NetworkOff = 0x0A,
+    /// AnswerPairing: no pairing with this id and code is waiting (answered
+    /// already, timed out, or another pairing after a restart).
+    PairingExpired = 0x0B,
 }
 
 impl DaemonError {
@@ -198,6 +223,8 @@ impl DaemonError {
             0x07 => Some(Self::NotSaved),
             0x08 => Some(Self::WeakPassword),
             0x09 => Some(Self::UnlockDelayed),
+            0x0A => Some(Self::NetworkOff),
+            0x0B => Some(Self::PairingExpired),
             _ => None,
         }
     }
@@ -220,6 +247,13 @@ impl fmt::Display for DaemonError {
             DaemonError::UnlockDelayed => {
                 write!(f, "too many wrong data passwords, try again later")
             }
+            DaemonError::NetworkOff => {
+                write!(
+                    f,
+                    "networking is off: turn Sync on (needs saved, unlocked keys)"
+                )
+            }
+            DaemonError::PairingExpired => write!(f, "that pairing request is no longer waiting"),
         }
     }
 }
@@ -245,6 +279,19 @@ pub enum Request {
     Unlock(PasswordUpdate),
     /// Keep `d_key` in the OS keychain (`true`) or delete it from there.
     SetAutoLogin(bool),
+    /// Turn networking on (`true`: listener, "Add device") or off; saved.
+    SetSync(bool),
+    /// Open the "Add device" window: search the LAN and pair.
+    AddDevice,
+    /// The pairing waiting for the user's answer, if any.
+    PendingPairing,
+    /// The user's answer to the pairing `id` showing `code` (`true` = the
+    /// codes match).
+    AnswerPairing {
+        id: u32,
+        code: PairingCode,
+        accept: bool,
+    },
 }
 
 /// Daemon status (contains no key material).
@@ -262,6 +309,24 @@ pub struct Status {
     pub auto_login: bool,
     /// Seconds until `Unlock` is accepted again (0 = now).
     pub unlock_wait_secs: u16,
+    /// The Sync switch is on (networking wanted; see `network_running`).
+    pub sync_enabled: bool,
+    /// The "Add device" window is open.
+    pub adding_device: bool,
+    /// Pairings waiting for the user's answer.
+    pub pending_pairings: u8,
+}
+
+/// A pairing waiting for the user (public data only: the handshake hash
+/// it comes from stays in the daemon).
+#[derive(Debug, PartialEq, Clone)]
+pub struct PairingPrompt {
+    /// Which pairing an answer is for.
+    pub id: u32,
+    /// The other device's display name (its address for now).
+    pub name: String,
+    /// The code to compare with the other device, see [`pairing_code`].
+    pub code: PairingCode,
 }
 
 /// A paired device as shown to the user (public data only).
@@ -282,6 +347,26 @@ pub enum Response {
     Done,
     /// Answer to [`Request::ListPeers`].
     Peers(Vec<PeerInfo>),
+    /// Answer to [`Request::PendingPairing`].
+    Pairing(Option<PairingPrompt>),
+}
+
+/// Parses a one-byte on/off payload: exactly `0x00` or `0x01`.
+fn parse_flag(payload: &[u8]) -> Option<bool> {
+    match payload {
+        [0x00] => Some(false),
+        [0x01] => Some(true),
+        _ => None,
+    }
+}
+
+/// `name` cut to at most 255 bytes, on a char boundary.
+fn short_name(name: &str) -> &[u8] {
+    let mut end = name.len().min(255);
+    while !name.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    name.as_bytes().get(..end).unwrap_or_default()
 }
 
 /// Parses a `password` payload.
@@ -306,6 +391,17 @@ impl Request {
             Request::Unlock(u) => (REQ_UNLOCK, Some(u)),
             Request::SetAutoLogin(on) => {
                 return Zeroizing::new(vec![REQ_SET_AUTO_LOGIN, u8::from(*on)]);
+            }
+            Request::SetSync(on) => return Zeroizing::new(vec![REQ_SET_SYNC, u8::from(*on)]),
+            Request::AddDevice => (REQ_ADD_DEVICE, None),
+            Request::PendingPairing => (REQ_PENDING_PAIRING, None),
+            Request::AnswerPairing { id, code, accept } => {
+                let mut body = Zeroizing::new(Vec::with_capacity(1 + 4 + PAIRING_CODE_LEN + 1));
+                body.push(REQ_ANSWER_PAIRING);
+                body.extend_from_slice(&id.to_le_bytes());
+                body.extend_from_slice(code);
+                body.push(u8::from(*accept));
+                return body;
             }
         };
 
@@ -332,11 +428,22 @@ impl Request {
             REQ_SET_AUTH_PASSWORD => parse_password_update(payload).map(Request::SetAuthPassword),
             REQ_SET_DATA_PASSWORD => parse_password_update(payload).map(Request::SetDataPassword),
             REQ_UNLOCK => parse_password_update(payload).map(Request::Unlock),
-            REQ_SET_AUTO_LOGIN => match payload {
-                [0x00] => Some(Request::SetAutoLogin(false)),
-                [0x01] => Some(Request::SetAutoLogin(true)),
-                _ => None,
-            },
+            REQ_SET_AUTO_LOGIN => parse_flag(payload).map(Request::SetAutoLogin),
+            REQ_SET_SYNC => parse_flag(payload).map(Request::SetSync),
+            REQ_ADD_DEVICE if payload.is_empty() => Some(Request::AddDevice),
+            REQ_PENDING_PAIRING if payload.is_empty() => Some(Request::PendingPairing),
+            REQ_ANSWER_PAIRING => {
+                let (id, rest) = payload.split_first_chunk::<4>()?;
+                let (code, accept) = rest.split_first_chunk::<PAIRING_CODE_LEN>()?;
+                if !pairing_code::is_valid(code) {
+                    return None;
+                }
+                Some(Request::AnswerPairing {
+                    id: u32::from_le_bytes(*id),
+                    code: *code,
+                    accept: parse_flag(accept)?,
+                })
+            }
             _ => None,
         }
     }
@@ -354,13 +461,25 @@ impl Response {
                     | u8::from(s.network_running) << 2
                     | u8::from(s.locked) << 3
                     | u8::from(s.saved) << 4
-                    | u8::from(s.auto_login) << 5;
+                    | u8::from(s.auto_login) << 5
+                    | u8::from(s.sync_enabled) << 6
+                    | u8::from(s.adding_device) << 7;
 
                 body.push(flags);
                 body.extend_from_slice(&s.trusted_peers.to_le_bytes());
                 body.extend_from_slice(&s.unlock_wait_secs.to_le_bytes());
+                body.push(s.pending_pairings);
             }
             Response::Done => {}
+            Response::Pairing(None) => body.push(0x00),
+            Response::Pairing(Some(prompt)) => {
+                let name = short_name(&prompt.name);
+                body.push(0x01);
+                body.extend_from_slice(&prompt.id.to_le_bytes());
+                body.extend_from_slice(&prompt.code);
+                body.push(u8::try_from(name.len()).unwrap_or(0));
+                body.extend_from_slice(name);
+            }
             Response::Peers(peers) => {
                 let peers = peers.get(..MAX_LISTED_PEERS).unwrap_or(peers);
                 let count = u16::try_from(peers.len()).unwrap_or(u16::MAX);
@@ -369,11 +488,7 @@ impl Response {
 
                 for peer in peers.iter().take(usize::from(count)) {
                     // names are cut at 255 bytes, on a char boundary
-                    let mut end = peer.name.len().min(255);
-                    while !peer.name.is_char_boundary(end) {
-                        end = end.saturating_sub(1);
-                    }
-                    let name = peer.name.as_bytes().get(..end).unwrap_or_default();
+                    let name = short_name(&peer.name);
 
                     body.extend_from_slice(&peer.fingerprint);
                     body.push(u8::try_from(name.len()).unwrap_or(0));
@@ -410,18 +525,15 @@ impl Response {
 
         match request {
             Request::Status => {
-                let (flags, peers, unlock_wait_secs) = match payload {
-                    [flags, a, b, c, d, w0, w1] => (
+                let (flags, peers, unlock_wait_secs, pending_pairings) = match payload {
+                    [flags, a, b, c, d, w0, w1, pending] => (
                         *flags,
                         u32::from_le_bytes([*a, *b, *c, *d]),
                         u16::from_le_bytes([*w0, *w1]),
+                        *pending,
                     ),
                     _ => return Err(IpcErrors::Malformed),
                 };
-
-                if flags & !0b11_1111 != 0 {
-                    return Err(IpcErrors::Malformed);
-                }
 
                 Ok(Response::Status(Status {
                     auth_key_set: flags & 0b001 != 0,
@@ -430,14 +542,20 @@ impl Response {
                     locked: flags & 0b1000 != 0,
                     saved: flags & 0b1_0000 != 0,
                     auto_login: flags & 0b10_0000 != 0,
+                    sync_enabled: flags & 0b100_0000 != 0,
+                    adding_device: flags & 0b1000_0000 != 0,
                     trusted_peers: peers,
                     unlock_wait_secs,
+                    pending_pairings,
                 }))
             }
             Request::SetAuthPassword(_)
             | Request::SetDataPassword(_)
             | Request::Unlock(_)
             | Request::SetAutoLogin(_)
+            | Request::SetSync(_)
+            | Request::AddDevice
+            | Request::AnswerPairing { .. }
                 if payload.is_empty() =>
             {
                 Ok(Response::Done)
@@ -445,8 +563,12 @@ impl Response {
             Request::SetAuthPassword(_)
             | Request::SetDataPassword(_)
             | Request::Unlock(_)
-            | Request::SetAutoLogin(_) => Err(IpcErrors::Malformed),
+            | Request::SetAutoLogin(_)
+            | Request::SetSync(_)
+            | Request::AddDevice
+            | Request::AnswerPairing { .. } => Err(IpcErrors::Malformed),
             Request::ListPeers => decode_peers(payload).ok_or(IpcErrors::Malformed),
+            Request::PendingPairing => decode_pairing(payload).ok_or(IpcErrors::Malformed),
         }
     }
 }
@@ -476,6 +598,37 @@ fn decode_peers(payload: &[u8]) -> Option<Response> {
     }
 
     rest.is_empty().then_some(Response::Peers(peers))
+}
+
+/// Parses the `PendingPairing` payload; `None` unless it is consumed exactly,
+/// the code is in the table and the name is printable (it goes to a terminal).
+fn decode_pairing(payload: &[u8]) -> Option<Response> {
+    let (&present, rest) = payload.split_first()?;
+
+    match present {
+        0x00 if rest.is_empty() => Some(Response::Pairing(None)),
+        0x01 => {
+            let (id, rest) = rest.split_first_chunk::<4>()?;
+            let (code, rest) = rest.split_first_chunk::<PAIRING_CODE_LEN>()?;
+            let (&name_len, name) = rest.split_first()?;
+
+            if name.len() != usize::from(name_len) || !pairing_code::is_valid(code) {
+                return None;
+            }
+
+            let name = std::str::from_utf8(name).ok()?;
+            if name.chars().any(char::is_control) {
+                return None;
+            }
+
+            Some(Response::Pairing(Some(PairingPrompt {
+                id: u32::from_le_bytes(*id),
+                name: name.to_owned(),
+                code: *code,
+            })))
+        }
+        _ => None,
+    }
 }
 
 /// Writes one frame (`length || body`), each write bounded by [`IO_TIMEOUT`].
@@ -675,6 +828,20 @@ mod tests {
             Request::Unlock(update(b"data password")),
             Request::SetAutoLogin(true),
             Request::SetAutoLogin(false),
+            Request::SetSync(true),
+            Request::SetSync(false),
+            Request::AddDevice,
+            Request::PendingPairing,
+            Request::AnswerPairing {
+                id: 0xDEAD_BEEF,
+                code: [0, 1, 2, 3, 60, 61, 62, 63],
+                accept: true,
+            },
+            Request::AnswerPairing {
+                id: 0,
+                code: [0; PAIRING_CODE_LEN],
+                accept: false,
+            },
         ] {
             let decoded = Request::decode(&req.encode()).unwrap();
             assert_eq!(decoded.encode().as_slice(), req.encode().as_slice());
@@ -707,6 +874,28 @@ mod tests {
         assert!(Request::decode(&[REQ_SET_AUTO_LOGIN, 1, 0]).is_none());
         // empty unlock password
         assert!(Request::decode(&[REQ_UNLOCK]).is_none());
+        // sync flag: exactly one byte, 0 or 1
+        assert!(Request::decode(&[REQ_SET_SYNC]).is_none());
+        assert!(Request::decode(&[REQ_SET_SYNC, 2]).is_none());
+        assert!(Request::decode(&[REQ_SET_SYNC, 0, 0]).is_none());
+        // payload-less requests take no payload
+        assert!(Request::decode(&[REQ_ADD_DEVICE, 0]).is_none());
+        assert!(Request::decode(&[REQ_PENDING_PAIRING, 0]).is_none());
+        // answer: id (4) + code (8, in the table) + exactly 0 or 1
+        let answer = |code: u8, tail: &[u8]| {
+            [
+                &[REQ_ANSWER_PAIRING, 1, 0, 0, 0][..],
+                &[code; PAIRING_CODE_LEN],
+                tail,
+            ]
+            .concat()
+        };
+        assert!(Request::decode(&answer(5, &[1])).is_some());
+        assert!(Request::decode(&answer(5, &[])).is_none());
+        assert!(Request::decode(&answer(5, &[2])).is_none());
+        assert!(Request::decode(&answer(5, &[1, 0])).is_none());
+        assert!(Request::decode(&answer(64, &[1])).is_none());
+        assert!(Request::decode(&[REQ_ANSWER_PAIRING, 1, 0, 0, 0, 1]).is_none());
         // longest allowed password still fits
         let max = [&[REQ_SET_DATA_PASSWORD][..], &vec![b'a'; MAX_PASSWORD_LEN]].concat();
         assert!(Request::decode(&max).is_some());
@@ -725,6 +914,8 @@ mod tests {
             DaemonError::NotSaved,
             DaemonError::WeakPassword,
             DaemonError::UnlockDelayed,
+            DaemonError::NetworkOff,
+            DaemonError::PairingExpired,
         ] {
             assert_eq!(
                 Response::decode(&Request::Status, &Response::encode_error(e)),
@@ -732,15 +923,94 @@ mod tests {
             );
         }
 
-        // bit 6 is not defined
+        // unknown error codes are refused
         assert_eq!(
-            Response::decode(&Request::Status, &[RESP_OK, 0b100_0000, 0, 0, 0, 0, 0, 0]),
+            Response::decode(&Request::Status, &[RESP_ERR, 0x0C]),
             Err(IpcErrors::Malformed)
         );
 
-        // a version 2 status (no unlock wait) is refused, not misread
+        // a version 2 (no unlock wait) or version 3 (no pending pairings)
+        // status is refused, not misread
         assert_eq!(
             Response::decode(&Request::Status, &[RESP_OK, 0, 0, 0, 0, 0]),
+            Err(IpcErrors::Malformed)
+        );
+        assert_eq!(
+            Response::decode(&Request::Status, &[RESP_OK, 0, 0, 0, 0, 0, 0, 0]),
+            Err(IpcErrors::Malformed)
+        );
+    }
+
+    /// Test that the pairing answer round-trips and its decoding is strict
+    #[test]
+    fn test_pairing_prompt_roundtrip_and_strict() {
+        for prompt in [
+            None,
+            Some(PairingPrompt {
+                id: 7,
+                name: "192.168.1.20:51234".into(),
+                code: [0, 1, 2, 3, 60, 61, 62, 63],
+            }),
+        ] {
+            let response = Response::Pairing(prompt);
+            assert_eq!(
+                Response::decode(&Request::PendingPairing, &response.encode()),
+                Ok(response)
+            );
+        }
+
+        let good = Response::Pairing(Some(PairingPrompt {
+            id: 1,
+            name: "ab".into(),
+            code: [5; PAIRING_CODE_LEN],
+        }))
+        .encode();
+
+        // truncated anywhere, or extra bytes
+        for cut in 1..good.len() {
+            assert_eq!(
+                Response::decode(&Request::PendingPairing, &good[..cut]),
+                Err(IpcErrors::Malformed),
+                "cut at {cut}"
+            );
+        }
+        let longer = [&good[..], &[0]].concat();
+        assert_eq!(
+            Response::decode(&Request::PendingPairing, &longer),
+            Err(IpcErrors::Malformed)
+        );
+
+        // "none" with trailing bytes, an unknown marker
+        for body in [&[RESP_OK, 0x00, 0x00][..], &[RESP_OK, 0x02]] {
+            assert_eq!(
+                Response::decode(&Request::PendingPairing, body),
+                Err(IpcErrors::Malformed)
+            );
+        }
+
+        // a symbol outside the table
+        let mut bad_code = good.clone();
+        bad_code[6] = 64;
+        assert_eq!(
+            Response::decode(&Request::PendingPairing, &bad_code),
+            Err(IpcErrors::Malformed)
+        );
+
+        // a control character (terminal escape) in the name
+        let mut escape = good.clone();
+        let last = escape.len() - 1;
+        escape[last] = 0x1b;
+        assert_eq!(
+            Response::decode(&Request::PendingPairing, &escape),
+            Err(IpcErrors::Malformed)
+        );
+
+        // not UTF-8
+        let mut not_utf8 = good;
+        let last = not_utf8.len() - 1;
+        not_utf8[last] = 0xff;
+        assert_eq!(
+            Response::decode(&Request::PendingPairing, &not_utf8),
             Err(IpcErrors::Malformed)
         );
     }
@@ -757,6 +1027,9 @@ mod tests {
             saved: true,
             auto_login: true,
             unlock_wait_secs: 0x1234,
+            sync_enabled: true,
+            adding_device: true,
+            pending_pairings: 3,
         });
         assert_eq!(
             Response::decode(&Request::Status, &status.encode()),
@@ -849,6 +1122,7 @@ mod tests {
             let _ = Request::decode(&bytes);
             let _ = Response::decode(&Request::Status, &bytes);
             let _ = Response::decode(&Request::ListPeers, &bytes);
+            let _ = Response::decode(&Request::PendingPairing, &bytes);
         }
     }
 

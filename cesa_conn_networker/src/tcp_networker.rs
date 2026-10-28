@@ -12,8 +12,8 @@ use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
 
 use crate::auth_snow::{
-    AuthSnowErrors, DATA_LAYER_OVERHEAD, DeviceKeypairs, Keys, SecureConnection, Tags, TrustedPeer,
-    TrustedPeers, auth_incoming, auth_outgoing,
+    AuthSnowErrors, DATA_LAYER_OVERHEAD, DeviceKeypairs, Keys, Pairing, SecureConnection, Tags,
+    TrustedPeer, TrustedPeers, auth_incoming, auth_outgoing,
 };
 use crate::guess_limiter::GuessLimiter;
 
@@ -51,6 +51,9 @@ impl ActionType {
         }
     }
 }
+
+/// TCP port devices listen on (and connect to; discovery only gives the IP).
+pub const TCP_PORT: u16 = 3232;
 
 /// Init header: action type (1) + payload length as little-endian u64 (8).
 const INIT_HEADER_LEN: usize = 9;
@@ -91,8 +94,8 @@ pub struct NetworkerContext {
     pub device_keypairs: Arc<DeviceKeypairs>,
     /// Devices we have paired with.
     pub trusted_peers: TrustedPeers,
-    /// Asks the user to confirm a new device (name, handshake hash).
-    pub pair_fallback: fn(&String, &[u8; 32]) -> bool,
+    /// Asks the user to confirm a new device (name, pairing code).
+    pub pairing: Pairing,
     /// Counts wrong passwords per source and locks guessers out.
     pub guess_limiter: Arc<GuessLimiter>,
 }
@@ -208,7 +211,7 @@ pub async fn recv_handler(
         &context.device_keypairs,
         context.trusted_peers,
         IncomingConnection::new(stream, peer_addr),
-        context.pair_fallback,
+        &context.pairing,
     )
     .await
     .map_err(|e| {
@@ -407,7 +410,7 @@ pub async fn connect_handler(
         &context.device_keypairs,
         context.trusted_peers,
         IncomingConnection::new(outgoing_connection, connect_addr),
-        context.pair_fallback,
+        &context.pairing,
     )
     .await;
 
@@ -478,6 +481,8 @@ pub async fn connect_handler(
 /// Returns immediately after the TCP connect resolves — auth and data transfer happen
 /// inside a spawned task concurrently with other work. Cancellation is checked both
 /// before the TCP connect and mid-handler inside the spawned task.
+// only the manual test commands use it (the daemon waits for each result)
+#[cfg(any(test, feature = "test-commands"))]
 pub async fn connect(
     context: NetworkerContext,
     cancellation_token: CancellationToken,
@@ -538,30 +543,18 @@ mod tests {
     const TEST_A_KEY: [u8; 32] = [0xAB; 32];
     const TEST_D_KEY: [u8; 32] = [0xCD; 32];
 
-    /// Pairing callback that accepts every device.
-    fn accept_all(_name: &String, _hash: &[u8; 32]) -> bool {
-        true
-    }
-
-    /// Pairing callback that rejects every device.
-    fn reject_all(_name: &String, _hash: &[u8; 32]) -> bool {
-        false
-    }
+    /// The user accepts every new device.
+    const ACCEPT_ALL: bool = true;
+    /// The user rejects every new device.
+    const REJECT_ALL: bool = false;
 
     /// Fresh device identity + empty trusted list.
-    fn make_context(
-        a_key: [u8; 32],
-        pair_fallback: fn(&String, &[u8; 32]) -> bool,
-    ) -> NetworkerContext {
-        make_context_d(a_key, TEST_D_KEY, pair_fallback)
+    fn make_context(a_key: [u8; 32], accept: bool) -> NetworkerContext {
+        make_context_d(a_key, TEST_D_KEY, accept)
     }
 
     /// Like [`make_context`] with an explicit `d_key`.
-    fn make_context_d(
-        a_key: [u8; 32],
-        d_key: [u8; 32],
-        pair_fallback: fn(&String, &[u8; 32]) -> bool,
-    ) -> NetworkerContext {
+    fn make_context_d(a_key: [u8; 32], d_key: [u8; 32], accept: bool) -> NetworkerContext {
         NetworkerContext {
             keys: Arc::new(RwLock::new(Keys::new(
                 AuthKey::from_bytes(&a_key),
@@ -569,7 +562,7 @@ mod tests {
             ))),
             device_keypairs: Arc::new(DeviceKeypairs::generate().unwrap()),
             trusted_peers: Arc::new(RwLock::new(Vec::new())),
-            pair_fallback,
+            pairing: Pairing::answer_all(accept),
             guess_limiter: Arc::new(GuessLimiter::new()),
         }
     }
@@ -648,8 +641,8 @@ mod tests {
     /// Test that two new devices pair and the payload arrives intact
     #[tokio::test]
     async fn test_pair_and_send_debug_packet() {
-        let server = make_context(TEST_A_KEY, accept_all);
-        let client = make_context(TEST_A_KEY, accept_all);
+        let server = make_context(TEST_A_KEY, ACCEPT_ALL);
+        let client = make_context(TEST_A_KEY, ACCEPT_ALL);
         let server_peers = server.trusted_peers.clone();
         let client_peers = client.trusted_peers.clone();
 
@@ -672,8 +665,8 @@ mod tests {
         let data: Vec<u8> = (0..=250u8).cycle().take(1024 * 1024).collect();
 
         let (server_result, client_result) = exchange(
-            make_context(TEST_A_KEY, accept_all),
-            make_context(TEST_A_KEY, accept_all),
+            make_context(TEST_A_KEY, ACCEPT_ALL),
+            make_context(TEST_A_KEY, ACCEPT_ALL),
             ActionType::ClipboardSync,
             &data,
         )
@@ -694,7 +687,7 @@ mod tests {
         let stream = TcpStream::connect(addr).await.unwrap();
 
         let result = connect_handler(
-            make_context(TEST_A_KEY, accept_all),
+            make_context(TEST_A_KEY, ACCEPT_ALL),
             addr,
             stream,
             ActionType::ClipboardSync,
@@ -713,12 +706,12 @@ mod tests {
     /// Test that ConnectNewDevice pairs and delivers an empty payload
     #[tokio::test]
     async fn test_connect_new_device_pairs_without_payload() {
-        let server = make_context(TEST_A_KEY, accept_all);
+        let server = make_context(TEST_A_KEY, ACCEPT_ALL);
         let server_peers = server.trusted_peers.clone();
 
         let (server_result, client_result) = exchange(
             server,
-            make_context(TEST_A_KEY, accept_all),
+            make_context(TEST_A_KEY, ACCEPT_ALL),
             ActionType::ConnectNewDevice,
             b"ignored",
         )
@@ -736,12 +729,12 @@ mod tests {
     /// Test that a peer with a different a_key gets nothing and pairs nothing
     #[tokio::test]
     async fn test_wrong_a_key_rejected() {
-        let server = make_context(TEST_A_KEY, accept_all);
+        let server = make_context(TEST_A_KEY, ACCEPT_ALL);
         let server_peers = server.trusted_peers.clone();
 
         let (server_result, client_result) = exchange(
             server,
-            make_context([0x11; 32], accept_all),
+            make_context([0x11; 32], ACCEPT_ALL),
             ActionType::Debug,
             b"secret",
         )
@@ -755,8 +748,8 @@ mod tests {
     /// Test that a rejected pairing delivers no data and saves no peer on either side
     #[tokio::test]
     async fn test_rejected_pairing_sends_nothing() {
-        let server = make_context(TEST_A_KEY, reject_all);
-        let client = make_context(TEST_A_KEY, accept_all);
+        let server = make_context(TEST_A_KEY, REJECT_ALL);
+        let client = make_context(TEST_A_KEY, ACCEPT_ALL);
         let server_peers = server.trusted_peers.clone();
         let client_peers = client.trusted_peers.clone();
 
@@ -777,8 +770,8 @@ mod tests {
     #[tokio::test]
     async fn test_different_d_key_data_rejected() {
         let (server_result, client_result) = exchange(
-            make_context(TEST_A_KEY, accept_all),
-            make_context_d(TEST_A_KEY, [0x22; 32], accept_all),
+            make_context(TEST_A_KEY, ACCEPT_ALL),
+            make_context_d(TEST_A_KEY, [0x22; 32], ACCEPT_ALL),
             ActionType::ClipboardSync,
             b"clipboard",
         )
@@ -800,7 +793,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let token = CancellationToken::new();
         let server_token = token.clone();
-        let context = make_context(TEST_A_KEY, accept_all);
+        let context = make_context(TEST_A_KEY, ACCEPT_ALL);
 
         let server = tokio::spawn(async move { recv(&listener, context, server_token).await });
 
@@ -838,12 +831,12 @@ mod tests {
     async fn test_wrong_passwords_lock_out_the_source() {
         use crate::guess_limiter::MAX_FAILURES;
 
-        let server = make_context(TEST_A_KEY, accept_all);
+        let server = make_context(TEST_A_KEY, ACCEPT_ALL);
 
         for _ in 0..MAX_FAILURES {
             let (server_result, _) = exchange(
                 server.clone(),
-                make_context([0x11; 32], accept_all),
+                make_context([0x11; 32], ACCEPT_ALL),
                 ActionType::Debug,
                 b"guess",
             )
@@ -854,7 +847,7 @@ mod tests {
         // even the right password is refused now, before any handshake
         let (server_result, client_result) = exchange(
             server.clone(),
-            make_context(TEST_A_KEY, accept_all),
+            make_context(TEST_A_KEY, ACCEPT_ALL),
             ActionType::Debug,
             b"hi",
         )
@@ -869,11 +862,11 @@ mod tests {
     async fn test_client_locks_out_failing_server() {
         use crate::guess_limiter::MAX_FAILURES;
 
-        let client = make_context([0x11; 32], accept_all);
+        let client = make_context([0x11; 32], ACCEPT_ALL);
 
         for _ in 0..MAX_FAILURES {
             let (_, client_result) = exchange(
-                make_context(TEST_A_KEY, accept_all),
+                make_context(TEST_A_KEY, ACCEPT_ALL),
                 client.clone(),
                 ActionType::Debug,
                 b"x",
@@ -899,7 +892,7 @@ mod tests {
 
         let unreachable: SocketAddr = "127.0.0.1:19999".parse().unwrap();
         let result = connect(
-            make_context(TEST_A_KEY, accept_all),
+            make_context(TEST_A_KEY, ACCEPT_ALL),
             token,
             unreachable,
             ActionType::Debug,
@@ -919,7 +912,7 @@ mod tests {
         drop(listener);
 
         let result = connect(
-            make_context(TEST_A_KEY, accept_all),
+            make_context(TEST_A_KEY, ACCEPT_ALL),
             CancellationToken::new(),
             addr,
             ActionType::Debug,

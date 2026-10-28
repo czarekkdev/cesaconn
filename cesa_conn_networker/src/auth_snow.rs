@@ -27,6 +27,14 @@ pub const TIMEOUT: u64 = 5;
 /// how long the user has to confirm a new device during pairing (seconds)
 pub const PAIRING_TIMEOUT: u64 = 60;
 
+/// pairings that may wait for the user at the same time; one more is
+/// rejected at once instead of queueing (a peer that knows the auth
+/// password must not be able to stack up prompts)
+pub const MAX_PENDING_PAIRINGS: usize = 4;
+
+/// HKDF label of the pairing code
+const PAIRING_CODE_LABEL: &[u8] = b"CesaConn-pairing-code";
+
 /// deadline for the whole handshake up to the verified signatures (seconds);
 /// per-message timeouts alone would let a peer drip one message every
 /// TIMEOUT - 1 seconds and hold the connection for minutes
@@ -50,6 +58,7 @@ use cesa_conn_crypto::{
     crand::random_array,
     x25519_cesa::{X25519KeyPair, generate_new_key_pair},
 };
+use cesa_conn_system::pairing_code::{PAIRING_CODE_LEN, PairingCode};
 use core::fmt;
 use hkdf::SimpleHkdf;
 use libcrux_ml_dsa::ml_dsa_87::{
@@ -60,8 +69,7 @@ use std::{sync::Arc, time::Duration};
 use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::RwLock,
-    task::spawn_blocking,
+    sync::{Notify, RwLock, mpsc, oneshot},
     time::timeout,
 };
 use zeroize::Zeroizing;
@@ -777,6 +785,120 @@ impl TrustedPeer {
     }
 }
 
+/// A new device waiting for our user's decision: shown with its name and
+/// the pairing code, answered with [`PairingRequest::answer`]. Dropping it
+/// unanswered is a rejection.
+pub struct PairingRequest {
+    /// The peer's display name (its address until devices exchange names).
+    pub name: String,
+    /// The code both devices show, see [`pairing_code`].
+    pub code: PairingCode,
+    /// Where the decision goes; the handshake waits on the other end.
+    decision: oneshot::Sender<bool>,
+}
+
+impl PairingRequest {
+    /// Sends the user's decision (`true` = the codes match, pair).
+    pub fn answer(self, accept: bool) {
+        if self.decision.send(accept).is_err() {
+            tracing::debug!(name = %self.name, "pairing answered after it had expired");
+        }
+    }
+
+    /// The handshake stopped waiting (timeout, connection closed).
+    pub fn is_expired(&self) -> bool {
+        self.decision.is_closed()
+    }
+
+    /// A request with a fixed code whose answer goes to `decision` (tests).
+    #[cfg(test)]
+    pub fn for_test(name: &str, decision: oneshot::Sender<bool>) -> Self {
+        Self {
+            name: name.to_owned(),
+            code: [0; PAIRING_CODE_LEN],
+            decision,
+        }
+    }
+}
+
+/// How the handshake asks the user about a new device, and tells the owner
+/// that a new peer was saved (so it can be written to the vault).
+#[derive(Clone)]
+pub struct Pairing {
+    /// Bounded by [`MAX_PENDING_PAIRINGS`]; a full queue rejects at once.
+    requests: mpsc::Sender<PairingRequest>,
+    /// Woken after a peer was added to the trusted list.
+    saved: Arc<Notify>,
+}
+
+/// The receiving end of a [`Pairing`]: requests for the user, and the
+/// "a peer was saved" signal.
+pub struct PairingInbox {
+    pub requests: mpsc::Receiver<PairingRequest>,
+    pub saved: Arc<Notify>,
+}
+
+impl Pairing {
+    /// A new pairing channel and its receiving end.
+    pub fn channel() -> (Self, PairingInbox) {
+        let (requests, receiver) = mpsc::channel(MAX_PENDING_PAIRINGS);
+        let saved = Arc::new(Notify::new());
+
+        (
+            Self {
+                requests,
+                saved: saved.clone(),
+            },
+            PairingInbox {
+                requests: receiver,
+                saved,
+            },
+        )
+    }
+
+    /// A pairing channel whose every request gets the same answer (tests).
+    #[cfg(test)]
+    pub fn answer_all(accept: bool) -> Self {
+        let (pairing, mut inbox) = Self::channel();
+
+        tokio::spawn(async move {
+            // an in-process channel, not the network: ends with the senders
+            // nosemgrep: cesa.net.read-without-timeout
+            while let Some(request) = inbox.requests.recv().await {
+                request.answer(accept);
+            }
+        });
+
+        pairing
+    }
+}
+
+/// The pairing code of a connection: `HKDF-BLAKE2s(ikm = handshake hash)`
+/// expanded to 6 bytes = 48 bits, cut into 8 symbols of 6 bits (big endian,
+/// first symbol = highest bits). Both devices have the same handshake hash
+/// only without a MITM, so only then do they show the same code.
+pub fn pairing_code(handshake_hash: &[u8; 32]) -> Result<PairingCode, AuthSnowErrors> {
+    // not secret (it is shown on screen), so no Zeroizing here
+    let mut okm = [0u8; 8];
+
+    // the top 2 bytes stay zero, the 6 expanded bytes are the 48 code bits
+    let (_, bits) = okm.split_at_mut(2);
+    SimpleHkdf::<Blake2s256>::new(None, handshake_hash)
+        .expand(PAIRING_CODE_LABEL, bits)
+        .map_err(|_| AuthSnowErrors::FailedToExpandHkdf)?;
+
+    let bits = u64::from_be_bytes(okm);
+    let mut code = [0u8; PAIRING_CODE_LEN];
+
+    for (symbol, shift) in code.iter_mut().zip([42u32, 36, 30, 24, 18, 12, 6, 0]) {
+        // 6 bits: always below PAIRING_SYMBOLS
+        *symbol = u8::try_from(bits.checked_shr(shift).unwrap_or(0) & 0x3F)
+            .map_err(|_| AuthSnowErrors::FailedToConvertToArray)?;
+    }
+
+    Ok(code)
+}
+
 /// Which end of the connection we are. Decides who sends first after the
 /// Noise handshake and which ML-DSA signing context belongs to whom.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -1046,36 +1168,67 @@ async fn exchange_signatures(
     Ok(*peer_key)
 }
 
+/// Asks our user about the peer: the name and the pairing code go to the
+/// [`Pairing`] channel, the answer comes back within [`PAIRING_TIMEOUT`].
+/// A full queue or a dropped request is a rejection; no answer in time is
+/// `Err(PairingTimeout)`.
+async fn ask_user(
+    pairing: &Pairing,
+    name: String,
+    handshake_hash: &[u8; 32],
+) -> Result<bool, AuthSnowErrors> {
+    let code = pairing_code(handshake_hash)?;
+    let (decision, answer) = oneshot::channel();
+
+    // full: rejected at once, never queued behind other prompts
+    if pairing
+        .requests
+        .try_send(PairingRequest {
+            name,
+            code,
+            decision,
+        })
+        .is_err()
+    {
+        tracing::warn!("too many pairings waiting for the user, rejecting");
+        return Ok(false);
+    }
+
+    match timeout(Duration::from_secs(PAIRING_TIMEOUT), answer).await {
+        Ok(Ok(accept)) => Ok(accept),
+        // dropped without an answer (UI gone, networking stopped)
+        Ok(Err(_)) => Ok(false),
+        Err(_) => Err(AuthSnowErrors::PairingTimeout),
+    }
+}
+
 /// Pairing confirmation, run only when the two devices don't both know each other.
 ///
-/// Our user compares the words derived from the handshake hash and decides
-/// (`pair_fallback`, on a blocking thread, at most [`PAIRING_TIMEOUT`]). Then:
+/// Our user compares the pairing code derived from the handshake hash with
+/// the other device and decides ([`ask_user`], at most [`PAIRING_TIMEOUT`]).
+/// Then:
 ///
 /// 1. -> our decision (client: `ClientAcceptTag`, server: `ServerAcceptTag`)
 /// 2. <- the peer's decision
 ///
 /// The peer's user may still be deciding, so the read waits up to
 /// [`PAIRING_TIMEOUT`] + [`TIMEOUT`]. We always send our decision, even a
-/// rejection, so the peer doesn't wait for nothing.
+/// rejection or a timeout, so the peer doesn't wait for nothing.
 ///
 /// Returns `Ok(())` only if both users accepted.
 async fn confirm_pairing(
     secure_connection: &mut SecureConnection,
     role: Role,
     handshake_hash: &Zeroizing<[u8; 32]>,
-    pair_fallback: fn(&String, &[u8; 32]) -> bool,
+    pairing: &Pairing,
 ) -> Result<(), AuthSnowErrors> {
-    // ask the user on a blocking thread, so tokio isn't blocked meanwhile
-    let name_clone = secure_connection.connection.name.clone();
-    let handshake_hash_clone = handshake_hash.clone();
-
-    let accept = timeout(
-        Duration::from_secs(PAIRING_TIMEOUT),
-        spawn_blocking(move || pair_fallback(&name_clone, &handshake_hash_clone)),
+    let asked = ask_user(
+        pairing,
+        secure_connection.connection.name.clone(),
+        handshake_hash,
     )
-    .await
-    .map_err(|_| AuthSnowErrors::PairingTimeout)?
-    .map_err(|_| AuthSnowErrors::FailedToPairNewDevice)?;
+    .await;
+    let accept = matches!(asked, Ok(true));
 
     let (our_tag, peer_tag, peer_rejected) = match role {
         Role::Client => (
@@ -1096,7 +1249,8 @@ async fn confirm_pairing(
     send_secure(secure_connection, &decision, our_tag, TIMEOUT).await?;
 
     if !accept {
-        return Err(AuthSnowErrors::FailedToPairNewDevice);
+        // a timeout stays visible as such, everything else is a rejection
+        return Err(asked.err().unwrap_or(AuthSnowErrors::FailedToPairNewDevice));
     }
 
     // 2. the peer's decision
@@ -1583,7 +1737,7 @@ async fn finish_auth(
     identified: Result<Result<Option<Identified>, AuthSnowErrors>, tokio::time::error::Elapsed>,
     role: Role,
     trusted_peers: &TrustedPeers,
-    pair_fallback: fn(&String, &[u8; 32]) -> bool,
+    pairing: &Pairing,
 ) -> Result<Option<(SecureConnection, TrustedPeer)>, AuthSnowErrors> {
     let Some((mut secure_connection, peer, handshake_hash, both_saved)) =
         identified.map_err(|_| AuthSnowErrors::HandshakeTimeout)??
@@ -1598,8 +1752,11 @@ async fn finish_auth(
             return Err(AuthSnowErrors::FailedToPairNewDevice);
         }
 
-        confirm_pairing(&mut secure_connection, role, &handshake_hash, pair_fallback).await?;
+        confirm_pairing(&mut secure_connection, role, &handshake_hash, pairing).await?;
         save_peer(trusted_peers, &peer).await?;
+
+        // the owner writes the new list to the vault
+        pairing.saved.notify_one();
     }
 
     Ok(Some((secure_connection, peer)))
@@ -1619,7 +1776,7 @@ pub async fn auth_incoming(
     device_keypairs: &DeviceKeypairs,
     trusted_peers: TrustedPeers,
     incoming_connection: IncomingConnection,
-    pair_fallback: fn(&String, &[u8; 32]) -> bool,
+    pairing: &Pairing,
 ) -> Result<Option<(SecureConnection, TrustedPeer)>, AuthSnowErrors> {
     // cloned, so the read lock is released before any network I/O
     let a_key = keys.read().await.a_key.clone();
@@ -1631,7 +1788,7 @@ pub async fn auth_incoming(
     )
     .await;
 
-    finish_auth(identified, Role::Server, &trusted_peers, pair_fallback).await
+    finish_auth(identified, Role::Server, &trusted_peers, pairing).await
 }
 
 /// Authenticates an outgoing connection (client side). Mirrors [`auth_incoming`].
@@ -1644,7 +1801,7 @@ pub async fn auth_outgoing(
     device_keypairs: &DeviceKeypairs,
     trusted_peers: TrustedPeers,
     outgoing_connection: IncomingConnection,
-    pair_fallback: fn(&String, &[u8; 32]) -> bool,
+    pairing: &Pairing,
 ) -> Result<Option<(SecureConnection, TrustedPeer)>, AuthSnowErrors> {
     let a_key = keys.read().await.a_key.clone();
 
@@ -1655,7 +1812,7 @@ pub async fn auth_outgoing(
     )
     .await;
 
-    finish_auth(identified, Role::Client, &trusted_peers, pair_fallback).await
+    finish_auth(identified, Role::Client, &trusted_peers, pairing).await
 }
 
 #[cfg(test)]
@@ -1667,15 +1824,15 @@ mod tests {
 
     const TEST_A_KEY: [u8; 32] = [0xAB; 32];
 
-    /// Pairing callback that accepts every device.
-    fn accept_all(_name: &String, _hash: &[u8; 32]) -> bool {
-        true
+    /// Pairing that accepts every device.
+    fn accept_all() -> Pairing {
+        Pairing::answer_all(true)
     }
 
-    /// Pairing callback for peers that must already be known: fails the test
-    /// path by rejecting, so an unexpected prompt shows up as an error.
-    fn must_not_prompt(_name: &String, _hash: &[u8; 32]) -> bool {
-        false
+    /// Pairing for peers that must already be known: rejects, so an
+    /// unexpected prompt shows up as an error.
+    fn must_not_prompt() -> Pairing {
+        Pairing::answer_all(false)
     }
 
     /// One side of a test connection: keys, identity and trusted list.
@@ -1704,8 +1861,8 @@ mod tests {
     async fn handshake(
         server: &Device,
         client: &Device,
-        server_pair: fn(&String, &[u8; 32]) -> bool,
-        client_pair: fn(&String, &[u8; 32]) -> bool,
+        server_pair: Pairing,
+        client_pair: Pairing,
     ) -> (AuthResult, AuthResult) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1717,7 +1874,7 @@ mod tests {
                 &server.keypairs,
                 server.peers.clone(),
                 IncomingConnection::new(stream, peer_addr),
-                server_pair,
+                &server_pair,
             )
             .await
         };
@@ -1729,7 +1886,7 @@ mod tests {
                 &client.keypairs,
                 client.peers.clone(),
                 IncomingConnection::new(stream, addr),
-                client_pair,
+                &client_pair,
             )
             .await
         };
@@ -1744,7 +1901,7 @@ mod tests {
         let client = Device::new(TEST_A_KEY);
 
         let (server_result, client_result) =
-            handshake(&server, &client, accept_all, accept_all).await;
+            handshake(&server, &client, accept_all(), accept_all()).await;
 
         let (mut server_conn, client_as_seen) = server_result.unwrap().unwrap();
         let (mut client_conn, server_as_seen) = client_result.unwrap().unwrap();
@@ -1795,11 +1952,11 @@ mod tests {
         let server = Device::new(TEST_A_KEY);
         let client = Device::new(TEST_A_KEY);
 
-        let (s, c) = handshake(&server, &client, accept_all, accept_all).await;
+        let (s, c) = handshake(&server, &client, accept_all(), accept_all()).await;
         assert!(s.unwrap().is_some() && c.unwrap().is_some());
 
         // must_not_prompt rejects, so this only succeeds if nobody is asked
-        let (s, c) = handshake(&server, &client, must_not_prompt, must_not_prompt).await;
+        let (s, c) = handshake(&server, &client, must_not_prompt(), must_not_prompt()).await;
 
         assert!(s.unwrap().is_some());
         assert!(c.unwrap().is_some());
@@ -1813,16 +1970,16 @@ mod tests {
         let server = Device::new(TEST_A_KEY);
         let client = Device::new(TEST_A_KEY);
 
-        let (s, c) = handshake(&server, &client, accept_all, accept_all).await;
+        let (s, c) = handshake(&server, &client, accept_all(), accept_all()).await;
         assert!(s.unwrap().is_some() && c.unwrap().is_some());
 
         client.peers.write().await.clear();
 
         // the server still knows the client, but both must confirm again
-        let (s, c) = handshake(&server, &client, must_not_prompt, accept_all).await;
+        let (s, c) = handshake(&server, &client, must_not_prompt(), accept_all()).await;
         assert!(s.is_err() && c.is_err());
 
-        let (s, c) = handshake(&server, &client, accept_all, accept_all).await;
+        let (s, c) = handshake(&server, &client, accept_all(), accept_all()).await;
         assert!(s.unwrap().is_some() && c.unwrap().is_some());
 
         // no duplicate entry on the side that never forgot
@@ -1836,7 +1993,7 @@ mod tests {
         let server = Device::new(TEST_A_KEY);
         let mut client = Device::new(TEST_A_KEY);
 
-        let (s, c) = handshake(&server, &client, accept_all, accept_all).await;
+        let (s, c) = handshake(&server, &client, accept_all(), accept_all()).await;
         assert!(s.unwrap().is_some() && c.unwrap().is_some());
 
         // same Noise static key, new ML-DSA identity
@@ -1845,7 +2002,7 @@ mod tests {
             mldsa_kep: generate_key_pair(*random_array::<32>().unwrap()),
         };
 
-        let (s, c) = handshake(&server, &client, accept_all, accept_all).await;
+        let (s, c) = handshake(&server, &client, accept_all(), accept_all()).await;
 
         assert_eq!(s.err(), Some(AuthSnowErrors::PeerKeyMismatch));
         assert!(c.is_err());
@@ -1857,7 +2014,7 @@ mod tests {
         let server = Device::new(TEST_A_KEY);
         let client = Device::new([0x11; 32]);
 
-        let (s, c) = handshake(&server, &client, accept_all, accept_all).await;
+        let (s, c) = handshake(&server, &client, accept_all(), accept_all()).await;
 
         assert!(s.unwrap().is_none());
         // the server closes instead of sending its confirmation
@@ -1866,13 +2023,169 @@ mod tests {
         assert!(client.peers.read().await.is_empty());
     }
 
+    /// A pairing channel that answers `accept` and hands every request's
+    /// code back to the test.
+    fn recording(accept: bool) -> (Pairing, mpsc::UnboundedReceiver<PairingCode>, Arc<Notify>) {
+        let (pairing, mut inbox) = Pairing::channel();
+        let (codes, seen) = mpsc::unbounded_channel();
+        let saved = inbox.saved.clone();
+
+        tokio::spawn(async move {
+            while let Some(request) = inbox.requests.recv().await {
+                codes.send(request.code).unwrap();
+                request.answer(accept);
+            }
+        });
+
+        (pairing, seen, saved)
+    }
+
+    /// Test that both devices are shown the same pairing code, every symbol
+    /// is in the table, and another connection gets another code
+    #[tokio::test]
+    async fn test_pairing_code_same_on_both_sides() {
+        use cesa_conn_system::pairing_code::is_valid;
+
+        let server = Device::new(TEST_A_KEY);
+        let client = Device::new(TEST_A_KEY);
+        let (server_pair, mut server_codes, _) = recording(false);
+        let (client_pair, mut client_codes, _) = recording(false);
+
+        // rejected, so the next connection asks again
+        let _ = handshake(&server, &client, server_pair.clone(), client_pair.clone()).await;
+        let _ = handshake(&server, &client, server_pair, client_pair).await;
+
+        let (first_s, first_c) = (
+            server_codes.recv().await.unwrap(),
+            client_codes.recv().await.unwrap(),
+        );
+        let (second_s, second_c) = (
+            server_codes.recv().await.unwrap(),
+            client_codes.recv().await.unwrap(),
+        );
+
+        assert_eq!(first_s, first_c);
+        assert_eq!(second_s, second_c);
+        assert!(is_valid(&first_s) && is_valid(&second_s));
+        // 48 bits: two handshakes colliding would be a 1 in 2^48 accident
+        assert_ne!(first_s, second_s);
+    }
+
+    /// Test that the code is exactly the 48 HKDF bits, 6 per symbol, first
+    /// symbol = highest bits, and that it depends on the handshake hash
+    #[test]
+    fn test_pairing_code_derivation() {
+        let hash = [7u8; 32];
+        let mut okm = [0u8; 6];
+        SimpleHkdf::<Blake2s256>::new(None, &hash)
+            .expand(PAIRING_CODE_LABEL, &mut okm)
+            .unwrap();
+
+        let bits: Vec<char> = okm
+            .iter()
+            .flat_map(|b| format!("{b:08b}").chars().collect::<Vec<_>>())
+            .collect();
+        let expected: Vec<u8> = bits
+            .chunks(6)
+            .map(|symbol| u8::from_str_radix(&symbol.iter().collect::<String>(), 2).unwrap())
+            .collect();
+
+        assert_eq!(pairing_code(&hash).unwrap().to_vec(), expected);
+        assert_eq!(pairing_code(&hash).unwrap(), pairing_code(&hash).unwrap());
+        assert_ne!(
+            pairing_code(&hash).unwrap(),
+            pairing_code(&[8u8; 32]).unwrap()
+        );
+    }
+
+    /// Test that a request dropped without an answer (UI gone, networking
+    /// stopped) rejects at once and tells the peer, instead of waiting out
+    /// PAIRING_TIMEOUT
+    #[tokio::test]
+    async fn test_dropped_request_rejects_at_once() {
+        let server = Device::new(TEST_A_KEY);
+        let client = Device::new(TEST_A_KEY);
+        let (server_pair, mut inbox) = Pairing::channel();
+
+        tokio::spawn(async move {
+            while let Some(request) = inbox.requests.recv().await {
+                drop(request);
+            }
+        });
+
+        let started = tokio::time::Instant::now();
+        let (s, c) = handshake(&server, &client, server_pair, accept_all()).await;
+
+        assert_eq!(s.err(), Some(AuthSnowErrors::FailedToPairNewDevice));
+        assert_eq!(c.err(), Some(AuthSnowErrors::NoServerConfirmation));
+        assert!(started.elapsed() < Duration::from_secs(PAIRING_TIMEOUT));
+        assert!(server.peers.read().await.is_empty());
+        assert!(client.peers.read().await.is_empty());
+    }
+
+    /// Test that with MAX_PENDING_PAIRINGS prompts already waiting, the next
+    /// one is rejected at once instead of queued
+    #[tokio::test]
+    async fn test_full_pairing_queue_rejects_at_once() {
+        let server = Device::new(TEST_A_KEY);
+        let client = Device::new(TEST_A_KEY);
+        // never read: the queue stays full
+        let (server_pair, _inbox) = Pairing::channel();
+        let mut waiting = Vec::new();
+
+        for _ in 0..MAX_PENDING_PAIRINGS {
+            let (decision, answer) = oneshot::channel();
+            waiting.push(answer);
+            server_pair
+                .requests
+                .try_send(PairingRequest {
+                    name: "queued".into(),
+                    code: [0; PAIRING_CODE_LEN],
+                    decision,
+                })
+                .unwrap_or_else(|_| panic!("queue full too early"));
+        }
+
+        let started = tokio::time::Instant::now();
+        let (s, c) = handshake(&server, &client, server_pair, accept_all()).await;
+
+        assert_eq!(s.err(), Some(AuthSnowErrors::FailedToPairNewDevice));
+        assert_eq!(c.err(), Some(AuthSnowErrors::NoServerConfirmation));
+        assert!(started.elapsed() < Duration::from_secs(PAIRING_TIMEOUT));
+        assert!(server.peers.read().await.is_empty());
+    }
+
+    /// Test that the owner is told after a new peer was saved (so it can
+    /// write the vault), and not when nothing was paired
+    #[tokio::test]
+    async fn test_saved_peer_is_announced() {
+        let server = Device::new(TEST_A_KEY);
+        let client = Device::new(TEST_A_KEY);
+        let (server_pair, _codes, saved) = recording(true);
+
+        let (s, c) = handshake(&server, &client, server_pair.clone(), accept_all()).await;
+        assert!(s.is_ok() && c.is_ok());
+        timeout(Duration::from_secs(1), saved.notified())
+            .await
+            .expect("no saved signal after pairing");
+
+        // known to each other now: no pairing, no signal
+        let (s, c) = handshake(&server, &client, server_pair, must_not_prompt()).await;
+        assert!(s.is_ok() && c.is_ok());
+        assert!(
+            timeout(Duration::from_millis(200), saved.notified())
+                .await
+                .is_err()
+        );
+    }
+
     /// Test that a rejection on either side means nobody saves anybody
     #[tokio::test]
     async fn test_client_rejects_pairing() {
         let server = Device::new(TEST_A_KEY);
         let client = Device::new(TEST_A_KEY);
 
-        let (s, c) = handshake(&server, &client, accept_all, must_not_prompt).await;
+        let (s, c) = handshake(&server, &client, accept_all(), must_not_prompt()).await;
 
         assert_eq!(s.err(), Some(AuthSnowErrors::NoClientConfirmation));
         assert_eq!(c.err(), Some(AuthSnowErrors::FailedToPairNewDevice));
@@ -1886,7 +2199,7 @@ mod tests {
         let server = Device::new(TEST_A_KEY);
         let client = Device::new(TEST_A_KEY);
 
-        let (_s, c) = handshake(&server, &client, accept_all, accept_all).await;
+        let (_s, c) = handshake(&server, &client, accept_all(), accept_all()).await;
         let (mut conn, _) = c.unwrap().unwrap();
 
         let too_big = vec![0u8; SECURE_MSG_MAX_PAYLOAD + 1];
@@ -1908,7 +2221,7 @@ mod tests {
         let server = Device::new(TEST_A_KEY);
         let client = Device::new(TEST_A_KEY);
 
-        let (s, c) = handshake(&server, &client, accept_all, accept_all).await;
+        let (s, c) = handshake(&server, &client, accept_all(), accept_all()).await;
         let (mut server_conn, _) = s.unwrap().unwrap();
         let (mut client_conn, _) = c.unwrap().unwrap();
 
@@ -1928,7 +2241,7 @@ mod tests {
         let server = Device::new(TEST_A_KEY);
         let client = Device::new(TEST_A_KEY);
 
-        let (s, c) = handshake(&server, &client, accept_all, accept_all).await;
+        let (s, c) = handshake(&server, &client, accept_all(), accept_all()).await;
         let (mut server_conn, _) = s.unwrap().unwrap();
         let (mut client_conn, _) = c.unwrap().unwrap();
 
@@ -1957,7 +2270,7 @@ mod tests {
         let server = Device::new(TEST_A_KEY);
         let client = Device::new(TEST_A_KEY);
 
-        let (s, c) = handshake(&server, &client, accept_all, accept_all).await;
+        let (s, c) = handshake(&server, &client, accept_all(), accept_all()).await;
         let (mut server_conn, _) = s.unwrap().unwrap();
         let (mut client_conn, _) = c.unwrap().unwrap();
 
@@ -1979,7 +2292,7 @@ mod tests {
         let server = Device::new(TEST_A_KEY);
         let client = Device::new(TEST_A_KEY);
 
-        let (s, c) = handshake(&server, &client, accept_all, accept_all).await;
+        let (s, c) = handshake(&server, &client, accept_all(), accept_all()).await;
         let (mut server_conn, _) = s.unwrap().unwrap();
         let (mut client_conn, _) = c.unwrap().unwrap();
 
@@ -1999,7 +2312,7 @@ mod tests {
         let server = Device::new(TEST_A_KEY);
         let client = Device::new(TEST_A_KEY);
 
-        let (s, c) = handshake(&server, &client, accept_all, accept_all).await;
+        let (s, c) = handshake(&server, &client, accept_all(), accept_all()).await;
         let (mut server_conn, _) = s.unwrap().unwrap();
         let (mut client_conn, _) = c.unwrap().unwrap();
 
@@ -2026,7 +2339,7 @@ mod tests {
         let server = Device::new(TEST_A_KEY);
         let client = Device::new(TEST_A_KEY);
 
-        let (s, c) = handshake(&server, &client, accept_all, accept_all).await;
+        let (s, c) = handshake(&server, &client, accept_all(), accept_all()).await;
         let (mut server_conn, _) = s.unwrap().unwrap();
         let (mut client_conn, _) = c.unwrap().unwrap();
 
@@ -2047,7 +2360,7 @@ mod tests {
         let client = Device::new(TEST_A_KEY);
         let d_key = DataKey::from_bytes(&[9u8; 32]);
 
-        let (s, c) = handshake(&server, &client, accept_all, accept_all).await;
+        let (s, c) = handshake(&server, &client, accept_all(), accept_all()).await;
         let (server_conn, _) = s.unwrap().unwrap();
         let (client_conn, _) = c.unwrap().unwrap();
 
@@ -2060,7 +2373,7 @@ mod tests {
         assert_ne!(*c2s_client, *s2c_client);
 
         // a new connection gets new keys (new handshake hash)
-        let (_s2, c2) = handshake(&server, &client, accept_all, accept_all).await;
+        let (_s2, c2) = handshake(&server, &client, accept_all(), accept_all()).await;
         let (client_conn2, _) = c2.unwrap().unwrap();
         assert_ne!(*client_conn2.data_key(&d_key, true).unwrap(), *c2s_client);
     }
@@ -2073,7 +2386,7 @@ mod tests {
             .unwrap_err();
         let peers: TrustedPeers = Arc::new(RwLock::new(Vec::new()));
 
-        let result = finish_auth(Err(elapsed), Role::Server, &peers, accept_all).await;
+        let result = finish_auth(Err(elapsed), Role::Server, &peers, &accept_all()).await;
 
         assert_eq!(result.err(), Some(AuthSnowErrors::HandshakeTimeout));
         assert!(peers.read().await.is_empty());
@@ -2096,7 +2409,7 @@ mod tests {
             &server.keypairs,
             server.peers.clone(),
             IncomingConnection::new(stream, peer_addr),
-            accept_all,
+            &accept_all(),
         )
         .await;
 

@@ -32,8 +32,9 @@ const VERSION: u8 = 1;
 const ANNOUNCEMENT_LEN: usize = 8 + 1 + 16;
 
 /// Random id of one running instance, so a device ignores its own broadcasts.
-/// Not a secret and not an identity: it changes on every start.
-#[derive(Clone, Copy, PartialEq, Debug)]
+/// Not a secret and not an identity: it changes on every start. Ordered, so
+/// two devices that find each other can agree which one connects.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct InstanceId([u8; 16]);
 
 impl InstanceId {
@@ -156,6 +157,8 @@ pub async fn udp_broadcast_presence(
 /// Packets that aren't a valid announcement, and our own (`own_id`), are
 /// skipped. The address is only a hint: it is NOT authenticated, the TCP
 /// handshake decides trust.
+// only the manual test commands use it (the daemon wants every device)
+#[cfg(any(test, feature = "test-commands"))]
 pub async fn udp_find_broadcaster(
     duration: u64,
     own_id: InstanceId,
@@ -211,6 +214,81 @@ pub async fn udp_find_broadcaster(
             }
         }
     }
+}
+
+/// Most devices one [`udp_find_broadcasters`] search reports.
+pub const MAX_FOUND_DEVICES: usize = 16;
+
+/// Listens for announcements of OTHER devices for `duration` seconds (capped
+/// at [`MAX_BROADCAST_DURATION`]) and returns one entry per sending IP (the
+/// first instance heard from it), at most [`MAX_FOUND_DEVICES`]; an empty
+/// list if nobody answered.
+///
+/// Per IP, because only the IP is used: a flood of made-up ids from one
+/// address can't fill the list and push real devices out. It keeps
+/// listening until the deadline either way, so the search always takes
+/// `duration` (no early end to race for).
+///
+/// Same rules as [`udp_find_broadcaster`]: junk and our own announcements are
+/// skipped, one deadline for the whole search, the addresses are only hints.
+pub async fn udp_find_broadcasters(
+    duration: u64,
+    own_id: InstanceId,
+) -> Result<Vec<(SocketAddr, InstanceId)>, UdpNetworkerErrors> {
+    let duration = duration.min(MAX_BROADCAST_DURATION);
+    // one deadline for the whole search, junk packets can't extend it
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(duration))
+        .ok_or(UdpNetworkerErrors::Timeout)?;
+
+    // Broadcasts only arrive on a wildcard bind.
+    // nosemgrep: cesa.net.bind-all-interfaces
+    let socket = UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT))
+        .await
+        .map_err(|e| {
+            error!(error = %e, port = DISCOVERY_PORT, "failed to bind UDP socket for discovery");
+            UdpNetworkerErrors::FailedToBindSocket
+        })?;
+
+    info!(
+        timeout_secs = duration,
+        "searching for all CesaConn devices on the network"
+    );
+
+    // one byte bigger than an announcement, so a longer packet is detectable
+    let mut buf = [0u8; ANNOUNCEMENT_LEN + 1];
+    let mut found: Vec<(SocketAddr, InstanceId)> = Vec::new();
+    let mut full = false;
+
+    loop {
+        let Ok(received) = timeout_at(deadline, socket.recv_from(&mut buf)).await else {
+            break;
+        };
+        let (len, addr) = received.map_err(|e| {
+            error!(error = %e, "failed to receive UDP packet");
+            UdpNetworkerErrors::FailedToFetchResult
+        })?;
+
+        match buf.get(..len).and_then(parse_announcement) {
+            Some(id) if id == own_id => debug!(%addr, "ignoring our own announcement"),
+            Some(_) if found.iter().any(|(known, _)| known.ip() == addr.ip()) => {}
+            Some(_) if found.len() >= MAX_FOUND_DEVICES => full = true,
+            Some(id) => {
+                info!(%addr, "found CesaConn device (unauthenticated hint)");
+                found.push((addr, id));
+            }
+            None => debug!(%addr, len, "ignoring packet that isn't an announcement"),
+        }
+    }
+
+    if full {
+        warn!(
+            max = MAX_FOUND_DEVICES,
+            "more devices answered than one search keeps, ignored the rest"
+        );
+    }
+
+    Ok(found)
 }
 
 #[cfg(test)]
@@ -319,6 +397,38 @@ mod tests {
         send_local(b"garbage").await;
 
         assert_eq!(handle.await.unwrap(), Err(UdpNetworkerErrors::Timeout));
+    }
+
+    /// Test that a search for all devices reports each sending address once
+    /// (many ids from one address are one device, so a flood of made-up ids
+    /// can't fill the list) and skips our own announcement and junk
+    #[tokio::test]
+    async fn test_finds_each_address_once() {
+        let _guard = port_lock().lock().await;
+        let own = InstanceId::generate().unwrap();
+        let handle = tokio::spawn(async move { udp_find_broadcasters(1, own).await });
+        sleep(Duration::from_millis(100)).await;
+
+        // all from 127.0.0.1: the first real one counts, the flood doesn't
+        send_local(&announcement(own)).await;
+        send_local(b"garbage").await;
+        let first = InstanceId([1; 16]);
+        send_local(&announcement(first)).await;
+        for byte in 2..=40u8 {
+            send_local(&announcement(InstanceId([byte; 16]))).await;
+        }
+
+        let found = handle.await.unwrap().unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1, first);
+    }
+
+    /// Test that a search nobody answers ends with an empty list, not an error
+    #[tokio::test]
+    async fn test_find_all_nobody_answers() {
+        let _guard = port_lock().lock().await;
+        let found = udp_find_broadcasters(1, InstanceId::generate().unwrap()).await;
+        assert_eq!(found, Ok(Vec::new()));
     }
 
     /// Test that every error has a non-empty message

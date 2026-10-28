@@ -16,33 +16,32 @@ use tracing::error;
 use zeroize::Zeroizing;
 
 use cesa_conn_crypto::{crand::random_array, pswd_manager::derive_key};
+use cesa_conn_system::pairing_code::{PairingCode, symbol};
 
 use crate::{
-    auth_snow::{AuthKey, DataKey, DeviceKeypairs, Keys},
+    auth_snow::{AuthKey, DataKey, DeviceKeypairs, Keys, Pairing},
     guess_limiter::GuessLimiter,
-    tcp_networker::{ActionType, NetworkerContext, connect, recv},
+    tcp_networker::{ActionType, NetworkerContext, TCP_PORT, connect, recv},
     udp_networker::{InstanceId, UdpNetworkerErrors, udp_broadcast_presence, udp_find_broadcaster},
 };
-
-/// TCP port the test server listens on.
-const TEST_PORT: u16 = 3232;
 
 /// a_salt (32) + d_salt (32), hex encoded on the command line
 const SALTS_LEN: usize = 64;
 
-/// Asks on the terminal whether to pair with a new device.
-///
-/// Shows the first 8 bytes of the handshake hash, the user compares them with
-/// the other device before accepting (they only match without a MITM).
-fn pair_prompt(name: &String, handshake_hash: &[u8; 32]) -> bool {
-    let code: String = handshake_hash
-        .iter()
-        .take(8)
-        .map(|b| format!("{b:02X}"))
+/// The pairing code as `emoji name` pairs, the way the UI shows it.
+fn describe_code(code: &PairingCode) -> String {
+    code.iter()
+        .filter_map(|&index| symbol(index))
+        .map(|(emoji, name)| format!("{emoji} {name}"))
         .collect::<Vec<_>>()
-        .join(" ");
+        .join("  ")
+}
 
-    print!("Pair with {name}? Check that the other device shows: {code}  [y/N] ");
+/// Asks on the terminal whether to pair with a new device. The user
+/// compares the pairing code with the other device before accepting (the
+/// codes only match without a MITM).
+fn pair_prompt(prompt: &str) -> bool {
+    print!("{prompt}");
 
     if io::stdout().flush().is_err() {
         return false;
@@ -55,6 +54,31 @@ fn pair_prompt(name: &String, handshake_hash: &[u8; 32]) -> bool {
     }
 
     matches!(answer.trim(), "y" | "Y" | "yes")
+}
+
+/// Asks on the terminal about every new device, one at a time.
+fn terminal_pairing() -> Pairing {
+    let (pairing, mut inbox) = Pairing::channel();
+
+    tokio::spawn(async move {
+        // an in-process channel, not the network: ends with the senders
+        // nosemgrep: cesa.net.read-without-timeout
+        while let Some(request) = inbox.requests.recv().await {
+            let prompt = format!(
+                "Pair with {}? Check that the other device shows:\n  {}\n[y/N] ",
+                request.name,
+                describe_code(&request.code)
+            );
+            // stdin blocks: off the async workers
+            let accept = tokio::task::spawn_blocking(move || pair_prompt(&prompt))
+                .await
+                .unwrap_or(false);
+
+            request.answer(accept);
+        }
+    });
+
+    pairing
 }
 
 /// Shared networker state for the test subcommands.
@@ -72,7 +96,7 @@ fn make_context(keys: Arc<RwLock<Keys>>) -> Option<NetworkerContext> {
         keys,
         device_keypairs: Arc::new(device_keypairs),
         trusted_peers: Arc::new(RwLock::new(Vec::new())),
-        pair_fallback: pair_prompt,
+        pairing: terminal_pairing(),
         guess_limiter: Arc::new(GuessLimiter::new()),
     })
 }
@@ -189,10 +213,10 @@ async fn servertest(password: &str) {
     // Test server: peers on the LAN must reach it; every connection is
     // authenticated before any data is processed.
     // nosemgrep: cesa.net.bind-all-interfaces
-    let listener = match TcpListener::bind(("0.0.0.0", TEST_PORT)).await {
+    let listener = match TcpListener::bind(("0.0.0.0", TCP_PORT)).await {
         Ok(listener) => listener,
         Err(e) => {
-            error!(error = %e, port = TEST_PORT, "failed to bind TCP listener");
+            error!(error = %e, port = TCP_PORT, "failed to bind TCP listener");
             return;
         }
     };
@@ -237,7 +261,7 @@ async fn clienttest(message: &str, password: &str, salts_hex: &str) {
     };
 
     // only the IP comes from discovery (an unauthenticated hint), the port is fixed
-    let connect_addr = SocketAddr::new(server_addr.ip(), TEST_PORT);
+    let connect_addr = SocketAddr::new(server_addr.ip(), TCP_PORT);
 
     let Some(context) = make_context(keys) else {
         return;
