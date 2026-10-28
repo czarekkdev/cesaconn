@@ -185,15 +185,17 @@ Tasks today:
 - the IPC server (`ipc_server::serve`), one task per UI connection;
 - one task per state change (so an IPC deadline can't cancel it halfway).
 
-Tasks once networking starts **[planned]**:
+Tasks while networking runs **[built]** (section 13):
 - the TCP listener (`tcp_networker::recv`), one task per connection;
-- UDP discovery (announce + listen);
-- outgoing connections (`tcp_networker::connect`), one task each;
-- the pairing prompt bridge to the UI (section 13).
+- the pairing bridge: pairing requests from the handshakes to the UI, and
+  re-sealing the vault after a new peer was saved;
+- during an "Add device" window: UDP announce + search, then one task per
+  outgoing connection.
 
 Shutdown: Ctrl-C cancels a `CancellationToken`; the IPC server stops
-accepting, the daemon waits for it and removes its socket file (best effort;
-a stale socket is replaced on the next start anyway).
+accepting, the daemon waits for it, stops networking (the bridge saves the
+peers once more, at most 5 s) and removes its socket file (best effort; a
+stale socket is replaced on the next start anyway).
 
 ### 5.2 Shared state **[built]**
 
@@ -204,6 +206,10 @@ pub struct Daemon {
     derive_slot: Arc<Semaphore>,                 // 1: one Argon2 run (64 MiB) at a time
     change_slot: Arc<Semaphore>,                 // 1: one state change at a time
     storage: Option<Storage>,                    // None = RAM only
+    network: RwLock<Option<Network>>,            // token, NetworkerContext, bridge
+    pairings: RwLock<PendingPairings>,           // requests waiting for the user
+    adding: AtomicBool,                          // "Add device" window open
+    guess_limiter: Arc<GuessLimiter>,            // one for the daemon's lifetime
 }
 
 struct KeySlots {
@@ -258,8 +264,11 @@ stateDiagram-v2
 ```
 
 `Status` shows it: `auth_key_set`, `data_key_set`, `locked`, `saved`,
-`auto_login`, `network_running` (always `false` until section 13 is built),
-`trusted_peers`.
+`auto_login`, `sync_enabled`, `network_running`, `adding_device`,
+`trusted_peers`, `unlock_wait_secs`, `pending_pairings`.
+
+Networking runs exactly while the vault is open, both keys are set and the
+Sync switch is on (section 13); every state change re-checks it.
 
 Without storage (Linux and others today, or no safe data directory) the
 daemon is RAM only: keys are gone after a restart, `Unlock` and
@@ -401,7 +410,7 @@ Frames that carry a request are read into `Zeroizing` buffers (a request may
 hold a password). Compile-time asserts keep the largest request and the
 largest `ListPeers` answer under `MAX_FRAME_LEN`.
 
-### 7.4 Wire format, version 3 **[built]**
+### 7.4 Wire format, version 4 **[built]**
 
 ```
 frame    = length (u32 LE, 1..=MAX_FRAME_LEN) || body
@@ -412,19 +421,29 @@ response = 0x00 || payload        (success)
 
 | Kind | Request | Payload | Success payload |
 |---|---|---|---|
-| `0x01` | Status | none | `flags (1) \|\| trusted peers (u32 LE) \|\| unlock wait (u16 LE, seconds)` |
+| `0x01` | Status | none | `flags (1) \|\| trusted peers (u32 LE) \|\| unlock wait (u16 LE, seconds) \|\| pending pairings (u8)` |
 | `0x04` | ListPeers | none | `count (u16 LE) \|\| count * (fingerprint (8) \|\| name len (1) \|\| name)` |
 | `0x05` | SetAuthPassword | `password` | empty |
 | `0x06` | SetDataPassword | `password` | empty |
 | `0x07` | Unlock | `password` (the data password) | empty |
 | `0x08` | SetAutoLogin | exactly `0x00` or `0x01` | empty |
+| `0x09` | SetSync | exactly `0x00` or `0x01` | empty |
+| `0x0A` | AddDevice | none | empty (the window runs in the background) |
+| `0x0B` | PendingPairing | none | `0x00` (none) or `0x01 \|\| id (u32 LE) \|\| code (8) \|\| name len (1) \|\| name` |
+| `0x0C` | AnswerPairing | `id (u32 LE) \|\| accept (exactly 0x00 or 0x01)` | empty |
 | `0x02`, `0x03` | retired (v1 sent `salt \|\| password`) | refused, so a mismatched UI and daemon fail loudly | |
 
 Status flags: bit 0 auth key set, 1 data key set, 2 network running, 3 vault
-locked, 4 keys saved, 5 automatic login. Any other bit set is `Malformed`.
-Unlock wait: seconds until `Unlock` is accepted again (0 = now). Version 2
-had no unlock wait; a version 2 status is `Malformed`, so a mismatched UI and
-daemon fail loudly.
+locked, 4 keys saved, 5 automatic login, 6 Sync switched on, 7 "Add device"
+window open. Unlock wait: seconds until `Unlock` is accepted again (0 =
+now). Pending pairings: how many wait for the user; the UI asks
+`PendingPairing` only then. Versions 2 and 3 had shorter status answers; they
+are `Malformed`, so a mismatched UI and daemon fail loudly.
+
+`PendingPairing` gives the oldest waiting pairing. Its code is 8 symbol
+indices, each below 64 (section 10.7); the decoder refuses anything else, a
+name that isn't UTF-8 and a name with control characters (it is printed in
+a terminal).
 
 A fingerprint is the first 8 bytes of the peer's X25519 static public key,
 for telling devices apart in the UI; it is not a security check. Names are cut
@@ -432,7 +451,9 @@ to 255 bytes on a char boundary.
 
 Error codes: `0x01` BadRequest, `0x02` KeyDerivationFailed, `0x03` Internal,
 `0x04` WrongPassword, `0x05` Locked, `0x06` StorageFailed, `0x07` NotSaved,
-`0x08` WeakPassword, `0x09` UnlockDelayed.
+`0x08` WeakPassword, `0x09` UnlockDelayed, `0x0A` NetworkOff (AddDevice
+while networking doesn't run), `0x0B` PairingExpired (no waiting pairing has
+that id: answered already, or timed out).
 
 Decoding is strict: anything not exactly well-formed is refused (`BadRequest`
 from the daemon, `Malformed` in the client), and responses are decoded for
@@ -452,7 +473,7 @@ the request they answer.
 
 The command set grows with the UI; it is not designed up front (his
 decision). Planned additions are listed where they are designed: section 11.7
-(groups) and 13 (sync switch, pairing prompt).
+(groups). The sync switch and the pairing prompt (section 13) are built.
 
 ---
 
@@ -496,9 +517,11 @@ data nonce (12) || AES-256-GCM(DEK, plaintext) (n*4096 + 16)  AAD = header || "c
   config there is. Unpadding is strict: every padding byte must be zero.
 - `contents` is TLV, `tag (1) || len (u32 LE) || value`, every tag exactly
   once and in this order, nothing after:
-  `0x01 a_key (32)`, `0x02 a_salt (32)`, `0x03 config (<= 64 KiB, empty today;
-  its inner format comes with the first setting, the Sync switch)`,
+  `0x01 a_key (32)`, `0x02 a_salt (32)`, `0x03 config (<= 64 KiB)`,
   `0x04 identity seed (64)`, `0x05 peers (<= 1 MiB)`.
+- config: `version 0x01 (1) || flags (1)`, flag bit 0 = Sync; every other
+  bit must be 0. Empty = all defaults (vaults written before there were
+  settings). Anything else is damaged (`StorageFailed` on unlock).
 - peers: `count (u16 LE) || count * (x25519 pub (32) || ML-DSA-87 vk (2592) ||
   name len (u8) || name)`, at most 256 peers, names at most 255 bytes with no
   control characters (no terminal escapes in the TUI), no duplicate keys,
@@ -538,7 +561,7 @@ to `StorageFailed`, with details only in the daemon log.
 
 ## 9. Network layer: discovery, listener, limits
 
-### 9.1 Discovery (UDP) **[built, not started by the daemon yet]**
+### 9.1 Discovery (UDP) **[built; the daemon runs it only in the "Add device" window]**
 
 - Port 3636. Announcement = `"CESACONN" (8) || version 0x01 (1) || instance id (16)`,
   25 bytes, sent to `255.255.255.255` once per second.
@@ -553,10 +576,17 @@ to `StorageFailed`, with details only in the daemon log.
   offline. So the result of discovery is only a hint where to connect: only
   the IP is used, the port is fixed, and trust is decided by the TCP handshake
   alone. Forged or replayed announcements can at most cause a failed connection.
+- The daemon does not announce itself all the time: only for the 20 s of an
+  "Add device" window (section 13), announcing and searching at the same
+  time. A search reports every distinct instance it heard, at most 16
+  (`MAX_FOUND_DEVICES`).
 
-### 9.2 TCP listener **[built, not started by the daemon yet]**
+### 9.2 TCP listener **[built]**
 
-- **[open]** the daemon's TCP port. The test commands use 3232.
+- Port 3232 (`TCP_PORT`), on every interface (paired devices on the LAN must
+  reach it), only while networking runs. The test commands use the same port.
+  If the port can't be bound, networking stays off and the UI shows the
+  network as "failed" (Sync on, not running).
 - At most 16 unauthenticated connections at once (`MAX_CONCURRENT_CONNECTIONS`);
   a connection over the cap is closed at once, not queued.
 - Each connection runs `recv_handler` in its own task, cancelled with the
@@ -745,29 +775,41 @@ A device is identified by both keys: the X25519 static key (Noise) and the
 ML-DSA-87 key (signatures). Both come from the 64-byte identity seed, and the
 seed is in the vault, so a restart is the same device and needs no new pairing.
 
-### 10.7 Phase 6: pairing confirmation **[built: protocol; planned: real prompt]**
+### 10.7 Phase 6: pairing confirmation **[built]**
 
 Runs only if `both_saved` is false (new device, or one side forgot the other):
 
 1. If 256 peers are already saved: refuse *before* asking the user. (That side
    then closes without sending a decision; the other side gives up after its
    wait in step 4.)
-2. Ask our user (`pair_fallback(name, handshake_hash)` on a blocking thread,
-   at most `PAIRING_TIMEOUT` = 60 s; timeout = reject).
-3. Send our decision, **even a rejection**, so the peer doesn't wait for
-   nothing: client tag `0x04`, server tag `0x06`.
+2. Ask our user: a `PairingRequest` (peer name, pairing code) goes into the
+   `Pairing` channel, and the answer comes back on a oneshot within
+   `PAIRING_TIMEOUT` = 60 s. The channel holds at most 4 requests
+   (`MAX_PENDING_PAIRINGS`); one more is rejected at once, never queued.
+   A request that is dropped unanswered (UI gone, networking stopped) is a
+   rejection right away; no answer in time is `PairingTimeout`.
+3. Send our decision, **even a rejection or a timeout**, so the peer doesn't
+   wait for nothing: client tag `0x04`, server tag `0x06`.
 4. Read the peer's decision, waiting up to 60 + 5 s (its user may still be
    deciding). Only `0x01` is acceptance.
 5. Only if both accepted: save the peer (under the write lock, no duplicates,
-   cap re-checked) and return the connection.
+   cap re-checked), signal the owner (`Pairing.saved`, so the daemon
+   re-seals the vault) and return the connection.
 
-Today `pair_fallback` is a plain blocking `fn` pointer, and the test commands
-show 8 hex bytes of the handshake hash. The real pairing code, decided:
-**8 emoji from a fixed 64-entry table (6 bits each, 48 bits), each always
-shown together with its name** (the names cover terminals that render emoji
-differently or as tofu), derived with HKDF from the handshake hash; `y/n` on
-both devices; 60 s timeout = reject. Its delivery through the daemon to the
-UI is section 13. **[planned]**
+The pairing code (his decision): **8 emoji from a fixed 64-entry table
+(6 bits each, 48 bits), each always shown together with its name** (the
+names cover terminals that render emoji differently or as tofu); `y/n` on
+both devices; 60 s timeout = reject.
+
+```
+okm  = HKDF-BLAKE2s(salt = none, ikm = handshake hash).expand("CesaConn-pairing-code", 6)
+code = the 48 bits of okm, big endian, cut into 8 symbols of 6 bits
+```
+
+The table is `cesa_conn_system::pairing_code::SYMBOLS` (single-code-point
+emoji, unique emoji and names; the order is part of the protocol). The code
+is derived in the networker; the daemon and the UI only get the 8 indices,
+never the handshake hash. The test commands print the same emoji + names.
 
 A MITM who knows `pw1` would have two different Noise sessions, so the two
 users would see different codes. 48 bits make a lucky match about 1 in 2.8 *
@@ -1046,22 +1088,70 @@ decided after an audit.
 
 ---
 
-## 13. Networking switch and pairing over IPC **[planned, next]**
+## 13. Networking switch and pairing over IPC **[built]**
 
-- A "Sync" switch in the UI, **off by default**, persisted in the vault config.
-- When the vault is open and Sync is on, the daemon builds
-  `DeviceKeypairs::from_seed(identity)` and starts the TCP listener and UDP
-  discovery with a `NetworkerContext` sharing its keys, peers and one
-  `GuessLimiter`. Sync off, lock or shutdown cancels them. `network_running`
-  in `Status` reports it.
-- `pair_fallback` (a blocking `fn` pointer) is replaced by an async request
-  daemon -> UI: the daemon holds the pending pairing (peer name, the 8-emoji
-  code) and the UI fetches and answers it over IPC. No answer within 60 s is a
-  rejection. The code is derived in the daemon; the UI only displays it (it is
-  not secret, but the handshake hash stays in the daemon).
-- A newly paired peer is saved to the vault at once (re-seal).
-- Done when two daemons pair once and reconnect after a restart without
-  re-pairing.
+**Sync switch.** "Sync" in the UI, **off by default**, saved in the vault
+config (`SetSync`; saved first, kept second). It needs an open, saved vault:
+`Locked` / `NotSaved` otherwise, so RAM-only platforms (Linux today) have no
+networking yet. Networking runs exactly while the vault is open, both keys
+are set and Sync is on; every state change (and automatic login at start)
+re-checks that. Starting it builds `DeviceKeypairs::from_seed(identity)` and
+one `NetworkerContext` (a copy of the keys, the daemon's trusted-peer list,
+a new `Pairing` channel, the daemon's one `GuessLimiter`) and binds the
+listener. Sync off or shutdown cancels the token: the listener, every
+connection, the bridge and an open "Add device" window stop, and every
+waiting pairing is rejected. A password change is handed to the running
+connections at once.
+
+**Add device** (his decision: outgoing connections only on this explicit
+action, never on every announcement, so strangers' devices on the same LAN
+don't burn each other's guess-limiter slots). `AddDevice` (only while
+networking runs, `NetworkOff` otherwise) opens one window at a time:
+1. for 20 s, announce this device and search at the same time (9.1), with
+   a fresh instance id;
+2. connect to every device found, only the IP from discovery, port 3232,
+   `ConnectNewDevice` (header only). Both devices hear each other, so only
+   the one with the **lower instance id connects**: one connection and one
+   prompt per device pair, not two;
+3. the window stays open until those connections are done and for 20 s more
+   (`HANDSHAKE_DEADLINE`), so the other device's connection to us still
+   finds it open.
+
+Both users press "Add device" on their device at about the same time.
+
+**Pairing only inside the window** (my addition, for his review): a pairing
+request that arrives while this device has no "Add device" window open is
+rejected at once, without a prompt. Nobody gets a pairing prompt they didn't
+ask for, and a device that knows pw1 can't make prompts appear on its own.
+Devices that already know each other connect at any time; this only gates
+new pairings (also re-pairing after one side forgot the other).
+
+**Pairing prompt over IPC.** The bridge task keeps the requests (at most 4;
+more are rejected at once) with a `u32` id. `Status.pending_pairings` tells
+the UI that one waits; `PendingPairing` gives the oldest (id, name, code);
+`AnswerPairing(id, accept)` answers it (`PairingExpired` if it isn't waiting
+any more). Requests whose handshake stopped waiting (60 s timeout,
+connection closed) drop out by themselves. Neither call waits for the change
+slot: an Argon2 run must not eat the 60 s. The UI never shows the prompt on
+top of another popup (a half-typed password), shows every symbol with its
+name, and closes a prompt the daemon no longer has.
+
+**Saving.** A newly paired peer goes into the shared list in the handshake;
+the handshake then signals the bridge, which re-seals the vault as its own
+state change (waits for the change slot). When networking stops, the bridge
+re-seals once more, so a pairing that finished at that moment isn't lost.
+A failed save is logged; the peer stays in RAM and the next change saves it.
+
+**Verified** (`daemon` tests, two real daemons over localhost, both given
+the same salts by the test because salt sync doesn't exist yet): both users
+see the same code, both accept, both vaults hold the other device, and after
+restarting both daemons (Sync comes back with the unlock) they connect again
+without anyone being asked. Also tested: rejection on one side, answers for
+unknown or answered ids, a pairing outside the window (rejected without a
+prompt), Sync off with a pairing waiting, the prompt cap, the key update
+reaching the network, the Sync switch surviving restarts and automatic
+login. The real two-machine check needs salt sync (section 11): until then
+two daemons with the same passwords still derive different keys.
 
 ---
 
@@ -1110,7 +1200,9 @@ Tests (`cargo test --workspace --all-features`):
   within the IPC deadline), minimum
   length in characters, identity and peers surviving restarts, RAM-only mode,
   no key or salt in any response over a real socket, a waiting change holding
-  no task;
+  no task; the Sync switch and networking (section 13), two daemons pairing
+  and reconnecting after a restart, pairing outside the window, rejected and
+  stale answers, the prompt cap;
 - `auth_snow` / networker: end-to-end localhost handshakes, first pairing,
   reconnect without a prompt, one-sided forget, swapped ML-DSA key, wrong
   `a_key`, rejected pairing, handshake deadline and silent peers, chunking,
@@ -1126,7 +1218,7 @@ Every new protection gets a test that fails without it.
 Manual two-machine test (`--features test-commands`, never in release
 builds): `servertest <pw>` prints fresh random salts and listens on 3232;
 `clienttest <msg> <pw> <salts>` discovers the server over UDP, connects,
-pairs (8 hex bytes of the handshake hash, `y/N`) and sends one Debug packet.
+pairs (the 8-emoji pairing code with names, `y/N`) and sends one Debug packet.
 
 The security gate (`security/README.md`) runs on every push: zeroize, lock and
 network rules (semgrep), clippy (every rustc and clippy warning), ThreadSanitizer,
@@ -1171,8 +1263,17 @@ Stated plainly so nobody relies on a property that isn't there.
 7. **Unlock counter and delay reset on restart** (6.4).
 8. **Display names** are socket addresses for now, so the pairing prompt can
    only show where the request comes from, not which device it claims to be.
+   The code comparison is what proves it is the right device.
 9. **The transcript after Noise** (signatures) is appended but no longer used;
    harmless, noted so nobody assumes it binds anything.
+10. **Unsigned builds and pairing**: like every other command (4.), any
+    process of the same user can answer a pairing prompt over IPC, and so
+    pair a device that knows pw1 during an "Add device" window. Closed only
+    by signed macOS releases.
+11. **Discovery is a hint** (9.1): during an "Add device" window, a LAN
+    attacker can make the daemon try up to 16 connections to addresses of
+    its choice on port 3232. Each costs it one handshake attempt and fails
+    without pw1.
 
 ---
 
@@ -1184,6 +1285,13 @@ Decided:
 - Salt query privacy: the invite window, 2 min.
 - Join defaults: `JOIN_WINDOW` 5 min, `JOIN_MAX_ATTEMPTS` 5.
 - Networking off by default; a persisted "Sync" switch.
+- The daemon's TCP port: 3232.
+- Outgoing connections only from an explicit "Add device" (20 s search,
+  then connect to each device found); later sync features connect when they
+  have data.
+- Pairing is built before salt sync; the end-to-end check uses tests that
+  give both daemons the same salts; the real two-machine check comes with
+  salt sync.
 - Pairing code: 8 emoji with names, 64-entry table, 48 bits, HKDF from the
   handshake hash, y/n on both devices, 60 s timeout rejects.
 - Password change: "are you sure?" first; the old password isn't required.
@@ -1193,8 +1301,11 @@ Decided:
 - Argon2id pinned (v0x13, 64 MiB, t = 3, p = 1).
 - Minimum new password length 12 characters.
 
+Proposed in the networking PR, for his review:
+- new devices are only asked about inside an "Add device" window (13);
+- the lower instance id connects (13).
+
 Open:
-- the daemon's TCP port;
 - clipboard access (`arboard` vs own code) and delivery model: deferred;
 - Linux keychain backend;
 - release signing (Developer ID) for the signature gates and the
@@ -1213,13 +1324,14 @@ Built (in `main`): the crypto primitives; `auth_snow` with SPAKE2, hybrid KEX,
 Noise, ML-DSA, pairing protocol, chunking and the `d_key` layer; discovery;
 the TCP networker with limits and the guess limiter; the IPC with both gates;
 the daemon with Argon2, the vault, the keychain, unlock, automatic login, a
-persistent identity and persistent trusted peers.
+persistent identity and persistent trusted peers; the Sync switch, "Add
+device" and the pairing prompt with the emoji code (section 13).
 
 Next, one stacked PR each, every failure path tested:
-1. networking switch + pairing over IPC + emoji code (section 13);
-2. salt sync: invite window, join slot, salt query, `a_salt` in the SPAKE2
-   transcript, `GroupSalt` (section 11);
-3. group rotation, trusted-peer sync and revocation (section 14, after his
+1. salt sync: invite window, join slot, salt query, `a_salt` in the SPAKE2
+   transcript, `GroupSalt` (section 11), and with it the real two-machine
+   pairing check;
+2. group rotation, trusted-peer sync and revocation (section 14, after his
    protocol review);
-4. vault reset;
-5. clipboard v1 (section 12, after the access and delivery decisions).
+3. vault reset;
+4. clipboard v1 (section 12, after the access and delivery decisions).

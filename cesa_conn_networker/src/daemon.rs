@@ -1,7 +1,5 @@
 /*
 TODO:
-start the networker once the vault is open (device identity + trusted peers go into the vault first)
-pairing prompt over IPC (UI command set is defined together with the UI)
 salt syncing between devices (docs/design/daemon.md, section 11)
 Linux keychain backend (Secret Service): until then Linux keeps the keys in RAM only
 data-protection keychain (WhenUnlockedThisDeviceOnly) together with release signing
@@ -20,31 +18,47 @@ data-protection keychain (WhenUnlockedThisDeviceOnly) together with release sign
 //! * `d_key`: RAM only; after a restart the vault is **locked** until the user
 //!   enters the data password. With automatic login, `d_key` is also kept in
 //!   the OS keychain and the daemon unlocks itself.
+//!
+//! Networking (off by default): with the Sync switch on and the vault open,
+//! the daemon listens for paired devices. New devices are only paired from
+//! the "Add device" window, and only after the user compared the pairing
+//! code (`PendingPairing` / `AnswerPairing` over IPC).
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::select;
 use tokio::sync::{RwLock, Semaphore};
-use tokio::time::Instant;
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::{Instant, sleep, timeout};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
 
 use cesa_conn_crypto::{crand::random_array, pswd_manager::derive_key};
 use cesa_conn_system::{
     ipc::{
-        DaemonError, MAX_LISTED_PEERS, MIN_NEW_PASSWORD_LEN, PasswordUpdate, PeerInfo, Request,
-        Response, Status, socket_path,
+        DaemonError, MAX_LISTED_PEERS, MIN_NEW_PASSWORD_LEN, PairingPrompt, PasswordUpdate,
+        PeerInfo, Request, Response, Status, socket_path,
     },
     keychain::{Item, OsKeychain, SecretStore},
 };
 
 use crate::{
     auth_snow::{
-        AuthKey, DataKey, DeviceKeypairs, IDENTITY_SEED_LEN, TrustedPeer, decode_peers,
-        encode_peers,
+        AuthKey, DataKey, DeviceKeypairs, HANDSHAKE_DEADLINE, IDENTITY_SEED_LEN, Keys,
+        MAX_PENDING_PAIRINGS, Pairing, PairingInbox, PairingRequest, TIMEOUT, TrustedPeer,
+        decode_peers, encode_peers,
     },
+    guess_limiter::GuessLimiter,
     ipc_server::{self, ClientPolicy},
+    tcp_networker::{self, ActionType, NetworkerContext, TCP_PORT, TcpNetworkerErrors},
+    udp_networker::{
+        InstanceId, MAX_BROADCAST_DURATION, udp_broadcast_presence, udp_find_broadcasters,
+    },
     vault::{self, Salts, VaultContents, VaultErrors, WrappedDek},
 };
 
@@ -59,12 +73,82 @@ pub struct Storage {
     pub path: PathBuf,
 }
 
+/* settings: the vault's config entry */
+/// config format version
+const CONFIG_VERSION: u8 = 0x01;
+/// config flag: the Sync switch
+const CONFIG_SYNC: u8 = 0b1;
+
+/// The daemon's settings, saved in the vault. Every one is off by default.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+struct Config {
+    /// Networking on: listen for paired devices, allow "Add device".
+    sync: bool,
+}
+
+impl Config {
+    /// `version (1) || flags (1)`.
+    fn encode(self) -> Zeroizing<Vec<u8>> {
+        let flags = if self.sync { CONFIG_SYNC } else { 0 };
+        Zeroizing::new(vec![CONFIG_VERSION, flags])
+    }
+
+    /// Strict: an empty entry (vaults from before there were settings) is
+    /// the defaults, anything but `version || known flags` is `None`.
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        match bytes {
+            [] => Some(Self::default()),
+            [CONFIG_VERSION, flags] if flags & !CONFIG_SYNC == 0 => Some(Self {
+                sync: flags & CONFIG_SYNC != 0,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/* networking */
+/// How long "Add device" announces this device and searches the LAN (seconds).
+const ADD_DEVICE_SEARCH: u64 = MAX_BROADCAST_DURATION;
+/// How long the bridge may take to save the peers at shutdown (seconds).
+const SHUTDOWN_SAVE_TIMEOUT: u64 = 5;
+
+/// Networking while it runs; cancelling the token stops all of it.
+struct Network {
+    token: CancellationToken,
+    /// What every connection shares: keys, identity, peers, pairing.
+    context: NetworkerContext,
+    /// The pairing bridge; it saves the peers once more when it stops.
+    bridge: JoinHandle<()>,
+}
+
+impl Network {
+    /// Running: not cancelled (Sync off, shutdown, or the listener failed).
+    fn running(&self) -> bool {
+        !self.token.is_cancelled()
+    }
+}
+
+/// Pairings waiting for the user's answer over IPC.
+#[derive(Default)]
+struct PendingPairings {
+    /// Id of the next request; ids only tell answers apart, they aren't secret.
+    next_id: u32,
+    waiting: Vec<(u32, PairingRequest)>,
+}
+
+impl PendingPairings {
+    /// Drops the requests the handshake stopped waiting for (timeout, closed).
+    fn prune(&mut self) {
+        self.waiting.retain(|(_, request)| !request.is_expired());
+    }
+}
+
 /// The open vault, kept so changes can be re-sealed without the password.
 struct OpenVault {
     dek: Zeroizing<[u8; 32]>,
     wrapped: WrappedDek,
     storage_salt: Salt,
-    config: Zeroizing<Vec<u8>>,
+    config: Config,
     /// This device's identity seed: made with the vault, kept for good.
     identity: Zeroizing<[u8; IDENTITY_SEED_LEN]>,
 }
@@ -132,9 +216,20 @@ pub struct Daemon {
     trusted_peers: Arc<RwLock<Vec<TrustedPeer>>>,
     // one Argon2 run (64 MiB) at a time, so clients can't stack up memory
     derive_slot: Arc<Semaphore>,
-    // one state change (set password / unlock / auto-login) at a time, end to end
+    // one state change (set password / unlock / auto-login / sync) at a time, end to end
     change_slot: Arc<Semaphore>,
     storage: Option<Storage>,
+    /// `Some` while networking runs.
+    network: RwLock<Option<Network>>,
+    /// New devices waiting for the user.
+    pairings: RwLock<PendingPairings>,
+    /// The "Add device" window is open: only then are new devices asked about.
+    adding: AtomicBool,
+    /// One guess limiter for the daemon's lifetime, so a Sync off / on
+    /// doesn't forgive a guesser.
+    guess_limiter: Arc<GuessLimiter>,
+    /// Where the listener binds: every interface on [`TCP_PORT`] (tests: localhost).
+    listen_addr: SocketAddr,
 }
 
 /// Which key a password is for.
@@ -179,12 +274,24 @@ fn storage_error(e: VaultErrors) -> DaemonError {
 impl Daemon {
     /// A daemon saving to `storage` (`None`: RAM only).
     pub fn new(storage: Option<Storage>) -> Self {
+        // paired devices on the LAN must reach it; every connection is
+        // authenticated (SPAKE2 + signatures) before anything is processed
+        Self::with_listen_addr(storage, SocketAddr::from(([0, 0, 0, 0], TCP_PORT)))
+    }
+
+    /// A daemon whose listener binds `listen_addr`.
+    fn with_listen_addr(storage: Option<Storage>, listen_addr: SocketAddr) -> Self {
         Self {
             keys: RwLock::default(),
             trusted_peers: Arc::default(),
             derive_slot: Arc::new(Semaphore::new(1)),
             change_slot: Arc::new(Semaphore::new(1)),
             storage,
+            network: RwLock::default(),
+            pairings: RwLock::default(),
+            adding: AtomicBool::new(false),
+            guess_limiter: Arc::new(GuessLimiter::new()),
+            listen_addr,
         }
     }
 
@@ -198,6 +305,17 @@ impl Daemon {
         match request {
             Request::Status => Response::Status(self.status().await).encode(),
             Request::ListPeers => Response::Peers(self.peers().await).encode(),
+            // quick and storage-free: never wait behind an Argon2 run, the
+            // pairing timeout is running
+            Request::PendingPairing => Response::Pairing(self.pending_pairing().await).encode(),
+            Request::AnswerPairing { id, accept } => match self.answer_pairing(id, accept).await {
+                Ok(()) => Response::Done.encode(),
+                Err(e) => Response::encode_error(e),
+            },
+            Request::AddDevice => match self.add_device().await {
+                Ok(()) => Response::Done.encode(),
+                Err(e) => Response::encode_error(e),
+            },
             change => {
                 let Ok(turn) = self.change_slot.clone().acquire_owned().await else {
                     return Response::encode_error(DaemonError::Internal);
@@ -220,19 +338,30 @@ impl Daemon {
     }
 
     /// One state change; the caller holds the change slot.
-    async fn change(&self, request: Request) -> Result<(), DaemonError> {
-        match request {
+    async fn change(self: &Arc<Self>, request: Request) -> Result<(), DaemonError> {
+        let result = match request {
             Request::SetAuthPassword(update) => self.set_password(KeyKind::Auth, update).await,
             Request::SetDataPassword(update) => self.set_password(KeyKind::Data, update).await,
             Request::Unlock(update) => self.unlock(update).await,
             Request::SetAutoLogin(on) => self.set_auto_login(on).await,
-            Request::Status | Request::ListPeers => Err(DaemonError::BadRequest),
-        }
+            Request::SetSync(on) => self.set_sync(on).await,
+            Request::Status
+            | Request::ListPeers
+            | Request::PendingPairing
+            | Request::AnswerPairing { .. }
+            | Request::AddDevice => Err(DaemonError::BadRequest),
+        };
+
+        // networking follows the state: keys, lock and the Sync switch
+        self.apply_network().await;
+
+        result
     }
 
     /// Looks for a saved vault: if there is one the daemon starts locked, and
-    /// with automatic login it unlocks itself from the keychain.
-    pub async fn start(&self) {
+    /// with automatic login it unlocks itself from the keychain (and starts
+    /// networking if Sync is on).
+    pub async fn start(self: &Arc<Self>) {
         let Some(storage) = &self.storage else {
             warn!("no storage: keys stay in RAM only and are gone after a restart");
             return;
@@ -278,7 +407,10 @@ impl Daemon {
         drop(d_key);
 
         match self.unlock_with(DataKey::new(key)).await {
-            Ok(()) => info!("vault unlocked by automatic login"),
+            Ok(()) => {
+                info!("vault unlocked by automatic login");
+                self.apply_network().await;
+            }
             Err(DaemonError::WrongPassword) => {
                 // a stale key that no longer opens the vault: remove it
                 let store = storage.store.clone();
@@ -295,23 +427,38 @@ impl Daemon {
     }
 
     async fn status(&self) -> Status {
+        // one lock after the other, never two at once
         let status = {
             let keys = self.keys.read().await;
             Status {
                 auth_key_set: keys.a_key.is_some(),
                 data_key_set: keys.d_key.is_some(),
-                network_running: false,
-                trusted_peers: 0,
                 locked: keys.locked,
                 saved: keys.vault.is_some(),
                 auto_login: keys.auto_login,
                 unlock_wait_secs: wait_secs(keys.unlock_not_before, Instant::now()),
+                sync_enabled: keys.vault.as_ref().is_some_and(|open| open.config.sync),
+                ..Status::default()
             }
         };
         let trusted_peers = self.trusted_peers.read().await.len();
+        let network_running = self
+            .network
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(Network::running);
+        let pending_pairings = {
+            let mut pairings = self.pairings.write().await;
+            pairings.prune();
+            pairings.waiting.len()
+        };
 
         Status {
             trusted_peers: u32::try_from(trusted_peers).unwrap_or(u32::MAX),
+            network_running,
+            adding_device: network_running && self.adding.load(Ordering::SeqCst),
+            pending_pairings: u8::try_from(pending_pairings).unwrap_or(u8::MAX),
             ..status
         }
     }
@@ -414,6 +561,9 @@ impl Daemon {
             KeyKind::Data => info!("data key set"),
         }
 
+        // running connections use the new key from now on
+        self.update_network_keys().await;
+
         // first time both keys exist: create the vault
         if self.keys.read().await.vault.is_none() {
             self.create_vault().await;
@@ -466,7 +616,7 @@ impl Daemon {
             let contents = VaultContents {
                 a_key,
                 a_salt: a_salt.clone(),
-                config: open.config.clone(),
+                config: open.config.encode(),
                 identity: open.identity.clone(),
                 peers,
             };
@@ -543,13 +693,14 @@ impl Daemon {
                 let dek = vault::generate_dek()?;
                 let kek = vault::derive_kek(&d_key, &storage_salt)?;
                 let wrapped = vault::wrap_dek(&kek, &dek)?;
-                let config = Zeroizing::new(Vec::new());
+                // every setting starts off (Sync too)
+                let config = Config::default();
                 // the device identity is born with the vault
                 let identity = DeviceKeypairs::new_seed().map_err(|_| VaultErrors::Crypto)?;
                 let contents = VaultContents {
                     a_key: a_key.clone(),
                     a_salt: a_salt.clone(),
-                    config: config.clone(),
+                    config: config.encode(),
                     identity: identity.clone(),
                     peers,
                 };
@@ -695,6 +846,10 @@ impl Daemon {
             error!("saved trusted peers are damaged");
             DaemonError::StorageFailed
         })?;
+        let config = Config::decode(&opened.contents.config).ok_or_else(|| {
+            error!("saved settings are damaged");
+            DaemonError::StorageFailed
+        })?;
 
         *self.trusted_peers.write().await = peers;
 
@@ -707,7 +862,7 @@ impl Daemon {
             dek: opened.dek,
             wrapped: opened.wrapped,
             storage_salt: salts.storage_salt,
-            config: opened.contents.config,
+            config,
             identity: opened.contents.identity,
         });
         keys.locked = false;
@@ -760,6 +915,430 @@ impl Daemon {
 
         Ok(())
     }
+
+    /// Turns the Sync switch on or off: saved in the vault first, then
+    /// networking follows ([`Daemon::apply_network`], run by `change`).
+    async fn set_sync(&self, on: bool) -> Result<(), DaemonError> {
+        {
+            let keys = self.keys.read().await;
+            if keys.locked {
+                return Err(DaemonError::Locked);
+            }
+            // a paired device must survive a restart: no networking without a vault
+            if keys.vault.is_none() {
+                return Err(DaemonError::NotSaved);
+            }
+        }
+
+        let config = Config { sync: on };
+
+        // saved first, kept second: a failed save changes nothing
+        self.reseal(Some(config)).await?;
+
+        let mut keys = self.keys.write().await;
+        if let Some(open) = keys.vault.as_mut() {
+            open.config = config;
+        }
+        drop(keys);
+
+        if on {
+            info!("sync on");
+        } else {
+            info!("sync off");
+        }
+
+        Ok(())
+    }
+
+    /// Re-seals the open vault as it is, with `config` if given. The caller
+    /// holds the change slot.
+    async fn reseal(&self, config: Option<Config>) -> Result<(), DaemonError> {
+        let Some(storage) = &self.storage else {
+            return Err(DaemonError::NotSaved);
+        };
+
+        let peers = self.encoded_peers().await?;
+
+        let file = {
+            let keys = self.keys.read().await;
+            let (Some(open), Some(a_key), Some(a_salt)) = (&keys.vault, &keys.a_key, &keys.a_salt)
+            else {
+                return Err(DaemonError::NotSaved);
+            };
+
+            let contents = VaultContents {
+                a_key: a_key.clone(),
+                a_salt: a_salt.clone(),
+                config: config.unwrap_or(open.config).encode(),
+                identity: open.identity.clone(),
+                peers,
+            };
+            let file = vault::seal(&open.wrapped, &open.dek, &contents);
+            drop(keys);
+            file.map_err(storage_error)?
+        };
+
+        let path = storage.path.clone();
+        blocking(move || vault::write_file_atomic(&path, &file))
+            .await?
+            .map_err(storage_error)?;
+
+        info!("vault saved");
+        Ok(())
+    }
+
+    /// Writes the trusted peers to the vault after a pairing, as its own
+    /// state change (waits for the change slot).
+    async fn save_peers(&self) {
+        let Ok(_turn) = self.change_slot.clone().acquire_owned().await else {
+            return;
+        };
+
+        if self.keys.read().await.vault.is_none() {
+            return;
+        }
+
+        if let Err(e) = self.reseal(None).await {
+            error!(error = %e, "saving the trusted devices failed: they are kept in memory, the next change saves them");
+        }
+    }
+
+    /// Starts or stops networking to match the state: it runs exactly while
+    /// the vault is open with both keys and the Sync switch is on.
+    async fn apply_network(self: &Arc<Self>) {
+        let wanted = {
+            let keys = self.keys.read().await;
+            match &keys.vault {
+                Some(open)
+                    if open.config.sync
+                        && !keys.locked
+                        && keys.a_key.is_some()
+                        && keys.d_key.is_some() =>
+                {
+                    Some(open.identity.clone())
+                }
+                _ => None,
+            }
+        };
+
+        let running = self
+            .network
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(Network::running);
+
+        match (wanted, running) {
+            (Some(identity), false) => self.start_network(identity).await,
+            // the bridge finishes on its own, nobody needs to wait here
+            (None, true) => drop(self.stop_network().await),
+            _ => {}
+        }
+    }
+
+    /// Starts the TCP listener and the pairing bridge with this device's
+    /// identity, the shared keys and trusted peers.
+    async fn start_network(self: &Arc<Self>, identity: Zeroizing<[u8; IDENTITY_SEED_LEN]>) {
+        // copies (zeroizing) under the guard, which is dropped right away
+        let keys = {
+            let keys = self.keys.read().await;
+            match (&keys.a_key, &keys.d_key) {
+                (Some(a_key), Some(d_key)) => Keys::new(a_key.clone(), d_key.clone()),
+                _ => return,
+            }
+        };
+
+        let listener = match TcpListener::bind(self.listen_addr).await {
+            Ok(listener) => listener,
+            Err(e) => {
+                error!(error = %e, addr = %self.listen_addr, "failed to start the TCP listener: networking stays off");
+                return;
+            }
+        };
+        let local_addr = match listener.local_addr() {
+            Ok(addr) => addr,
+            Err(e) => {
+                error!(error = %e, "failed to read the TCP listener's address: networking stays off");
+                return;
+            }
+        };
+
+        let (pairing, inbox) = Pairing::channel();
+        let token = CancellationToken::new();
+        let context = NetworkerContext {
+            keys: Arc::new(RwLock::new(keys)),
+            device_keypairs: Arc::new(DeviceKeypairs::from_seed(&identity)),
+            trusted_peers: self.trusted_peers.clone(),
+            pairing,
+            guess_limiter: self.guess_limiter.clone(),
+        };
+        drop(identity);
+
+        listen(listener, context.clone(), token.clone());
+        let bridge = tokio::spawn(self.clone().pairing_bridge(inbox, token.clone()));
+
+        // check-then-act under one write guard; nothing is awaited while held
+        let mut network = self.network.write().await;
+        if network.as_ref().is_some_and(Network::running) {
+            drop(network);
+            // started twice (can't happen under the change slot): undo this one
+            token.cancel();
+            return;
+        }
+        *network = Some(Network {
+            token,
+            context,
+            bridge,
+        });
+        // a new network has no "Add device" window, whatever the last one
+        // had (a listener that failed on its own never closed its window)
+        self.adding.store(false, Ordering::SeqCst);
+        drop(network);
+
+        info!(%local_addr, "networking on: listening for paired devices");
+    }
+
+    /// Stops networking; returns the bridge, which saves the peers once
+    /// more and ends (awaited at shutdown only: it needs the change slot).
+    async fn stop_network(&self) -> Option<JoinHandle<()>> {
+        let network = self.network.write().await.take()?;
+
+        network.token.cancel();
+        self.adding.store(false, Ordering::SeqCst);
+        // dropped = rejected; the handshakes tell their peers
+        self.pairings.write().await.waiting.clear();
+        info!("networking off");
+
+        Some(network.bridge)
+    }
+
+    /// Hands changed keys to the running connections.
+    async fn update_network_keys(&self) {
+        let keys = {
+            let keys = self.keys.read().await;
+            match (&keys.a_key, &keys.d_key) {
+                (Some(a_key), Some(d_key)) => Keys::new(a_key.clone(), d_key.clone()),
+                _ => return,
+            }
+        };
+
+        // the networker's own lock, taken after the daemon's is released
+        let shared = self
+            .network
+            .read()
+            .await
+            .as_ref()
+            .map(|network| network.context.keys.clone());
+
+        if let Some(shared) = shared {
+            *shared.write().await = keys;
+        }
+    }
+
+    /// Between the handshakes and the UI: queues pairing requests for the
+    /// user and saves the peers after a pairing. Ends with networking.
+    async fn pairing_bridge(self: Arc<Self>, mut inbox: PairingInbox, token: CancellationToken) {
+        loop {
+            select! {
+                () = token.cancelled() => break,
+                request = inbox.requests.recv() => match request {
+                    Some(request) => self.queue_pairing(request).await,
+                    None => break,
+                },
+                // its own task: the bridge keeps taking requests while the
+                // save waits for the change slot
+                () = inbox.saved.notified() => {
+                    let daemon = self.clone();
+                    tokio::spawn(async move { daemon.save_peers().await });
+                }
+            }
+        }
+
+        // (waiting requests were dropped by stop_network: rejected)
+
+        // a pairing that finished just as networking stopped is saved too
+        self.save_peers().await;
+    }
+
+    /// Keeps `request` for the user, or rejects it: outside the
+    /// "Add device" window nobody asked to pair, and the queue is bounded.
+    async fn queue_pairing(&self, request: PairingRequest) {
+        if !self.adding.load(Ordering::SeqCst) {
+            warn!(name = %request.name, "pairing request outside \"Add device\", rejected");
+            request.answer(false);
+            return;
+        }
+
+        let mut pairings = self.pairings.write().await;
+        pairings.prune();
+
+        if pairings.waiting.len() >= MAX_PENDING_PAIRINGS {
+            drop(pairings);
+            warn!(name = %request.name, "too many pairings waiting, rejected");
+            request.answer(false);
+            return;
+        }
+
+        let id = pairings.next_id;
+        pairings.next_id = id.wrapping_add(1);
+        info!(id, name = %request.name, "new device wants to pair: waiting for the user");
+        pairings.waiting.push((id, request));
+    }
+
+    /// The oldest pairing still waiting for the user.
+    async fn pending_pairing(&self) -> Option<PairingPrompt> {
+        let mut pairings = self.pairings.write().await;
+        pairings.prune();
+
+        pairings.waiting.first().map(|(id, request)| PairingPrompt {
+            id: *id,
+            name: request.name.clone(),
+            code: request.code,
+        })
+    }
+
+    /// The user's answer to pairing `id`.
+    async fn answer_pairing(&self, id: u32, accept: bool) -> Result<(), DaemonError> {
+        let request = {
+            let mut pairings = self.pairings.write().await;
+            pairings.prune();
+            let index = pairings
+                .waiting
+                .iter()
+                .position(|(waiting, _)| *waiting == id)
+                .ok_or(DaemonError::PairingExpired)?;
+            pairings.waiting.remove(index).1
+        };
+
+        info!(id, name = %request.name, accept, "pairing answered");
+        request.answer(accept);
+        Ok(())
+    }
+
+    /// Opens the "Add device" window: announces this device and searches the
+    /// LAN for [`ADD_DEVICE_SEARCH`] seconds, then connects to what it found.
+    /// The window (and with it the pairing prompts) stays open until those
+    /// connections finished and for [`HANDSHAKE_DEADLINE`] more, so the other
+    /// device's connection to us can still arrive.
+    async fn add_device(self: &Arc<Self>) -> Result<(), DaemonError> {
+        let (context, token) = {
+            let network = self.network.read().await;
+            match network.as_ref() {
+                Some(network) if network.running() => {
+                    (network.context.clone(), network.token.clone())
+                }
+                _ => return Err(DaemonError::NetworkOff),
+            }
+        };
+
+        let id = InstanceId::generate().map_err(|e| {
+            error!(error = %e, "failed to generate a discovery id");
+            DaemonError::Internal
+        })?;
+
+        // already open: one window at a time
+        if self.adding.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        info!("add device: searching the network");
+
+        let daemon = self.clone();
+        tokio::spawn(async move {
+            select! {
+                () = token.cancelled() => {},
+                () = add_device_window(context, id) => {},
+            }
+            // cancelled: stop_network closed it already, and a window of a
+            // restarted network must not be closed by this old one
+            if !token.is_cancelled() {
+                daemon.adding.store(false, Ordering::SeqCst);
+                info!("add device: window closed");
+            }
+        });
+
+        Ok(())
+    }
+}
+
+/// Runs the accept loop in its own task until the token is cancelled. If
+/// it fails on its own, it cancels the token, so all of networking stops.
+fn listen(listener: TcpListener, context: NetworkerContext, token: CancellationToken) {
+    tokio::spawn(async move {
+        // the accept loop runs until the token is cancelled; every
+        // connection in it has its own timeouts and handshake deadline
+        // nosemgrep: cesa.net.read-without-timeout
+        let result = tcp_networker::recv(&listener, context, token.clone()).await;
+
+        if let Err(e) = result {
+            error!(error = %e, "TCP listener stopped: networking off");
+            token.cancel();
+        }
+    });
+}
+
+/// The "Add device" window ([`Daemon::add_device`]): announce and search at
+/// the same time, connect to every device found, wait for the stragglers.
+async fn add_device_window(context: NetworkerContext, id: InstanceId) {
+    let (announced, found) = tokio::join!(
+        udp_broadcast_presence(ADD_DEVICE_SEARCH, id),
+        udp_find_broadcasters(ADD_DEVICE_SEARCH, id),
+    );
+
+    if let Err(e) = announced {
+        warn!(error = %e, "announcing this device failed");
+    }
+    let found = found.unwrap_or_else(|e| {
+        warn!(error = %e, "searching for devices failed");
+        Vec::new()
+    });
+
+    let mut connects = JoinSet::new();
+
+    for (addr, their_id) in found {
+        // both devices hear each other: only the lower id connects, so a
+        // pair makes one connection (and one prompt each), not two
+        if id < their_id {
+            // only the IP comes from discovery (an unauthenticated hint)
+            connects.spawn(connect_to(
+                context.clone(),
+                SocketAddr::new(addr.ip(), TCP_PORT),
+            ));
+        } else {
+            debug!(%addr, "found device connects to us");
+        }
+    }
+
+    tokio::join!(
+        async { while connects.join_next().await.is_some() {} },
+        sleep(Duration::from_secs(HANDSHAKE_DEADLINE)),
+    );
+}
+
+/// One outgoing `ConnectNewDevice` connection: authenticates, and pairs if
+/// the two devices don't know each other yet (the user is asked).
+async fn connect_to(context: NetworkerContext, addr: SocketAddr) -> Result<(), TcpNetworkerErrors> {
+    let stream = timeout(Duration::from_secs(TIMEOUT), TcpStream::connect(addr))
+        .await
+        .map_err(|_| TcpNetworkerErrors::FailedToConnect)?
+        .map_err(|_| TcpNetworkerErrors::FailedToConnect)?;
+
+    // a full handshake: boxed, so the future isn't kept on the stack
+    let result = Box::pin(tcp_networker::connect_handler(
+        context,
+        addr,
+        stream,
+        ActionType::ConnectNewDevice,
+        Zeroizing::new(Vec::new()),
+    ))
+    .await;
+
+    match &result {
+        Ok(()) => info!(%addr, "connected to the device"),
+        Err(e) => warn!(%addr, error = %e, "connecting to the device failed"),
+    }
+
+    result
 }
 
 /// The storage this platform supports: the vault in the private data
@@ -815,8 +1394,9 @@ pub async fn run() {
     daemon.start().await;
 
     let token = CancellationToken::new();
+    let handler_daemon = daemon.clone();
     let handler = move |request: Request| {
-        let daemon = daemon.clone();
+        let daemon = handler_daemon.clone();
         async move { daemon.handle(request).await }
     };
 
@@ -832,6 +1412,15 @@ pub async fn run() {
         error!("IPC server task failed");
     }
 
+    // networking off; the bridge saves a pairing that just finished
+    if let Some(bridge) = daemon.stop_network().await
+        && timeout(Duration::from_secs(SHUTDOWN_SAVE_TIMEOUT), bridge)
+            .await
+            .is_err()
+    {
+        warn!("saving the trusted devices at shutdown timed out");
+    }
+
     // best effort: a stale socket is replaced on the next start anyway
     if std::fs::remove_file(&path).is_err() {
         warn!(path = %path.display(), "failed to remove the IPC socket");
@@ -839,6 +1428,7 @@ pub async fn run() {
 }
 
 #[cfg(test)]
+#[allow(clippy::large_futures)] // full handshakes in tests, stack size doesn't matter
 mod tests {
     use super::*;
     use cesa_conn_system::ipc::{IpcErrors, prepare_socket_dir, request_at};
@@ -956,6 +1546,8 @@ mod tests {
                     0x07 => DaemonError::NotSaved,
                     0x08 => DaemonError::WeakPassword,
                     0x09 => DaemonError::UnlockDelayed,
+                    0x0A => DaemonError::NetworkOff,
+                    0x0B => DaemonError::PairingExpired,
                     _ => DaemonError::Internal,
                 }),
                 _ => panic!("unexpected response"),
@@ -1576,6 +2168,472 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(daemon.peers().await.len(), 1);
+    }
+
+    // ── networking and pairing ───────────────────────────────────────────
+
+    impl TestStorage {
+        /// A (re)started daemon whose listener binds a free localhost port.
+        async fn daemon_on_localhost(&self) -> Arc<Daemon> {
+            // a free port: bound, read, released (the daemon binds it again)
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            let daemon = Arc::new(Daemon::with_listen_addr(
+                Some(Storage {
+                    store: self.store.clone(),
+                    path: self.path(),
+                }),
+                SocketAddr::from(([127, 0, 0, 1], port)),
+            ));
+            daemon.start().await;
+            daemon
+        }
+    }
+
+    /// The shared context of a running network.
+    async fn context(daemon: &Daemon) -> NetworkerContext {
+        daemon
+            .network
+            .read()
+            .await
+            .as_ref()
+            .expect("networking isn't running")
+            .context
+            .clone()
+    }
+
+    /// Two devices of one group: the second one gets the first one's salts
+    /// before its passwords are set (test only: real devices will get them
+    /// from salt sync), so both derive the same keys.
+    async fn group_of_two(a: &TestStorage, b: &TestStorage) -> (Arc<Daemon>, Arc<Daemon>) {
+        let first = a.daemon_on_localhost().await;
+        setup(&first).await;
+
+        let second = b.daemon_on_localhost().await;
+        let (a_salt, d_salt) = {
+            let salts = first.keys.read().await;
+            (salts.a_salt.clone(), salts.d_salt.clone())
+        };
+        {
+            let mut keys = second.keys.write().await;
+            keys.a_salt = a_salt;
+            keys.d_salt = d_salt;
+        }
+        setup(&second).await;
+        assert_eq!(key_bytes(&first).await, key_bytes(&second).await);
+
+        for daemon in [&first, &second] {
+            ask(daemon, Request::SetSync(true)).await.unwrap();
+            assert!(daemon.status().await.network_running);
+        }
+
+        (first, second)
+    }
+
+    /// Waits (bounded) until `daemon` has a pairing waiting for its user.
+    async fn wait_for_prompt(daemon: &Daemon) -> PairingPrompt {
+        for _ in 0..1000 {
+            if let Some(prompt) = daemon.pending_pairing().await {
+                return prompt;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        panic!("no pairing prompt within 10 s");
+    }
+
+    /// Waits (bounded) until `daemon`'s vault holds `count` trusted peers.
+    async fn wait_for_saved_peers(storage: &TestStorage, count: usize) {
+        for _ in 0..500 {
+            let restarted = storage.daemon_on_localhost().await;
+            restarted.unlock(update(DATA_PW)).await.unwrap();
+            if restarted.trusted_peers.read().await.len() == count {
+                return;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the vault never held {count} peers");
+    }
+
+    /// A pairing request as a handshake would send it, and the end that
+    /// receives the user's answer.
+    fn fake_request() -> (PairingRequest, tokio::sync::oneshot::Receiver<bool>) {
+        let (decision, answer) = tokio::sync::oneshot::channel();
+        (PairingRequest::for_test("peer", decision), answer)
+    }
+
+    /// Test that the daemon keeps at most MAX_PENDING_PAIRINGS prompts and
+    /// rejects the next one at once, and that answered ones are gone
+    #[tokio::test]
+    async fn test_pending_pairings_bounded() {
+        let daemon = Daemon::default();
+        daemon.adding.store(true, Ordering::SeqCst);
+        let mut answers = Vec::new();
+
+        for _ in 0..MAX_PENDING_PAIRINGS {
+            let (request, answer) = fake_request();
+            daemon.queue_pairing(request).await;
+            answers.push(answer);
+        }
+        assert_eq!(
+            usize::from(daemon.status().await.pending_pairings),
+            MAX_PENDING_PAIRINGS
+        );
+
+        let (extra, extra_answer) = fake_request();
+        daemon.queue_pairing(extra).await;
+        assert_eq!(
+            timeout(Duration::from_secs(1), extra_answer).await,
+            Ok(Ok(false))
+        );
+        assert_eq!(
+            usize::from(daemon.status().await.pending_pairings),
+            MAX_PENDING_PAIRINGS
+        );
+
+        // the oldest first; an answer reaches its handshake and frees a place
+        let first = daemon.pending_pairing().await.unwrap();
+        daemon.answer_pairing(first.id, true).await.unwrap();
+        assert_eq!(answers.remove(0).await, Ok(true));
+        assert_ne!(daemon.pending_pairing().await.unwrap().id, first.id);
+
+        // a handshake that stopped waiting drops out by itself
+        drop(answers);
+        assert_eq!(daemon.status().await.pending_pairings, 0);
+        assert!(daemon.pending_pairing().await.is_none());
+    }
+
+    /// Test that the settings encoding is strict and empty means defaults
+    #[test]
+    fn test_config_encoding() {
+        assert_eq!(Config::decode(&[]), Some(Config::default()));
+        assert!(!Config::default().sync);
+        for config in [Config { sync: false }, Config { sync: true }] {
+            assert_eq!(Config::decode(&config.encode()), Some(config));
+        }
+        // unknown version, unknown flag, wrong length
+        assert_eq!(Config::decode(&[0x02, 0x01]), None);
+        assert_eq!(Config::decode(&[CONFIG_VERSION, 0b10]), None);
+        assert_eq!(Config::decode(&[CONFIG_VERSION]), None);
+        assert_eq!(Config::decode(&[CONFIG_VERSION, 0x01, 0x00]), None);
+    }
+
+    /// Test that Sync is off by default, starts networking when switched on,
+    /// survives a restart (networking comes back with the unlock) and turns
+    /// everything off again
+    #[tokio::test]
+    async fn test_sync_switch_saved_and_drives_networking() {
+        let storage = TestStorage::new("sync");
+        let daemon = storage.daemon_on_localhost().await;
+        setup(&daemon).await;
+
+        let status = daemon.status().await;
+        assert!(!status.sync_enabled && !status.network_running);
+        assert_eq!(
+            ask(&daemon, Request::AddDevice).await,
+            Err(DaemonError::NetworkOff)
+        );
+
+        ask(&daemon, Request::SetSync(true)).await.unwrap();
+        let status = daemon.status().await;
+        assert!(status.sync_enabled && status.network_running);
+        drop(daemon.stop_network().await);
+        drop(daemon);
+
+        // restart: locked, so off; the unlock brings it back
+        let daemon = storage.daemon_on_localhost().await;
+        let status = daemon.status().await;
+        assert!(status.locked && !status.sync_enabled && !status.network_running);
+        ask(&daemon, Request::Unlock(update(DATA_PW)))
+            .await
+            .unwrap();
+        let status = daemon.status().await;
+        assert!(status.sync_enabled && status.network_running);
+
+        ask(&daemon, Request::SetSync(false)).await.unwrap();
+        let status = daemon.status().await;
+        assert!(!status.sync_enabled && !status.network_running);
+        drop(daemon);
+
+        let daemon = storage.daemon_on_localhost().await;
+        ask(&daemon, Request::Unlock(update(DATA_PW)))
+            .await
+            .unwrap();
+        assert!(!daemon.status().await.network_running);
+    }
+
+    /// Test that automatic login starts networking too when Sync is on
+    #[tokio::test]
+    async fn test_auto_login_starts_networking() {
+        let storage = TestStorage::new("sync-auto");
+        let daemon = storage.daemon_on_localhost().await;
+        setup(&daemon).await;
+        ask(&daemon, Request::SetAutoLogin(true)).await.unwrap();
+        ask(&daemon, Request::SetSync(true)).await.unwrap();
+        drop(daemon.stop_network().await);
+        drop(daemon);
+
+        let daemon = storage.daemon_on_localhost().await;
+        let status = daemon.status().await;
+        assert!(!status.locked && status.network_running);
+    }
+
+    /// Test that Sync needs an open, saved vault
+    #[tokio::test]
+    async fn test_sync_needs_saved_unlocked_keys() {
+        let ram_only = Arc::new(Daemon::default());
+        setup(&ram_only).await;
+        assert_eq!(
+            ask(&ram_only, Request::SetSync(true)).await,
+            Err(DaemonError::NotSaved)
+        );
+        assert!(!ram_only.status().await.network_running);
+
+        let storage = TestStorage::new("sync-locked");
+        let daemon = storage.daemon_on_localhost().await;
+        assert_eq!(
+            ask(&daemon, Request::SetSync(true)).await,
+            Err(DaemonError::NotSaved)
+        );
+        setup(&daemon).await;
+        drop(daemon);
+
+        let daemon = storage.daemon_on_localhost().await;
+        assert_eq!(
+            ask(&daemon, Request::SetSync(true)).await,
+            Err(DaemonError::Locked)
+        );
+    }
+
+    /// Test the whole pairing flow between two daemons: both users see the
+    /// same code over IPC and accept, both vaults save the other device, and
+    /// after a restart they reconnect without being asked again
+    #[tokio::test]
+    async fn test_two_daemons_pair_once_and_reconnect_after_restart() {
+        let (storage_a, storage_b) = (TestStorage::new("pair-a"), TestStorage::new("pair-b"));
+        let (a, b) = group_of_two(&storage_a, &storage_b).await;
+
+        // both users pressed "Add device" (the UDP part is tested in udp_networker)
+        a.adding.store(true, Ordering::SeqCst);
+        b.adding.store(true, Ordering::SeqCst);
+
+        let b_addr = b.listen_addr;
+        let connect = tokio::spawn(connect_to(context(&a).await, b_addr));
+
+        let prompt_a = wait_for_prompt(&a).await;
+        let prompt_b = wait_for_prompt(&b).await;
+        assert_eq!(prompt_a.code, prompt_b.code);
+        assert_eq!(a.status().await.pending_pairings, 1);
+
+        // the daemon's IPC answers both
+        for (daemon, prompt) in [(&a, &prompt_a), (&b, &prompt_b)] {
+            ask(
+                daemon,
+                Request::AnswerPairing {
+                    id: prompt.id,
+                    accept: true,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(connect.await.unwrap(), Ok(()));
+        assert_eq!(a.status().await.trusted_peers, 1);
+        assert_eq!(b.status().await.trusted_peers, 1);
+        assert_eq!(a.status().await.pending_pairings, 0);
+
+        // the new peer reaches the vault on its own (re-sealed after pairing)
+        wait_for_saved_peers(&storage_a, 1).await;
+        wait_for_saved_peers(&storage_b, 1).await;
+
+        for daemon in [a, b] {
+            drop(daemon.stop_network().await);
+        }
+
+        // restart both; Sync was saved, the unlock starts networking
+        let a = storage_a.daemon_on_localhost().await;
+        let b = storage_b.daemon_on_localhost().await;
+        for daemon in [&a, &b] {
+            ask(daemon, Request::Unlock(update(DATA_PW))).await.unwrap();
+            assert!(daemon.status().await.network_running);
+        }
+
+        // no "Add device" window anywhere: known devices still connect,
+        // and nobody is asked
+        assert_eq!(connect_to(context(&a).await, b.listen_addr).await, Ok(()));
+        assert!(a.pending_pairing().await.is_none());
+        assert!(b.pending_pairing().await.is_none());
+        assert_eq!(a.status().await.trusted_peers, 1);
+        assert_eq!(b.status().await.trusted_peers, 1);
+    }
+
+    /// Test that a new device is rejected without a prompt when this device
+    /// has no "Add device" window open, and nothing is saved on either side
+    #[tokio::test]
+    async fn test_pairing_outside_add_window_rejected() {
+        let (storage_a, storage_b) = (TestStorage::new("gate-a"), TestStorage::new("gate-b"));
+        let (a, b) = group_of_two(&storage_a, &storage_b).await;
+
+        // only A wants to add a device
+        a.adding.store(true, Ordering::SeqCst);
+
+        let connect = tokio::spawn(connect_to(context(&a).await, b.listen_addr));
+
+        // A's user is asked and accepts; B rejected without asking anybody
+        let prompt = wait_for_prompt(&a).await;
+        assert!(b.pending_pairing().await.is_none());
+        a.answer_pairing(prompt.id, true).await.unwrap();
+
+        assert_eq!(
+            connect.await.unwrap(),
+            Err(TcpNetworkerErrors::FailedToAuthenticate)
+        );
+        assert!(b.pending_pairing().await.is_none());
+        assert_eq!(a.status().await.trusted_peers, 0);
+        assert_eq!(b.status().await.trusted_peers, 0);
+    }
+
+    /// Test that a rejection by one user pairs nobody, and an answer for an
+    /// unknown or already answered pairing is refused
+    #[tokio::test]
+    async fn test_rejected_pairing_and_stale_answers() {
+        let (storage_a, storage_b) = (TestStorage::new("reject-a"), TestStorage::new("reject-b"));
+        let (a, b) = group_of_two(&storage_a, &storage_b).await;
+        a.adding.store(true, Ordering::SeqCst);
+        b.adding.store(true, Ordering::SeqCst);
+
+        let connect = tokio::spawn(connect_to(context(&a).await, b.listen_addr));
+        let prompt_a = wait_for_prompt(&a).await;
+        let prompt_b = wait_for_prompt(&b).await;
+
+        assert_eq!(
+            ask(
+                &b,
+                Request::AnswerPairing {
+                    id: prompt_b.id.wrapping_add(1),
+                    accept: true
+                }
+            )
+            .await,
+            Err(DaemonError::PairingExpired)
+        );
+
+        ask(
+            &b,
+            Request::AnswerPairing {
+                id: prompt_b.id,
+                accept: false,
+            },
+        )
+        .await
+        .unwrap();
+        // answered: gone
+        assert_eq!(
+            ask(
+                &b,
+                Request::AnswerPairing {
+                    id: prompt_b.id,
+                    accept: true
+                }
+            )
+            .await,
+            Err(DaemonError::PairingExpired)
+        );
+        a.answer_pairing(prompt_a.id, true).await.unwrap();
+
+        assert!(connect.await.unwrap().is_err());
+        assert_eq!(a.status().await.trusted_peers, 0);
+        assert_eq!(b.status().await.trusted_peers, 0);
+    }
+
+    /// Test that switching Sync off stops networking and rejects a pairing
+    /// that is still waiting for the user
+    #[tokio::test]
+    async fn test_sync_off_rejects_waiting_pairing() {
+        let (storage_a, storage_b) = (TestStorage::new("off-a"), TestStorage::new("off-b"));
+        let (a, b) = group_of_two(&storage_a, &storage_b).await;
+        a.adding.store(true, Ordering::SeqCst);
+        b.adding.store(true, Ordering::SeqCst);
+
+        let connect = tokio::spawn(connect_to(context(&a).await, b.listen_addr));
+        let prompt_a = wait_for_prompt(&a).await;
+        wait_for_prompt(&b).await;
+
+        ask(&b, Request::SetSync(false)).await.unwrap();
+        // rejected by the stop itself, not only once the handshake noticed
+        assert!(b.pairings.read().await.waiting.is_empty());
+        let status = b.status().await;
+        assert!(!status.network_running && !status.adding_device);
+        assert_eq!(status.pending_pairings, 0);
+        a.answer_pairing(prompt_a.id, true).await.unwrap();
+
+        assert!(connect.await.unwrap().is_err());
+        assert_eq!(a.status().await.trusted_peers, 0);
+        assert_eq!(b.status().await.trusted_peers, 0);
+    }
+
+    /// Test that a network that stopped on its own (listener failure) and is
+    /// started again doesn't inherit an open "Add device" window
+    #[tokio::test]
+    async fn test_restarted_network_has_no_add_window() {
+        let storage = TestStorage::new("restart-window");
+        let daemon = storage.daemon_on_localhost().await;
+        setup(&daemon).await;
+        ask(&daemon, Request::SetSync(true)).await.unwrap();
+
+        daemon.adding.store(true, Ordering::SeqCst);
+        assert!(daemon.status().await.adding_device);
+
+        // what the listener task does when accept fails
+        daemon.network.read().await.as_ref().unwrap().token.cancel();
+        let status = daemon.status().await;
+        assert!(!status.network_running && !status.adding_device);
+
+        // the next state change starts networking again: no window
+        ask(&daemon, Request::SetSync(true)).await.unwrap();
+        let status = daemon.status().await;
+        assert!(status.network_running && !status.adding_device);
+        assert!(!daemon.adding.load(Ordering::SeqCst));
+    }
+
+    /// Test that a password change reaches the running connections: after a
+    /// new auth password on one side only, the two no longer authenticate
+    #[tokio::test]
+    async fn test_password_change_reaches_network() {
+        let (storage_a, storage_b) = (TestStorage::new("keys-a"), TestStorage::new("keys-b"));
+        let (a, b) = group_of_two(&storage_a, &storage_b).await;
+
+        ask(
+            &b,
+            Request::SetAuthPassword(update(b"another auth password")),
+        )
+        .await
+        .unwrap();
+
+        // the networker holds exactly the daemon's new keys
+        let (a_key, d_key) = key_bytes(&b).await;
+        {
+            let shared = context(&b).await.keys;
+            let shared = shared.read().await;
+            assert_eq!(**shared.a_key.expose(), a_key);
+            assert_eq!(**shared.d_key.expose(), d_key);
+        }
+
+        a.adding.store(true, Ordering::SeqCst);
+        b.adding.store(true, Ordering::SeqCst);
+
+        // different a_key: SPAKE2 fails before anybody is asked
+        let started = Instant::now();
+        assert_eq!(
+            connect_to(context(&a).await, b.listen_addr).await,
+            Err(TcpNetworkerErrors::FailedToAuthenticate)
+        );
+        assert!(started.elapsed() < Duration::from_secs(HANDSHAKE_DEADLINE));
+        assert!(a.pending_pairing().await.is_none());
+        assert!(b.pending_pairing().await.is_none());
     }
 
     /// Test that without storage nothing can be unlocked or auto-logged
