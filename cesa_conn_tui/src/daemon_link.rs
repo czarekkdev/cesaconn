@@ -14,8 +14,9 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
-use cesa_conn_system::ipc::{
-    self, IpcErrors, PairingPrompt, PasswordUpdate, PeerInfo, Request, Response, Status,
+use cesa_conn_system::{
+    ipc::{self, IpcErrors, PairingPrompt, PasswordUpdate, PeerInfo, Request, Response, Status},
+    pairing_code::PairingCode,
 };
 
 /// Which of the two keys a password is for.
@@ -45,7 +46,11 @@ pub enum Command {
     /// Open the daemon's "Add device" window.
     AddDevice,
     /// The user's answer to a pairing prompt.
-    AnswerPairing { id: u32, accept: bool },
+    AnswerPairing {
+        id: u32,
+        code: PairingCode,
+        accept: bool,
+    },
 }
 
 /// What a refresh brings back: status, paired devices and the pairing
@@ -174,9 +179,9 @@ async fn run_command(socket: Option<&PathBuf>, command: Command) -> LinkEvent {
         Command::AddDevice => {
             LinkEvent::AddDeviceStarted(send_done(socket, Request::AddDevice).await)
         }
-        Command::AnswerPairing { id, accept } => LinkEvent::PairingAnswered {
+        Command::AnswerPairing { id, code, accept } => LinkEvent::PairingAnswered {
             accept,
-            result: send_done(socket, Request::AnswerPairing { id, accept }).await,
+            result: send_done(socket, Request::AnswerPairing { id, code, accept }).await,
         },
     }
 }
@@ -405,6 +410,7 @@ mod tests {
 
         assert!(link.send(Command::AnswerPairing {
             id: 9,
+            code: [1, 2, 3, 4, 5, 6, 7, 8],
             accept: true
         }));
         assert_eq!(
@@ -418,6 +424,7 @@ mod tests {
             Request::decode(&seen_rx.recv().unwrap()).unwrap(),
             Request::AnswerPairing {
                 id: 9,
+                code: [1, 2, 3, 4, 5, 6, 7, 8],
                 accept: true
             }
         ));

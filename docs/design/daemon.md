@@ -430,7 +430,7 @@ response = 0x00 || payload        (success)
 | `0x09` | SetSync | exactly `0x00` or `0x01` | empty |
 | `0x0A` | AddDevice | none | empty (the window runs in the background) |
 | `0x0B` | PendingPairing | none | `0x00` (none) or `0x01 \|\| id (u32 LE) \|\| code (8) \|\| name len (1) \|\| name` |
-| `0x0C` | AnswerPairing | `id (u32 LE) \|\| accept (exactly 0x00 or 0x01)` | empty |
+| `0x0C` | AnswerPairing | `id (u32 LE) \|\| code (8) \|\| accept (exactly 0x00 or 0x01)` | empty |
 | `0x02`, `0x03` | retired (v1 sent `salt \|\| password`) | refused, so a mismatched UI and daemon fail loudly | |
 
 Status flags: bit 0 auth key set, 1 data key set, 2 network running, 3 vault
@@ -453,7 +453,11 @@ Error codes: `0x01` BadRequest, `0x02` KeyDerivationFailed, `0x03` Internal,
 `0x04` WrongPassword, `0x05` Locked, `0x06` StorageFailed, `0x07` NotSaved,
 `0x08` WeakPassword, `0x09` UnlockDelayed, `0x0A` NetworkOff (AddDevice
 while networking doesn't run), `0x0B` PairingExpired (no waiting pairing has
-that id: answered already, or timed out).
+that id and code: answered already, timed out, or a different pairing).
+
+An answer names the id **and the code** the user saw. Ids start at 0 again
+when the daemon restarts, so an id alone could land on a newer pairing that
+nobody compared; with the code it can only accept exactly what was shown.
 
 Decoding is strict: anything not exactly well-formed is refused (`BadRequest`
 from the daemon, `Malformed` in the client), and responses are decoded for
@@ -578,8 +582,9 @@ to `StorageFailed`, with details only in the daemon log.
   alone. Forged or replayed announcements can at most cause a failed connection.
 - The daemon does not announce itself all the time: only for the 20 s of an
   "Add device" window (section 13), announcing and searching at the same
-  time. A search reports every distinct instance it heard, at most 16
-  (`MAX_FOUND_DEVICES`).
+  time. A search keeps one entry per sending IP (only the IP is used), at
+  most 16 (`MAX_FOUND_DEVICES`), and always runs to its deadline, so a flood
+  of made-up ids from one address can't push real devices out.
 
 ### 9.2 TCP listener **[built]**
 
@@ -1129,8 +1134,10 @@ new pairings (also re-pairing after one side forgot the other).
 **Pairing prompt over IPC.** The bridge task keeps the requests (at most 4;
 more are rejected at once) with a `u32` id. `Status.pending_pairings` tells
 the UI that one waits; `PendingPairing` gives the oldest (id, name, code);
-`AnswerPairing(id, accept)` answers it (`PairingExpired` if it isn't waiting
-any more). Requests whose handshake stopped waiting (60 s timeout,
+`AnswerPairing(id, code, accept)` answers it; the code must be the one shown
+(`PairingExpired` if that pairing isn't waiting any more). The UI replaces a
+shown prompt whenever the daemon reports a different one, not only a
+different id. Requests whose handshake stopped waiting (60 s timeout,
 connection closed) drop out by themselves. Neither call waits for the change
 slot: an Argon2 run must not eat the 60 s. The UI never shows the prompt on
 top of another popup (a half-typed password), shows every symbol with its
@@ -1272,8 +1279,11 @@ Stated plainly so nobody relies on a property that isn't there.
     by signed macOS releases.
 11. **Discovery is a hint** (9.1): during an "Add device" window, a LAN
     attacker can make the daemon try up to 16 connections to addresses of
-    its choice on port 3232. Each costs it one handshake attempt and fails
-    without pw1.
+    its choice on port 3232 (16 different source addresses needed). Each
+    costs it one handshake attempt and fails without pw1. Such an attacker
+    can also jam "Add device" (forged announcements with the real devices'
+    addresses and low ids, so neither side connects); that is a denial of
+    service, never a wrong pairing.
 
 ---
 

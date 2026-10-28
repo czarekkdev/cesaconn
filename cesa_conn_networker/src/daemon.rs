@@ -45,6 +45,7 @@ use cesa_conn_system::{
         PeerInfo, Request, Response, Status, socket_path,
     },
     keychain::{Item, OsKeychain, SecretStore},
+    pairing_code::PairingCode,
 };
 
 use crate::{
@@ -308,10 +309,12 @@ impl Daemon {
             // quick and storage-free: never wait behind an Argon2 run, the
             // pairing timeout is running
             Request::PendingPairing => Response::Pairing(self.pending_pairing().await).encode(),
-            Request::AnswerPairing { id, accept } => match self.answer_pairing(id, accept).await {
-                Ok(()) => Response::Done.encode(),
-                Err(e) => Response::encode_error(e),
-            },
+            Request::AnswerPairing { id, code, accept } => {
+                match self.answer_pairing(id, &code, accept).await {
+                    Ok(()) => Response::Done.encode(),
+                    Err(e) => Response::encode_error(e),
+                }
+            }
             Request::AddDevice => match self.add_device().await {
                 Ok(()) => Response::Done.encode(),
                 Err(e) => Response::encode_error(e),
@@ -1197,15 +1200,22 @@ impl Daemon {
         })
     }
 
-    /// The user's answer to pairing `id`.
-    async fn answer_pairing(&self, id: u32, accept: bool) -> Result<(), DaemonError> {
+    /// The user's answer to pairing `id`. The answer names the code the
+    /// user saw: ids start again after a restart, so an id alone could
+    /// accept a pairing nobody compared.
+    async fn answer_pairing(
+        &self,
+        id: u32,
+        code: &PairingCode,
+        accept: bool,
+    ) -> Result<(), DaemonError> {
         let request = {
             let mut pairings = self.pairings.write().await;
             pairings.prune();
             let index = pairings
                 .waiting
                 .iter()
-                .position(|(waiting, _)| *waiting == id)
+                .position(|(waiting, request)| *waiting == id && request.code == *code)
                 .ok_or(DaemonError::PairingExpired)?;
             pairings.waiting.remove(index).1
         };
@@ -2295,7 +2305,10 @@ mod tests {
 
         // the oldest first; an answer reaches its handshake and frees a place
         let first = daemon.pending_pairing().await.unwrap();
-        daemon.answer_pairing(first.id, true).await.unwrap();
+        daemon
+            .answer_pairing(first.id, &first.code, true)
+            .await
+            .unwrap();
         assert_eq!(answers.remove(0).await, Ok(true));
         assert_ne!(daemon.pending_pairing().await.unwrap().id, first.id);
 
@@ -2433,6 +2446,7 @@ mod tests {
                 daemon,
                 Request::AnswerPairing {
                     id: prompt.id,
+                    code: prompt.code,
                     accept: true,
                 },
             )
@@ -2485,7 +2499,9 @@ mod tests {
         // A's user is asked and accepts; B rejected without asking anybody
         let prompt = wait_for_prompt(&a).await;
         assert!(b.pending_pairing().await.is_none());
-        a.answer_pairing(prompt.id, true).await.unwrap();
+        a.answer_pairing(prompt.id, &prompt.code, true)
+            .await
+            .unwrap();
 
         assert_eq!(
             connect.await.unwrap(),
@@ -2514,17 +2530,36 @@ mod tests {
                 &b,
                 Request::AnswerPairing {
                     id: prompt_b.id.wrapping_add(1),
+                    code: prompt_b.code,
                     accept: true
                 }
             )
             .await,
             Err(DaemonError::PairingExpired)
         );
+        // the right id with another code (a different pairing after a
+        // restart reuses ids) is refused too, and the prompt stays
+        let mut other_code = prompt_b.code;
+        other_code[0] = (other_code[0] + 1) % 64;
+        assert_eq!(
+            ask(
+                &b,
+                Request::AnswerPairing {
+                    id: prompt_b.id,
+                    code: other_code,
+                    accept: true
+                }
+            )
+            .await,
+            Err(DaemonError::PairingExpired)
+        );
+        assert_eq!(b.pending_pairing().await, Some(prompt_b.clone()));
 
         ask(
             &b,
             Request::AnswerPairing {
                 id: prompt_b.id,
+                code: prompt_b.code,
                 accept: false,
             },
         )
@@ -2536,13 +2571,16 @@ mod tests {
                 &b,
                 Request::AnswerPairing {
                     id: prompt_b.id,
+                    code: prompt_b.code,
                     accept: true
                 }
             )
             .await,
             Err(DaemonError::PairingExpired)
         );
-        a.answer_pairing(prompt_a.id, true).await.unwrap();
+        a.answer_pairing(prompt_a.id, &prompt_a.code, true)
+            .await
+            .unwrap();
 
         assert!(connect.await.unwrap().is_err());
         assert_eq!(a.status().await.trusted_peers, 0);
@@ -2568,7 +2606,9 @@ mod tests {
         let status = b.status().await;
         assert!(!status.network_running && !status.adding_device);
         assert_eq!(status.pending_pairings, 0);
-        a.answer_pairing(prompt_a.id, true).await.unwrap();
+        a.answer_pairing(prompt_a.id, &prompt_a.code, true)
+            .await
+            .unwrap();
 
         assert!(connect.await.unwrap().is_err());
         assert_eq!(a.status().await.trusted_peers, 0);

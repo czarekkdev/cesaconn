@@ -30,8 +30,9 @@
 //! * `0x0A` AddDevice: none; opens the "Add device" window (search the LAN,
 //!   pair with what answers)
 //! * `0x0B` PendingPairing: none; the pairing waiting for the user, if any
-//! * `0x0C` AnswerPairing: `id (u32 LE) || accept (1)`, accept exactly
-//!   `0x00` or `0x01`
+//! * `0x0C` AnswerPairing: `id (u32 LE) || code (8) || accept (1)`, accept
+//!   exactly `0x00` or `0x01`; the code must be the one shown, so an answer
+//!   can never land on another pairing (ids start again after a restart)
 //! * `0x02` / `0x03` are retired (version 1 sent `salt || password` there).
 //!   They are refused, so a mismatched UI and daemon fail loudly instead of
 //!   deriving a key from the wrong bytes.
@@ -205,8 +206,8 @@ pub enum DaemonError {
     /// AddDevice: networking isn't running (Sync off, or the keys aren't
     /// saved and unlocked).
     NetworkOff = 0x0A,
-    /// AnswerPairing: no pairing with this id is waiting (answered already,
-    /// or it timed out).
+    /// AnswerPairing: no pairing with this id and code is waiting (answered
+    /// already, timed out, or another pairing after a restart).
     PairingExpired = 0x0B,
 }
 
@@ -284,8 +285,13 @@ pub enum Request {
     AddDevice,
     /// The pairing waiting for the user's answer, if any.
     PendingPairing,
-    /// The user's answer to the pairing `id` (`true` = the codes match).
-    AnswerPairing { id: u32, accept: bool },
+    /// The user's answer to the pairing `id` showing `code` (`true` = the
+    /// codes match).
+    AnswerPairing {
+        id: u32,
+        code: PairingCode,
+        accept: bool,
+    },
 }
 
 /// Daemon status (contains no key material).
@@ -389,10 +395,11 @@ impl Request {
             Request::SetSync(on) => return Zeroizing::new(vec![REQ_SET_SYNC, u8::from(*on)]),
             Request::AddDevice => (REQ_ADD_DEVICE, None),
             Request::PendingPairing => (REQ_PENDING_PAIRING, None),
-            Request::AnswerPairing { id, accept } => {
-                let mut body = Zeroizing::new(Vec::with_capacity(6));
+            Request::AnswerPairing { id, code, accept } => {
+                let mut body = Zeroizing::new(Vec::with_capacity(1 + 4 + PAIRING_CODE_LEN + 1));
                 body.push(REQ_ANSWER_PAIRING);
                 body.extend_from_slice(&id.to_le_bytes());
+                body.extend_from_slice(code);
                 body.push(u8::from(*accept));
                 return body;
             }
@@ -425,13 +432,18 @@ impl Request {
             REQ_SET_SYNC => parse_flag(payload).map(Request::SetSync),
             REQ_ADD_DEVICE if payload.is_empty() => Some(Request::AddDevice),
             REQ_PENDING_PAIRING if payload.is_empty() => Some(Request::PendingPairing),
-            REQ_ANSWER_PAIRING => match payload {
-                [a, b, c, d, accept] => Some(Request::AnswerPairing {
-                    id: u32::from_le_bytes([*a, *b, *c, *d]),
-                    accept: parse_flag(&[*accept])?,
-                }),
-                _ => None,
-            },
+            REQ_ANSWER_PAIRING => {
+                let (id, rest) = payload.split_first_chunk::<4>()?;
+                let (code, accept) = rest.split_first_chunk::<PAIRING_CODE_LEN>()?;
+                if !pairing_code::is_valid(code) {
+                    return None;
+                }
+                Some(Request::AnswerPairing {
+                    id: u32::from_le_bytes(*id),
+                    code: *code,
+                    accept: parse_flag(accept)?,
+                })
+            }
             _ => None,
         }
     }
@@ -822,10 +834,12 @@ mod tests {
             Request::PendingPairing,
             Request::AnswerPairing {
                 id: 0xDEAD_BEEF,
+                code: [0, 1, 2, 3, 60, 61, 62, 63],
                 accept: true,
             },
             Request::AnswerPairing {
                 id: 0,
+                code: [0; PAIRING_CODE_LEN],
                 accept: false,
             },
         ] {
@@ -867,10 +881,21 @@ mod tests {
         // payload-less requests take no payload
         assert!(Request::decode(&[REQ_ADD_DEVICE, 0]).is_none());
         assert!(Request::decode(&[REQ_PENDING_PAIRING, 0]).is_none());
-        // answer: id (4) + exactly 0 or 1
-        assert!(Request::decode(&[REQ_ANSWER_PAIRING, 1, 0, 0, 0]).is_none());
-        assert!(Request::decode(&[REQ_ANSWER_PAIRING, 1, 0, 0, 0, 2]).is_none());
-        assert!(Request::decode(&[REQ_ANSWER_PAIRING, 1, 0, 0, 0, 1, 0]).is_none());
+        // answer: id (4) + code (8, in the table) + exactly 0 or 1
+        let answer = |code: u8, tail: &[u8]| {
+            [
+                &[REQ_ANSWER_PAIRING, 1, 0, 0, 0][..],
+                &[code; PAIRING_CODE_LEN],
+                tail,
+            ]
+            .concat()
+        };
+        assert!(Request::decode(&answer(5, &[1])).is_some());
+        assert!(Request::decode(&answer(5, &[])).is_none());
+        assert!(Request::decode(&answer(5, &[2])).is_none());
+        assert!(Request::decode(&answer(5, &[1, 0])).is_none());
+        assert!(Request::decode(&answer(64, &[1])).is_none());
+        assert!(Request::decode(&[REQ_ANSWER_PAIRING, 1, 0, 0, 0, 1]).is_none());
         // longest allowed password still fits
         let max = [&[REQ_SET_DATA_PASSWORD][..], &vec![b'a'; MAX_PASSWORD_LEN]].concat();
         assert!(Request::decode(&max).is_some());

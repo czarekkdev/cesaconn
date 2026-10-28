@@ -556,8 +556,11 @@ fn handle_pairing_input(app: &mut App, code: KeyCode, prompt: &PairingPrompt) {
         _ => return,
     };
 
+    // the code goes along: the daemon only takes the answer for exactly
+    // the pairing the user looked at
     app.outbox.push(Command::AnswerPairing {
         id: prompt.id,
+        code: prompt.code,
         accept,
     });
     app.active_popup = ActivePopup::None;
@@ -830,7 +833,9 @@ fn handle_link_event(app: &mut App, event: LinkEvent) {
 /// shown prompt that the daemon no longer has expired and is closed.
 fn show_pairing(app: &mut App, pairing: Option<PairingPrompt>) {
     match (&app.active_popup, pairing) {
-        (ActivePopup::Pairing(shown), Some(prompt)) if shown.id == prompt.id => {}
+        // the whole prompt, not just the id: ids start again after a
+        // daemon restart, and the user must see the code they answer
+        (ActivePopup::Pairing(shown), Some(prompt)) if *shown == prompt => {}
         (ActivePopup::Pairing(_) | ActivePopup::None, Some(prompt)) => {
             app.push_log(format!(
                 "[ INFO] {} wants to pair: compare the code with the other device",
@@ -2178,6 +2183,7 @@ mod tests {
             app.outbox.as_slice(),
             [Command::AnswerPairing {
                 id: 4,
+                code: [0, 9, 18, 27, 36, 45, 54, 63],
                 accept: true
             }]
         ));
@@ -2191,6 +2197,7 @@ mod tests {
             app.outbox.as_slice(),
             [Command::AnswerPairing {
                 id: 5,
+                code: [0, 9, 18, 27, 36, 45, 54, 63],
                 accept: false
             }]
         ));
@@ -2238,6 +2245,12 @@ mod tests {
         app.active_popup = ActivePopup::None;
         handle_link_event(&mut app, up_network(true, Some(prompt(1))));
         assert_eq!(app.active_popup, ActivePopup::Pairing(prompt(1)));
+
+        // same id, another pairing (daemon restarted): the new code is shown
+        let mut other = prompt(1);
+        other.code = [1; 8];
+        handle_link_event(&mut app, up_network(true, Some(other.clone())));
+        assert_eq!(app.active_popup, ActivePopup::Pairing(other));
 
         handle_link_event(&mut app, up_network(true, None));
         assert_eq!(app.active_popup, ActivePopup::None);

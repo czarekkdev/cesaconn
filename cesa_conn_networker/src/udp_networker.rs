@@ -220,8 +220,14 @@ pub async fn udp_find_broadcaster(
 pub const MAX_FOUND_DEVICES: usize = 16;
 
 /// Listens for announcements of OTHER devices for `duration` seconds (capped
-/// at [`MAX_BROADCAST_DURATION`]) and returns every distinct instance heard,
-/// at most [`MAX_FOUND_DEVICES`]; an empty list if nobody answered.
+/// at [`MAX_BROADCAST_DURATION`]) and returns one entry per sending IP (the
+/// first instance heard from it), at most [`MAX_FOUND_DEVICES`]; an empty
+/// list if nobody answered.
+///
+/// Per IP, because only the IP is used: a flood of made-up ids from one
+/// address can't fill the list and push real devices out. It keeps
+/// listening until the deadline either way, so the search always takes
+/// `duration` (no early end to race for).
 ///
 /// Same rules as [`udp_find_broadcaster`]: junk and our own announcements are
 /// skipped, one deadline for the whole search, the addresses are only hints.
@@ -252,8 +258,9 @@ pub async fn udp_find_broadcasters(
     // one byte bigger than an announcement, so a longer packet is detectable
     let mut buf = [0u8; ANNOUNCEMENT_LEN + 1];
     let mut found: Vec<(SocketAddr, InstanceId)> = Vec::new();
+    let mut full = false;
 
-    while found.len() < MAX_FOUND_DEVICES {
+    loop {
         let Ok(received) = timeout_at(deadline, socket.recv_from(&mut buf)).await else {
             break;
         };
@@ -264,7 +271,8 @@ pub async fn udp_find_broadcasters(
 
         match buf.get(..len).and_then(parse_announcement) {
             Some(id) if id == own_id => debug!(%addr, "ignoring our own announcement"),
-            Some(id) if found.iter().any(|(_, known)| *known == id) => {}
+            Some(_) if found.iter().any(|(known, _)| known.ip() == addr.ip()) => {}
+            Some(_) if found.len() >= MAX_FOUND_DEVICES => full = true,
             Some(id) => {
                 info!(%addr, "found CesaConn device (unauthenticated hint)");
                 found.push((addr, id));
@@ -273,10 +281,10 @@ pub async fn udp_find_broadcasters(
         }
     }
 
-    if found.len() >= MAX_FOUND_DEVICES {
+    if full {
         warn!(
             max = MAX_FOUND_DEVICES,
-            "too many devices answered, the search stopped early"
+            "more devices answered than one search keeps, ignored the rest"
         );
     }
 
@@ -391,35 +399,28 @@ mod tests {
         assert_eq!(handle.await.unwrap(), Err(UdpNetworkerErrors::Timeout));
     }
 
-    /// Test that a search for all devices reports each other device once and
-    /// skips our own announcement and junk
+    /// Test that a search for all devices reports each sending address once
+    /// (many ids from one address are one device, so a flood of made-up ids
+    /// can't fill the list) and skips our own announcement and junk
     #[tokio::test]
-    async fn test_finds_every_device_once() {
+    async fn test_finds_each_address_once() {
         let _guard = port_lock().lock().await;
         let own = InstanceId::generate().unwrap();
         let handle = tokio::spawn(async move { udp_find_broadcasters(1, own).await });
         sleep(Duration::from_millis(100)).await;
 
-        let (a, b) = (InstanceId([1; 16]), InstanceId([2; 16]));
-        for packet in [
-            announcement(a),
-            announcement(own),
-            announcement(a),
-            announcement(b),
-        ] {
-            send_local(&packet).await;
-        }
+        // all from 127.0.0.1: the first real one counts, the flood doesn't
+        send_local(&announcement(own)).await;
         send_local(b"garbage").await;
+        let first = InstanceId([1; 16]);
+        send_local(&announcement(first)).await;
+        for byte in 2..=40u8 {
+            send_local(&announcement(InstanceId([byte; 16]))).await;
+        }
 
-        let mut ids: Vec<InstanceId> = handle
-            .await
-            .unwrap()
-            .unwrap()
-            .into_iter()
-            .map(|(_, id)| id)
-            .collect();
-        ids.sort();
-        assert_eq!(ids, vec![a, b]);
+        let found = handle.await.unwrap().unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1, first);
     }
 
     /// Test that a search nobody answers ends with an empty list, not an error
