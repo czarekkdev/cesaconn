@@ -98,8 +98,18 @@ Pair two devices on the same network:
 
 Set the passwords on the **first device only**. A device where you set them
 yourself starts its own group and can't pair with the others; Add device
-then says "a device nearby is in a different group". Reset that device (no
-passwords set) and press `n` there to join.
+then says "a device nearby is in a different group". Reset that device
+(Settings > **Reset this device**, type `RESET`) and press `n` there to join.
+
+Managing devices:
+
+- **Forget a device:** Devices, select it, `d`, then `y`. It can no longer
+  connect to this device, but it still knows the group passwords: it can
+  ask to pair again during Add device (press `n` on the prompt to refuse).
+- **Reset this device:** Settings > Reset this device, type `RESET`. Deletes
+  both keys, the encrypted vault, the keychain items and every paired device
+  on this device only; it also works when you forgot the data password.
+  Forget it on the other devices too.
 
 Allow incoming connections when macOS asks (UDP 3636, TCP 3232 and 3233).
 The full design, threat model and known limits are in

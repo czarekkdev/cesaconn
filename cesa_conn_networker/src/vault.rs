@@ -509,6 +509,23 @@ pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), VaultErrors> {
     result
 }
 
+/// Deletes the vault file (a device reset); a missing file is not an error.
+/// The directory is fsynced, so the deletion survives a crash.
+pub fn delete_file(path: &Path) -> Result<(), VaultErrors> {
+    let dir = path.parent().ok_or(VaultErrors::Io)?;
+    check_private_dir(dir).map_err(|_| VaultErrors::InsecureDirectory)?;
+
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(VaultErrors::Io),
+    }
+
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|_| VaultErrors::Io)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -750,6 +767,21 @@ mod tests {
             seal(&wrapped, &dek, &many_peers).err(),
             Some(VaultErrors::TooLarge)
         );
+    }
+
+    /// Test that a reset deletes the vault file and that a missing one is fine
+    #[test]
+    fn test_file_delete() {
+        let dir = test_dir("delete");
+        let path = vault_path(&dir);
+
+        // nothing there: not an error
+        assert_eq!(delete_file(&path), Ok(()));
+
+        write_file_atomic(&path, b"secret").unwrap();
+        assert_eq!(delete_file(&path), Ok(()));
+        assert_eq!(read_file(&path), Ok(None));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
     }
 
     /// Test the file side: atomic write is 0600, reads back, no temp left,

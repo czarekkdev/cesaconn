@@ -36,6 +36,10 @@ const AUTH_KEY_LABEL: &str = "Auth key";
 const DATA_KEY_LABEL: &str = "Data key";
 const AUTO_LOGIN_LABEL: &str = "Automatic login";
 const SYNC_LABEL: &str = "Sync";
+const RESET_LABEL: &str = "Reset this device";
+
+/// What the user types to confirm a reset (a key press alone is too easy).
+const RESET_WORD: &str = "RESET";
 
 /// Logged once when "Add device" finds a device of another group.
 const OTHER_GROUP_HINT: &str = "[ WARN] A device nearby is in a different group (other passwords setup): \
@@ -54,6 +58,8 @@ pub enum SettingKind {
     /// A secret saved in the locked vault: editing it unlocks instead.
     Locked,
     Bool(bool),
+    /// Not a value: Enter starts something (after asking).
+    Action,
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +78,7 @@ impl Setting {
             SettingKind::Locked => ("[locked: Enter to unlock]", Color::Yellow),
             SettingKind::Bool(true) => ("on", Color::Green),
             SettingKind::Bool(false) => ("off", Color::DarkGray),
+            SettingKind::Action => ("[Enter: wipe keys, vault, paired devices]", Color::Red),
         }
     }
 }
@@ -110,6 +117,10 @@ enum ActivePopup {
     ConfirmPasswordChange(KeyKind),
     /// Joining a group: the group's auth password, then its data password.
     JoinGroup(JoinStep),
+    /// "Forget this device?" (y / n).
+    ConfirmForget(PeerInfo),
+    /// "Reset this device?": the user types [`RESET_WORD`].
+    ConfirmReset,
 }
 
 /// Which password the join popup asks for.
@@ -189,6 +200,11 @@ impl App {
                 Setting {
                     label: SYNC_LABEL,
                     kind: SettingKind::Bool(false),
+                    warn_message: None,
+                },
+                Setting {
+                    label: RESET_LABEL,
+                    kind: SettingKind::Action,
                     warn_message: None,
                 },
             ],
@@ -333,6 +349,14 @@ fn handle_input(app: &mut App) -> io::Result<()> {
             handle_join_input(app, key.code, step);
             return Ok(());
         }
+        ActivePopup::ConfirmForget(peer) => {
+            handle_confirm_forget_input(app, key.code, &peer);
+            return Ok(());
+        }
+        ActivePopup::ConfirmReset => {
+            handle_confirm_reset_input(app, key.code);
+            return Ok(());
+        }
         ActivePopup::None => {}
     }
 
@@ -349,6 +373,7 @@ fn handle_input(app: &mut App) -> io::Result<()> {
             KeyCode::Down | KeyCode::Char('j') => app.next_peer(),
             KeyCode::Char('n') => start_add_device(app),
             KeyCode::Char('x') => stop_or_cancel(app),
+            KeyCode::Char('d') => ask_forget_selected(app),
             _ => {}
         },
         Tab::Settings => match key.code {
@@ -377,6 +402,12 @@ fn handle_input(app: &mut App) -> io::Result<()> {
 
 fn handle_settings_enter(app: &mut App) {
     let idx = app.settings_selected;
+
+    if matches!(app.settings.get(idx).map(|s| s.label), Some(RESET_LABEL)) {
+        clear_input(app);
+        app.active_popup = ActivePopup::ConfirmReset;
+        return;
+    }
 
     let (is_bool, currently_on, has_warning) = app
         .active_settings()
@@ -449,6 +480,51 @@ fn handle_confirm_change_input(app: &mut App, code: KeyCode) {
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
             app.active_popup = ActivePopup::None;
         }
+        _ => {}
+    }
+}
+
+/// `d` on Devices: asks before forgetting the selected device.
+fn ask_forget_selected(app: &mut App) {
+    if let Some(peer) = app.selected_peer().cloned() {
+        app.active_popup = ActivePopup::ConfirmForget(peer);
+    }
+}
+
+/// y: forget the device; anything that cancels: nothing changes.
+fn handle_confirm_forget_input(app: &mut App, code: KeyCode, peer: &PeerInfo) {
+    match code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.outbox.push(Command::ForgetPeer(peer.fingerprint));
+            app.push_log(format!("[ INFO] Forgetting {}", peer.name));
+            app.active_popup = ActivePopup::None;
+        }
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+            app.active_popup = ActivePopup::None;
+        }
+        _ => {}
+    }
+}
+
+/// Typing [`RESET_WORD`] then Enter resets; Esc cancels. Anything else
+/// typed and Enter does nothing (no reset by a stray key).
+fn handle_confirm_reset_input(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Esc => {
+            clear_input(app);
+            app.active_popup = ActivePopup::None;
+        }
+        KeyCode::Enter if app.input_buf.as_str() == RESET_WORD => {
+            clear_input(app);
+            app.active_popup = ActivePopup::None;
+            app.outbox.push(Command::ResetDevice);
+            app.push_log("[ WARN] Resetting this device");
+        }
+        KeyCode::Enter => {}
+        KeyCode::Backspace => {
+            app.input_buf.pop();
+        }
+        KeyCode::Char(c) => push_input(app, c),
         _ => {}
     }
 }
@@ -831,6 +907,32 @@ fn handle_link_event(app: &mut App, event: LinkEvent) {
             }
             app.request_refresh();
         }
+        LinkEvent::PeerForgotten(result) => {
+            match result {
+                Ok(()) => app.push_log(
+                    "[ INFO] Device forgotten here. It still knows the group passwords: to keep it out for good, change them on every device",
+                ),
+                Err(IpcErrors::Daemon(DaemonError::Locked)) => {
+                    app.push_log("[ WARN] Saved keys are locked: unlock first")
+                }
+                Err(IpcErrors::Daemon(DaemonError::UnknownPeer)) => {
+                    app.push_log("[ WARN] That device isn't paired any more")
+                }
+                Err(e) => app.push_log(format!("[ERROR] Forgetting the device failed: {e}")),
+            }
+            app.request_refresh();
+        }
+        LinkEvent::DeviceReset(result) => {
+            match result {
+                Ok(()) => app.push_log(
+                    "[ INFO] Device reset: no keys, no paired devices. n on Devices joins a group",
+                ),
+                Err(e) => app.push_log(format!(
+                    "[ERROR] Reset incomplete: {e}. Run it again (see the daemon log)"
+                )),
+            }
+            app.request_refresh();
+        }
         LinkEvent::WorkerStopped => {
             if app.daemon != DaemonState::NoLink {
                 app.push_log("[ERROR] The daemon link stopped, restart the UI");
@@ -936,6 +1038,8 @@ fn ui(frame: &mut Frame, app: &mut App) {
         }
         ActivePopup::ConfirmPasswordChange(kind) => render_confirm_change_popup(frame, area, kind),
         ActivePopup::JoinGroup(step) => render_join_popup(frame, area, step, app),
+        ActivePopup::ConfirmForget(peer) => render_confirm_forget_popup(frame, area, &peer),
+        ActivePopup::ConfirmReset => render_confirm_reset_popup(frame, area, app),
         ActivePopup::None => {}
     }
 }
@@ -1061,7 +1165,7 @@ fn render_devices(frame: &mut Frame, area: Rect, app: &mut App) {
     )));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  n: add device / join    x: stop / cancel join",
+        "  n: add device / join    x: stop / cancel join    d: forget",
         Style::default().fg(Color::DarkGray),
     )));
 
@@ -1163,7 +1267,7 @@ fn render_logs(frame: &mut Frame, area: Rect, app: &mut App) {
 
 fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
     let help = match app.active_tab {
-        Tab::Devices => " q:Quit  Tab:Switch  ↑↓:Select  n:Add device/Join  x:Stop ",
+        Tab::Devices => " q:Quit  Tab:Switch  ↑↓:Select  n:Add/Join  x:Stop  d:Forget ",
         Tab::Settings => " q:Quit  Tab:Switch  ↑↓:Navigate  Enter:Edit ",
         Tab::Logs => " q:Quit  Tab:Switch  ↑↓:Scroll  f:Follow ",
     };
@@ -1447,6 +1551,114 @@ fn render_confirm_change_popup(frame: &mut Frame, area: Rect, kind: KeyKind) {
     );
 }
 
+fn render_confirm_forget_popup(frame: &mut Frame, area: Rect, peer: &PeerInfo) {
+    let w = 64u16.min(area.width);
+    let h = 10u16.min(area.height);
+    let popup = centered_rect(area, w, h);
+
+    let yellow = Style::default().fg(Color::Yellow);
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(
+                "  Forget {} ({})?",
+                peer.name,
+                fingerprint_hex(&peer.fingerprint)
+            ),
+            yellow,
+        )),
+        Line::from(Span::styled(
+            "  It can't connect to this device any more.",
+            yellow,
+        )),
+        Line::from(Span::styled(
+            "  It still knows the group passwords: it can pair again",
+            yellow,
+        )),
+        Line::from(Span::styled("  if you accept it in Add device.", yellow)),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "  y",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(": forget   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "Esc/n",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(": cancel", Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" Forget device ")
+                .title_alignment(Alignment::Center)
+                .border_type(BorderType::Double)
+                .style(yellow),
+        ),
+        popup,
+    );
+}
+
+fn render_confirm_reset_popup(frame: &mut Frame, area: Rect, app: &App) {
+    let w = 66u16.min(area.width);
+    let h = 13u16.min(area.height);
+    let popup = centered_rect(area, w, h);
+
+    let red = Style::default().fg(Color::Red);
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Reset this device? It leaves its group.",
+            red,
+        )),
+        Line::from(Span::styled(
+            "  Deleted: both keys, the encrypted vault, the keychain",
+            red,
+        )),
+        Line::from(Span::styled(
+            "  items and every paired device. Other devices keep theirs.",
+            red,
+        )),
+        Line::from(Span::styled(
+            "  Afterwards: n on Devices joins a group again.",
+            Style::default().fg(Color::Reset),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  Type {RESET_WORD} and press Enter:"),
+            Style::default().fg(Color::Reset),
+        )),
+        Line::from(Span::styled(
+            format!("  > {}", app.input_buf.as_str()),
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Esc: cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" Reset device ")
+                .title_alignment(Alignment::Center)
+                .border_type(BorderType::Double)
+                .style(red),
+        ),
+        popup,
+    );
+}
+
 fn render_security_warning_popup(frame: &mut Frame, area: Rect, idx: usize, app: &App) {
     let Some(setting) = app.settings.get(idx) else {
         return;
@@ -1659,7 +1871,13 @@ mod tests {
         let labels: Vec<_> = app.settings.iter().map(|s| s.label).collect();
         assert_eq!(
             labels,
-            [AUTH_KEY_LABEL, DATA_KEY_LABEL, AUTO_LOGIN_LABEL, SYNC_LABEL]
+            [
+                AUTH_KEY_LABEL,
+                DATA_KEY_LABEL,
+                AUTO_LOGIN_LABEL,
+                SYNC_LABEL,
+                RESET_LABEL
+            ]
         );
     }
 
@@ -2272,7 +2490,7 @@ mod tests {
         let (status, keys) = (row(22), row(23));
 
         assert!(status.contains("daemon: keys 2/2"), "status: {status}");
-        for key in ["q:Quit", "n:Add device/Join", "x:Stop"] {
+        for key in ["q:Quit", "n:Add/Join", "x:Stop", "d:Forget"] {
             assert!(keys.contains(key), "{key} missing in: {keys}");
         }
     }
@@ -2304,6 +2522,90 @@ mod tests {
                 .collect(),
             None,
         )))
+    }
+
+    /// Test that `d` asks before forgetting, sends the selected device's
+    /// fingerprint only after y, and does nothing without a device
+    #[test]
+    fn test_forget_asks_first() {
+        let mut app = App::new();
+        ask_forget_selected(&mut app);
+        assert_eq!(app.active_popup, ActivePopup::None);
+
+        handle_link_event(
+            &mut app,
+            status_with(&["phone", "laptop"], Status::default()),
+        );
+        app.next_peer();
+        ask_forget_selected(&mut app);
+        let ActivePopup::ConfirmForget(peer) = app.active_popup.clone() else {
+            panic!("no confirmation");
+        };
+        assert_eq!(peer.name, "laptop");
+        assert!(screen(&mut app).contains("Forget laptop"));
+
+        // other keys wait, n cancels
+        handle_confirm_forget_input(&mut app, KeyCode::Char('x'), &peer);
+        assert!(matches!(app.active_popup, ActivePopup::ConfirmForget(_)));
+        handle_confirm_forget_input(&mut app, KeyCode::Char('n'), &peer);
+        assert_eq!(app.active_popup, ActivePopup::None);
+        assert!(
+            app.outbox
+                .iter()
+                .all(|c| !matches!(c, Command::ForgetPeer(_)))
+        );
+
+        handle_confirm_forget_input(&mut app, KeyCode::Char('y'), &peer);
+        assert!(matches!(
+            app.outbox.last(),
+            Some(Command::ForgetPeer([1, 1, 1, 1, 1, 1, 1, 1]))
+        ));
+        assert_eq!(app.active_popup, ActivePopup::None);
+    }
+
+    /// Test that a reset needs the exact word typed and Enter, and that Esc
+    /// cancels and wipes what was typed
+    #[test]
+    fn test_reset_needs_the_word() {
+        let mut app = App::new();
+        app.settings_selected = app
+            .settings
+            .iter()
+            .position(|s| s.label == RESET_LABEL)
+            .unwrap();
+        let resets = |app: &App| {
+            app.outbox
+                .iter()
+                .filter(|c| matches!(c, Command::ResetDevice))
+                .count()
+        };
+
+        handle_settings_enter(&mut app);
+        assert_eq!(app.active_popup, ActivePopup::ConfirmReset);
+        assert!(screen(&mut app).contains("Type RESET"));
+
+        // Enter alone, a wrong word, lower case: nothing
+        handle_confirm_reset_input(&mut app, KeyCode::Enter);
+        for c in "reset".chars() {
+            handle_confirm_reset_input(&mut app, KeyCode::Char(c));
+        }
+        handle_confirm_reset_input(&mut app, KeyCode::Enter);
+        assert_eq!(resets(&app), 0);
+        assert_eq!(app.active_popup, ActivePopup::ConfirmReset);
+
+        // Esc: cancelled, typed text wiped
+        handle_confirm_reset_input(&mut app, KeyCode::Esc);
+        assert_eq!(app.active_popup, ActivePopup::None);
+        assert!(app.input_buf.is_empty());
+
+        handle_settings_enter(&mut app);
+        for c in RESET_WORD.chars() {
+            handle_confirm_reset_input(&mut app, KeyCode::Char(c));
+        }
+        handle_confirm_reset_input(&mut app, KeyCode::Enter);
+        assert_eq!(resets(&app), 1);
+        assert_eq!(app.active_popup, ActivePopup::None);
+        assert!(app.input_buf.is_empty());
     }
 
     /// Test that the Devices tab lists the daemon's paired devices with the
