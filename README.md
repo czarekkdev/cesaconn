@@ -92,7 +92,7 @@ cargo run --release -p cesa_conn_tui         # the terminal UI
 Pair two devices on the same network:
 
 1. first device: Settings > set both passwords, turn **Sync** on, then
-   Devices > `n` (Add device, open for 2 minutes);
+   Devices > `n` (Add device, open for 2 minutes; `x` stops it early);
 2. new device: Devices > `n` (Join a group), enter the same two passwords;
 3. both show the same 8 emoji with names: press `y` on both.
 

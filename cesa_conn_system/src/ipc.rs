@@ -37,6 +37,7 @@
 //!   both `1..=MAX_PASSWORD_LEN`, consumed exactly; a fresh device joins the
 //!   group of a device whose user opened "Add device"
 //! * `0x0E` CancelJoin: none; ends a running join and wipes its passwords
+//! * `0x0F` StopAddDevice: none; ends the "Add device" window early
 //! * `0x02` / `0x03` are retired (version 1 sent `salt || password` there).
 //!   They are refused, so a mismatched UI and daemon fail loudly instead of
 //!   deriving a key from the wrong bytes.
@@ -52,7 +53,7 @@
 //!   Versions 2 to 4 were shorter, so a mismatched UI and daemon fail with
 //!   `Malformed`.
 //! * SetAuthPassword / SetDataPassword / Unlock / SetAutoLogin / SetSync /
-//!   AddDevice / AnswerPairing / JoinGroup / CancelJoin: empty
+//!   AddDevice / AnswerPairing / JoinGroup / CancelJoin / StopAddDevice: empty
 //! * ListPeers: `count (u16 LE) || count * (fingerprint (8) || name len (1) || name)`
 //! * PendingPairing: `0x00` (none) or `0x01 || id (u32 LE) || code (8) ||
 //!   name len (1) || name`; every code byte is below
@@ -127,6 +128,7 @@ const REQ_PENDING_PAIRING: u8 = 0x0B;
 const REQ_ANSWER_PAIRING: u8 = 0x0C;
 const REQ_JOIN_GROUP: u8 = 0x0D;
 const REQ_CANCEL_JOIN: u8 = 0x0E;
+const REQ_STOP_ADD_DEVICE: u8 = 0x0F;
 
 /* status flags2 */
 /// flags2: joining a group
@@ -321,6 +323,8 @@ pub enum Request {
     JoinGroup(JoinPasswords),
     /// End a running join; its passwords are wiped.
     CancelJoin,
+    /// End the "Add device" window before its time is up.
+    StopAddDevice,
 }
 
 /// The two group passwords for `JoinGroup`, each in its own exact-size
@@ -436,6 +440,7 @@ impl Request {
             Request::AddDevice => (REQ_ADD_DEVICE, None),
             Request::PendingPairing => (REQ_PENDING_PAIRING, None),
             Request::CancelJoin => (REQ_CANCEL_JOIN, None),
+            Request::StopAddDevice => (REQ_STOP_ADD_DEVICE, None),
             Request::JoinGroup(passwords) => {
                 let (auth, data) = (&passwords.auth.password, &passwords.data.password);
                 // the encoder never cuts: a too long password goes out whole
@@ -489,6 +494,7 @@ impl Request {
             REQ_ADD_DEVICE if payload.is_empty() => Some(Request::AddDevice),
             REQ_PENDING_PAIRING if payload.is_empty() => Some(Request::PendingPairing),
             REQ_CANCEL_JOIN if payload.is_empty() => Some(Request::CancelJoin),
+            REQ_STOP_ADD_DEVICE if payload.is_empty() => Some(Request::StopAddDevice),
             REQ_JOIN_GROUP => {
                 let (auth_len, rest) = payload.split_first_chunk::<2>()?;
                 let auth_len = usize::from(u16::from_le_bytes(*auth_len));
@@ -634,6 +640,7 @@ impl Response {
             | Request::AnswerPairing { .. }
             | Request::JoinGroup(_)
             | Request::CancelJoin
+            | Request::StopAddDevice
                 if payload.is_empty() =>
             {
                 Ok(Response::Done)
@@ -646,7 +653,8 @@ impl Response {
             | Request::AddDevice
             | Request::AnswerPairing { .. }
             | Request::JoinGroup(_)
-            | Request::CancelJoin => Err(IpcErrors::Malformed),
+            | Request::CancelJoin
+            | Request::StopAddDevice => Err(IpcErrors::Malformed),
             Request::ListPeers => decode_peers(payload).ok_or(IpcErrors::Malformed),
             Request::PendingPairing => decode_pairing(payload).ok_or(IpcErrors::Malformed),
         }
@@ -923,6 +931,7 @@ mod tests {
                 accept: false,
             },
             Request::CancelJoin,
+            Request::StopAddDevice,
             Request::JoinGroup(JoinPasswords {
                 auth: update(b"auth pass"),
                 data: update(b" data "),
@@ -1008,6 +1017,7 @@ mod tests {
         assert_eq!(passwords.auth.password.as_slice(), b" a ");
         assert_eq!(passwords.data.password.as_slice(), b"b ");
         assert!(Request::decode(&[REQ_CANCEL_JOIN, 0]).is_none());
+        assert!(Request::decode(&[REQ_STOP_ADD_DEVICE, 0]).is_none());
     }
 
     /// Test that every daemon error code round-trips, and unknown status bits are refused

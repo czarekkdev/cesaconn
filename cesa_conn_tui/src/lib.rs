@@ -426,7 +426,7 @@ fn handle_input(app: &mut App) -> io::Result<()> {
             KeyCode::Up | KeyCode::Char('k') => app.prev_device(),
             KeyCode::Down | KeyCode::Char('j') => app.next_device(),
             KeyCode::Char('n') => start_add_device(app),
-            KeyCode::Char('x') => cancel_join(app),
+            KeyCode::Char('x') => stop_or_cancel(app),
             KeyCode::Char('d') => {
                 let selected = app.device_list_state.selected();
                 let addr_str = selected
@@ -562,7 +562,7 @@ fn start_add_device(app: &mut App) {
         DaemonState::Up(status) if status.network_running => {
             app.outbox.push(Command::AddDevice);
             app.push_log(
-                "[ INFO] Add device open for 2 min: press n on the new device (or on another of yours), then compare the code",
+                "[ INFO] Add device open for 2 min (x stops it): press n on the new device (or on another of yours), then compare the code",
             );
         }
         DaemonState::Up(status) if status.joining => {
@@ -582,11 +582,21 @@ fn is_fresh(status: &Status) -> bool {
     !status.auth_key_set && !status.data_key_set && !status.locked && !status.saved
 }
 
-/// `x` on Devices: ends a running join.
-fn cancel_join(app: &mut App) {
-    if matches!(&app.daemon, DaemonState::Up(status) if status.joining) {
-        app.outbox.push(Command::CancelJoin);
-        app.push_log("[ INFO] Cancelling the join");
+/// `x` on Devices: ends a running join, or the "Add device" window. The
+/// window is stopped whenever networking runs, not only once the status
+/// shows it open: `x` right after `n` comes before the next refresh, and
+/// stopping a window that isn't open does nothing.
+fn stop_or_cancel(app: &mut App) {
+    match &app.daemon {
+        DaemonState::Up(status) if status.joining => {
+            app.outbox.push(Command::CancelJoin);
+            app.push_log("[ INFO] Cancelling the join");
+        }
+        DaemonState::Up(status) if status.network_running => {
+            app.outbox.push(Command::StopAddDevice);
+            app.push_log("[ INFO] Stopping Add device: no longer visible to new devices");
+        }
+        _ => {}
     }
 }
 
@@ -921,6 +931,12 @@ fn handle_link_event(app: &mut App, event: LinkEvent) {
             }
             app.request_refresh();
         }
+        LinkEvent::AddDeviceStopped(result) => {
+            if let Err(e) = result {
+                app.push_log(format!("[ERROR] Stopping Add device failed: {e}"));
+            }
+            app.request_refresh();
+        }
         LinkEvent::JoinCancelled(result) => {
             if let Err(e) = result {
                 app.push_log(format!("[ERROR] Cancelling the join failed: {e}"));
@@ -1175,7 +1191,7 @@ fn render_devices(frame: &mut Frame, area: Rect, app: &mut App) {
                 ]),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  n: add device / join    x: cancel join    d: disconnect",
+                    "  n: add device / join    x: stop add device / cancel join    d: disconnect",
                     Style::default().fg(Color::DarkGray),
                 )),
             ]
@@ -1294,7 +1310,7 @@ fn render_logs(frame: &mut Frame, area: Rect, app: &mut App) {
 
 fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
     let help = match app.active_tab {
-        Tab::Devices => " q:Quit  Tab:Switch  ↑↓:Navigate  n:Add device/Join  x:Cancel join ",
+        Tab::Devices => " q:Quit  Tab:Switch  ↑↓:Navigate  n:Add device/Join  x:Stop ",
         Tab::Settings => " q:Quit  Tab:Switch  ←→:Section  ↑↓:Navigate  Enter:Edit ",
         Tab::Logs => " q:Quit  Tab:Switch  ↑↓:Scroll  f:Follow ",
     };
@@ -2406,7 +2422,8 @@ mod tests {
     }
 
     /// Test that a device with keys never offers a join, and that x cancels
-    /// a running join (only then)
+    /// a running join (only then; with networking off there is nothing to
+    /// stop)
     #[test]
     fn test_join_only_fresh_and_cancel() {
         let mut app = App::new();
@@ -2416,19 +2433,40 @@ mod tests {
         assert_eq!(app.active_popup, ActivePopup::None);
         assert!(app.outbox.is_empty());
 
-        cancel_join(&mut app);
+        stop_or_cancel(&mut app);
         assert!(app.outbox.is_empty());
 
         handle_link_event(&mut app, fresh_status(true));
         app.outbox.clear();
         start_add_device(&mut app);
         assert_eq!(app.active_popup, ActivePopup::None);
-        cancel_join(&mut app);
+        stop_or_cancel(&mut app);
         assert!(matches!(app.outbox.as_slice(), [Command::CancelJoin]));
 
         // the end of the join is reported
         handle_link_event(&mut app, fresh_status(false));
         assert!(app.logs.iter().any(|l| l.contains("ended without joining")));
+    }
+
+    /// Test that x stops "Add device" whenever networking runs (also right
+    /// after n, before the status shows the window), and that the stop is
+    /// reported back
+    #[test]
+    fn test_x_stops_add_device() {
+        let mut app = App::new();
+        handle_link_event(&mut app, up_network(true, None));
+        app.outbox.clear();
+
+        start_add_device(&mut app);
+        stop_or_cancel(&mut app);
+        assert!(matches!(
+            app.outbox.as_slice(),
+            [Command::AddDevice, Command::StopAddDevice]
+        ));
+
+        app.outbox.clear();
+        handle_link_event(&mut app, LinkEvent::AddDeviceStopped(Ok(())));
+        assert!(matches!(app.outbox.as_slice(), [Command::Refresh]));
     }
 
     /// Test that the join popup shows stars, never the password

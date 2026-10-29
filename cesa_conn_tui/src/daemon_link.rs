@@ -58,6 +58,8 @@ pub enum Command {
     JoinGroup(JoinPasswords),
     /// End a running join.
     CancelJoin,
+    /// End the "Add device" window early.
+    StopAddDevice,
 }
 
 /// What a refresh brings back: status, paired devices and the pairing
@@ -97,6 +99,8 @@ pub enum LinkEvent {
     JoinStarted(Result<(), IpcErrors>),
     /// Answer to [`Command::CancelJoin`].
     JoinCancelled(Result<(), IpcErrors>),
+    /// Answer to [`Command::StopAddDevice`].
+    AddDeviceStopped(Result<(), IpcErrors>),
     /// The worker is gone (its runtime couldn't start, or it panicked).
     WorkerStopped,
 }
@@ -200,6 +204,9 @@ async fn run_command(socket: Option<&PathBuf>, command: Command) -> LinkEvent {
         }
         Command::CancelJoin => {
             LinkEvent::JoinCancelled(send_done(socket, Request::CancelJoin).await)
+        }
+        Command::StopAddDevice => {
+            LinkEvent::AddDeviceStopped(send_done(socket, Request::StopAddDevice).await)
         }
     }
 }
@@ -316,7 +323,7 @@ mod tests {
             rt.block_on(async move {
                 let listener = UnixListener::bind(&server_path).unwrap();
 
-                for _ in 0..11 {
+                for _ in 0..12 {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     let body = ipc::read_frame(&mut stream).await.unwrap();
 
@@ -334,7 +341,8 @@ mod tests {
                         | Request::AddDevice
                         | Request::AnswerPairing { .. }
                         | Request::JoinGroup(_)
-                        | Request::CancelJoin => {
+                        | Request::CancelJoin
+                        | Request::StopAddDevice => {
                             seen_tx.send(body.to_vec()).unwrap();
                             Response::Done.encode()
                         }
@@ -470,6 +478,13 @@ mod tests {
         assert!(matches!(
             Request::decode(&seen_rx.recv().unwrap()).unwrap(),
             Request::CancelJoin
+        ));
+
+        assert!(link.send(Command::StopAddDevice));
+        assert_eq!(wait_for_event(&link), LinkEvent::AddDeviceStopped(Ok(())));
+        assert!(matches!(
+            Request::decode(&seen_rx.recv().unwrap()).unwrap(),
+            Request::StopAddDevice
         ));
 
         server.join().unwrap();
