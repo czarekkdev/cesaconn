@@ -43,19 +43,6 @@ const REFRESH_INTERVAL: u64 = 2;
 // ── Data types ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum DeviceStatus {
-    Connected,
-    Connecting,
-    Disconnected,
-}
-
-#[derive(Debug, Clone)]
-pub struct Device {
-    pub addr: String,
-    pub status: DeviceStatus,
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub enum SettingKind {
     Secret {
         configured: bool,
@@ -63,15 +50,12 @@ pub enum SettingKind {
     /// A secret saved in the locked vault: editing it unlocks instead.
     Locked,
     Bool(bool),
-    Text,
 }
 
 #[derive(Debug, Clone)]
 pub struct Setting {
     pub label: &'static str,
     pub kind: SettingKind,
-    /// Current value — used for Text settings; empty for Secret.
-    pub value: String,
     /// If Some, enabling this Bool shows a security warning with this message.
     pub warn_message: Option<&'static str>,
 }
@@ -84,13 +68,6 @@ impl Setting {
             SettingKind::Locked => ("[locked: Enter to unlock]", Color::Yellow),
             SettingKind::Bool(true) => ("on", Color::Green),
             SettingKind::Bool(false) => ("off", Color::DarkGray),
-            SettingKind::Text => {
-                if self.value.is_empty() {
-                    ("[not set]", Color::DarkGray)
-                } else {
-                    (self.value.as_str(), Color::Cyan)
-                }
-            }
         }
     }
 }
@@ -115,12 +92,6 @@ enum Tab {
     Logs,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum SettingsSection {
-    Basic,
-    Advanced,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 enum ActivePopup {
     None,
@@ -128,7 +99,6 @@ enum ActivePopup {
     Pairing(PairingPrompt),
     EditSetting,
     SecurityWarning {
-        section: SettingsSection,
         idx: usize,
     },
     /// "Are you sure?" before changing a password that is already set.
@@ -150,12 +120,10 @@ enum JoinStep {
 pub struct App {
     active_tab: Tab,
 
-    pub devices: Vec<Device>,
-    device_list_state: ListState,
+    /// Which paired device the Devices tab shows.
+    peer_list_state: ListState,
 
-    pub settings_basic: Vec<Setting>,
-    pub settings_advanced: Vec<Setting>,
-    settings_section: SettingsSection,
+    pub settings: Vec<Setting>,
     settings_selected: usize,
 
     pub logs: Vec<String>,
@@ -189,30 +157,24 @@ impl Default for App {
 
 impl App {
     pub fn new() -> Self {
-        let mut device_list_state = ListState::default();
-        device_list_state.select(Some(0));
-
         Self {
             active_tab: Tab::Devices,
-            devices: Vec::new(),
-            device_list_state,
-            settings_basic: vec![
+            peer_list_state: ListState::default(),
+            // only settings the daemon really has: nothing that does nothing
+            settings: vec![
                 Setting {
                     label: AUTH_KEY_LABEL,
                     kind: SettingKind::Secret { configured: false },
-                    value: String::new(),
                     warn_message: None,
                 },
                 Setting {
                     label: DATA_KEY_LABEL,
                     kind: SettingKind::Secret { configured: false },
-                    value: String::new(),
                     warn_message: None,
                 },
                 Setting {
                     label: AUTO_LOGIN_LABEL,
                     kind: SettingKind::Bool(false),
-                    value: String::new(),
                     warn_message: Some(
                         "Your data key will be stored in the OS keychain.\n\
                          Its security then depends on your OS and account:\n\
@@ -223,43 +185,9 @@ impl App {
                 Setting {
                     label: SYNC_LABEL,
                     kind: SettingKind::Bool(false),
-                    value: String::new(),
-                    warn_message: None,
-                },
-                Setting {
-                    label: "Auto-connect",
-                    kind: SettingKind::Bool(false),
-                    value: String::new(),
-                    warn_message: None,
-                },
-                Setting {
-                    label: "UDP discovery",
-                    kind: SettingKind::Bool(true),
-                    value: String::new(),
                     warn_message: None,
                 },
             ],
-            settings_advanced: vec![
-                Setting {
-                    label: "Listen address",
-                    kind: SettingKind::Text,
-                    value: "0.0.0.0".into(),
-                    warn_message: None,
-                },
-                Setting {
-                    label: "Listen port",
-                    kind: SettingKind::Text,
-                    value: "3232".into(),
-                    warn_message: None,
-                },
-                Setting {
-                    label: "UDP broadcast duration (s)",
-                    kind: SettingKind::Text,
-                    value: "3".into(),
-                    warn_message: None,
-                },
-            ],
-            settings_section: SettingsSection::Basic,
             settings_selected: 0,
             logs: Vec::new(),
             log_scroll: 0,
@@ -284,10 +212,7 @@ impl App {
     }
 
     fn setting_mut(&mut self, label: &str) -> Option<&mut Setting> {
-        self.settings_basic
-            .iter_mut()
-            .chain(self.settings_advanced.iter_mut())
-            .find(|s| s.label == label)
+        self.settings.iter_mut().find(|s| s.label == label)
     }
 
     pub fn push_log(&mut self, msg: impl Into<String>) {
@@ -295,17 +220,7 @@ impl App {
     }
 
     fn active_settings(&self) -> &Vec<Setting> {
-        match self.settings_section {
-            SettingsSection::Basic => &self.settings_basic,
-            SettingsSection::Advanced => &self.settings_advanced,
-        }
-    }
-
-    fn active_settings_mut(&mut self) -> &mut Vec<Setting> {
-        match self.settings_section {
-            SettingsSection::Basic => &mut self.settings_basic,
-            SettingsSection::Advanced => &mut self.settings_advanced,
-        }
+        &self.settings
     }
 
     fn next_tab(&mut self) {
@@ -324,39 +239,42 @@ impl App {
         };
     }
 
-    fn switch_settings_section(&mut self, section: SettingsSection) {
-        self.settings_section = section;
-        self.settings_selected = 0;
-    }
-
-    fn next_device(&mut self) {
-        if self.devices.is_empty() {
+    fn next_peer(&mut self) {
+        if self.peers.is_empty() {
             return;
         }
         let i = self
-            .device_list_state
+            .peer_list_state
             .selected()
-            .map(|i| wrap_next(i, self.devices.len()))
-            .unwrap_or(0);
-        self.device_list_state.select(Some(i));
+            .map_or(0, |i| wrap_next(i, self.peers.len()));
+        self.peer_list_state.select(Some(i));
     }
 
-    fn prev_device(&mut self) {
-        if self.devices.is_empty() {
+    fn prev_peer(&mut self) {
+        if self.peers.is_empty() {
             return;
         }
         let i = self
-            .device_list_state
+            .peer_list_state
             .selected()
-            .map(|i| wrap_prev(i, self.devices.len()))
-            .unwrap_or(0);
-        self.device_list_state.select(Some(i));
+            .map_or(0, |i| wrap_prev(i, self.peers.len()));
+        self.peer_list_state.select(Some(i));
     }
 
-    fn selected_device(&self) -> Option<&Device> {
-        self.device_list_state
+    fn selected_peer(&self) -> Option<&PeerInfo> {
+        self.peer_list_state
             .selected()
-            .and_then(|i| self.devices.get(i))
+            .and_then(|i| self.peers.get(i))
+    }
+
+    /// Keeps the selection on a device that exists after the list changed.
+    fn clamp_peer_selection(&mut self) {
+        let selected = match (self.peer_list_state.selected(), self.peers.len()) {
+            (_, 0) => None,
+            (Some(i), len) => Some(i.min(len.saturating_sub(1))),
+            (None, _) => Some(0),
+        };
+        self.peer_list_state.select(selected);
     }
 
     fn next_setting(&mut self) {
@@ -399,8 +317,8 @@ fn handle_input(app: &mut App) -> io::Result<()> {
             handle_edit_setting_input(app, key.code);
             return Ok(());
         }
-        ActivePopup::SecurityWarning { section, idx } => {
-            handle_security_warning_input(app, key.code, section, idx);
+        ActivePopup::SecurityWarning { idx } => {
+            handle_security_warning_input(app, key.code, idx);
             return Ok(());
         }
         ActivePopup::ConfirmPasswordChange(_) => {
@@ -423,33 +341,15 @@ fn handle_input(app: &mut App) -> io::Result<()> {
 
     match app.active_tab {
         Tab::Devices => match key.code {
-            KeyCode::Up | KeyCode::Char('k') => app.prev_device(),
-            KeyCode::Down | KeyCode::Char('j') => app.next_device(),
+            KeyCode::Up | KeyCode::Char('k') => app.prev_peer(),
+            KeyCode::Down | KeyCode::Char('j') => app.next_peer(),
             KeyCode::Char('n') => start_add_device(app),
             KeyCode::Char('x') => stop_or_cancel(app),
-            KeyCode::Char('d') => {
-                let selected = app.device_list_state.selected();
-                let addr_str = selected
-                    .and_then(|i| app.devices.get(i))
-                    .map(|d| d.addr.clone());
-                if let (Some(addr_str), Some(i)) = (addr_str, selected) {
-                    if let Some(dev) = app.devices.get_mut(i) {
-                        dev.status = DeviceStatus::Disconnected;
-                    }
-                    app.push_log(format!("[ INFO] Disconnected from {}", addr_str));
-                }
-            }
             _ => {}
         },
         Tab::Settings => match key.code {
             KeyCode::Up | KeyCode::Char('k') => app.prev_setting(),
             KeyCode::Down | KeyCode::Char('j') => app.next_setting(),
-            KeyCode::Left | KeyCode::Char('h') => {
-                app.switch_settings_section(SettingsSection::Basic)
-            }
-            KeyCode::Right | KeyCode::Char('l') => {
-                app.switch_settings_section(SettingsSection::Advanced)
-            }
             KeyCode::Enter => handle_settings_enter(app),
             _ => {}
         },
@@ -472,7 +372,6 @@ fn handle_input(app: &mut App) -> io::Result<()> {
 }
 
 fn handle_settings_enter(app: &mut App) {
-    let section = app.settings_section;
     let idx = app.settings_selected;
 
     let (is_bool, currently_on, has_warning) = app
@@ -486,12 +385,12 @@ fn handle_settings_enter(app: &mut App) {
 
     if is_bool {
         if !currently_on && has_warning {
-            app.active_popup = ActivePopup::SecurityWarning { section, idx };
-        } else if is_auto_login(app, section, idx) {
+            app.active_popup = ActivePopup::SecurityWarning { idx };
+        } else if is_auto_login(app, idx) {
             // turning it off: the daemon deletes d_key from the keychain
             app.outbox.push(Command::SetAutoLogin(false));
             app.push_log("[ INFO] Turning automatic login off");
-        } else if is_sync(app, section, idx) {
+        } else if is_sync(app, idx) {
             // the daemon decides and saves it; the switch follows its status
             app.outbox.push(Command::SetSync(!currently_on));
             app.push_log(if currently_on {
@@ -499,10 +398,6 @@ fn handle_settings_enter(app: &mut App) {
             } else {
                 "[ INFO] Turning sync on"
             });
-        } else if let Some(s) = app.active_settings_mut().get_mut(idx)
-            && let SettingKind::Bool(ref mut v) = s.kind
-        {
-            *v = !*v;
         }
     } else if matches!(
         app.active_settings().get(idx).map(|s| &s.kind),
@@ -681,15 +576,9 @@ fn handle_edit_setting_input(app: &mut App, code: KeyCode) {
             clear_input(app);
         }
         KeyCode::Enter => {
-            if selected_key_kind(app).is_some() {
-                // a password: exactly as typed (never trimmed), straight to the daemon
-                send_password_from_input(app);
-            } else {
-                let new_value = Zeroizing::new(app.input_buf.trim().to_owned());
-                if !new_value.is_empty() {
-                    apply_setting_edit(app, &new_value);
-                }
-            }
+            // every editable setting is a password: exactly as typed (never
+            // trimmed), straight to the daemon
+            send_password_from_input(app);
             app.active_popup = ActivePopup::None;
             clear_input(app);
         }
@@ -715,17 +604,6 @@ fn push_input(app: &mut App, c: char) {
 /// Wipes the whole input buffer (spare capacity too), keeping its allocation.
 fn clear_input(app: &mut App) {
     app.input_buf.zeroize();
-}
-
-fn apply_setting_edit(app: &mut App, new_value: &str) {
-    let idx = app.settings_selected;
-
-    // secrets never come through here, see `send_password_from_input`
-    if let Some(s) = app.active_settings_mut().get_mut(idx)
-        && s.kind == SettingKind::Text
-    {
-        s.value = new_value.to_owned();
-    }
 }
 
 /// Which key the selected setting is, if it is one.
@@ -830,6 +708,7 @@ fn handle_link_event(app: &mut App, event: LinkEvent) {
                 s.kind = SettingKind::Bool(status.sync_enabled);
             }
             app.peers = peers;
+            app.clamp_peer_selection();
             app.daemon = DaemonState::Up(status);
             show_pairing(app, pairing);
         }
@@ -844,6 +723,7 @@ fn handle_link_event(app: &mut App, event: LinkEvent) {
             // nothing is known about keys or peers without the daemon
             set_key_flags(app, false, false);
             app.peers.clear();
+            app.clamp_peer_selection();
             app.daemon = DaemonState::Down(e);
             show_pairing(app, None);
         }
@@ -950,6 +830,7 @@ fn handle_link_event(app: &mut App, event: LinkEvent) {
 
             set_key_flags(app, false, false);
             app.peers.clear();
+            app.clamp_peer_selection();
             app.daemon = DaemonState::NoLink;
             show_pairing(app, None);
         }
@@ -987,48 +868,30 @@ fn set_key_flags(app: &mut App, auth: bool, data: bool) {
     }
 }
 
-/// Whether `idx` in `section` is the Sync switch.
-fn is_sync(app: &App, section: SettingsSection, idx: usize) -> bool {
-    let settings = match section {
-        SettingsSection::Basic => &app.settings_basic,
-        SettingsSection::Advanced => &app.settings_advanced,
-    };
-    matches!(settings.get(idx).map(|s| s.label), Some(SYNC_LABEL))
+/// Whether setting `idx` is the Sync switch.
+fn is_sync(app: &App, idx: usize) -> bool {
+    matches!(app.settings.get(idx).map(|s| s.label), Some(SYNC_LABEL))
 }
 
-/// Whether `idx` in `section` is the automatic-login switch.
-fn is_auto_login(app: &App, section: SettingsSection, idx: usize) -> bool {
-    let settings = match section {
-        SettingsSection::Basic => &app.settings_basic,
-        SettingsSection::Advanced => &app.settings_advanced,
-    };
-    matches!(settings.get(idx).map(|s| s.label), Some(AUTO_LOGIN_LABEL))
+/// Whether setting `idx` is the automatic-login switch.
+fn is_auto_login(app: &App, idx: usize) -> bool {
+    matches!(
+        app.settings.get(idx).map(|s| s.label),
+        Some(AUTO_LOGIN_LABEL)
+    )
 }
 
-fn handle_security_warning_input(
-    app: &mut App,
-    code: KeyCode,
-    section: SettingsSection,
-    idx: usize,
-) {
+/// y: turn automatic login on (the only switch with a warning); anything
+/// that cancels: nothing changes.
+fn handle_security_warning_input(app: &mut App, code: KeyCode, idx: usize) {
     match code {
-        KeyCode::Char('y') | KeyCode::Char('Y') if is_auto_login(app, section, idx) => {
-            // the daemon decides; the switch follows its status
-            app.outbox.push(Command::SetAutoLogin(true));
-            app.push_log(
-                "[ WARN] Turning automatic login on: your data key goes to the OS keychain",
-            );
-            app.active_popup = ActivePopup::None;
-        }
         KeyCode::Char('y') | KeyCode::Char('Y') => {
-            let settings = match section {
-                SettingsSection::Basic => &mut app.settings_basic,
-                SettingsSection::Advanced => &mut app.settings_advanced,
-            };
-            if let Some(s) = settings.get_mut(idx)
-                && let SettingKind::Bool(ref mut v) = s.kind
-            {
-                *v = true;
+            if is_auto_login(app, idx) {
+                // the daemon decides; the switch follows its status
+                app.outbox.push(Command::SetAutoLogin(true));
+                app.push_log(
+                    "[ WARN] Turning automatic login on: your data key goes to the OS keychain",
+                );
             }
             app.active_popup = ActivePopup::None;
         }
@@ -1060,8 +923,8 @@ fn ui(frame: &mut Frame, app: &mut App) {
     match app.active_popup.clone() {
         ActivePopup::Pairing(prompt) => render_pairing_popup(frame, area, &prompt),
         ActivePopup::EditSetting => render_edit_setting_popup(frame, area, app),
-        ActivePopup::SecurityWarning { section, idx } => {
-            render_security_warning_popup(frame, area, section, idx, app)
+        ActivePopup::SecurityWarning { idx } => {
+            render_security_warning_popup(frame, area, idx, app)
         }
         ActivePopup::ConfirmPasswordChange(kind) => render_confirm_change_popup(frame, area, kind),
         ActivePopup::JoinGroup(step) => render_join_popup(frame, area, step, app),
@@ -1101,17 +964,13 @@ fn render_content(frame: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn render_devices(frame: &mut Frame, area: Rect, app: &mut App) {
-    let [left_area, detail_area] =
+    let [list_area, detail_area] =
         Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).areas(area);
 
-    // paired devices come from the daemon; borders + at least one row
-    let paired_height = to_u16(app.peers.len().max(1).saturating_add(2)).min(left_area.height / 2);
-    let [paired_area, list_area] =
-        Layout::vertical([Constraint::Length(paired_height), Constraint::Min(0)]).areas(left_area);
-
+    // paired devices come from the daemon (public data only)
     let paired: Vec<ListItem> = if app.peers.is_empty() {
         vec![ListItem::new(Span::styled(
-            "  none yet",
+            "  none yet: n adds one",
             Style::default().fg(Color::DarkGray),
         ))]
     } else {
@@ -1121,44 +980,15 @@ fn render_devices(frame: &mut Frame, area: Rect, app: &mut App) {
                 ListItem::new(Line::from(vec![
                     Span::styled("◆ ", Style::default().fg(Color::Green)),
                     Span::raw(p.name.as_str()),
-                    Span::styled(
-                        format!("  {}", fingerprint_hex(&p.fingerprint)),
-                        Style::default().fg(Color::DarkGray),
-                    ),
                 ]))
             })
             .collect()
     };
 
-    frame.render_widget(
-        List::new(paired).block(
-            Block::bordered()
-                .title(" Paired ")
-                .border_type(BorderType::Rounded),
-        ),
-        paired_area,
-    );
-
-    let items: Vec<ListItem> = app
-        .devices
-        .iter()
-        .map(|d| {
-            let (icon, color) = match d.status {
-                DeviceStatus::Connected => ("● ", Color::Green),
-                DeviceStatus::Connecting => ("◌ ", Color::Yellow),
-                DeviceStatus::Disconnected => ("○ ", Color::DarkGray),
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled(icon, Style::default().fg(color)),
-                Span::raw(d.addr.as_str()),
-            ]))
-        })
-        .collect();
-
-    let list = List::new(items)
+    let list = List::new(paired)
         .block(
             Block::bordered()
-                .title(" Devices ")
+                .title(" Paired devices ")
                 .border_type(BorderType::Rounded),
         )
         .highlight_style(
@@ -1167,41 +997,64 @@ fn render_devices(frame: &mut Frame, area: Rect, app: &mut App) {
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▶ ");
+    frame.render_stateful_widget(list, list_area, &mut app.peer_list_state);
 
-    frame.render_stateful_widget(list, list_area, &mut app.device_list_state);
-
-    let detail_lines = match app.selected_device() {
-        None => vec![Line::from(Span::styled(
-            "  No devices",
-            Style::default().fg(Color::DarkGray),
-        ))],
-        Some(dev) => {
-            let (status_str, status_color) = match dev.status {
-                DeviceStatus::Connected => ("Connected", Color::Green),
-                DeviceStatus::Connecting => ("Connecting...", Color::Yellow),
-                DeviceStatus::Disconnected => ("Disconnected", Color::DarkGray),
-            };
-            vec![
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled("  Address : ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(dev.addr.as_str(), Style::default().fg(Color::Cyan)),
-                ]),
-                Line::from(vec![
-                    Span::styled("  Status  : ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(status_str, Style::default().fg(status_color)),
-                ]),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  n: add device / join    x: stop add device / cancel join    d: disconnect",
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ]
+    let mut lines = vec![Line::from("")];
+    match app.selected_peer() {
+        Some(peer) => {
+            lines.push(Line::from(vec![
+                Span::styled("  Name        : ", Style::default().fg(Color::DarkGray)),
+                Span::styled(peer.name.as_str(), Style::default().fg(Color::Cyan)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  Fingerprint : ", Style::default().fg(Color::DarkGray)),
+                Span::raw(fingerprint_hex(&peer.fingerprint)),
+            ]));
         }
+        None => lines.push(Line::from(Span::styled(
+            "  No paired device yet",
+            Style::default().fg(Color::DarkGray),
+        ))),
+    }
+
+    // what this device is doing right now, from the daemon's status
+    let (activity, color) = match &app.daemon {
+        DaemonState::Up(s) if s.joining => (
+            "Joining a group: compare the code when it appears (x cancels)",
+            Color::Yellow,
+        ),
+        DaemonState::Up(s) if s.adding_device => (
+            "Add device is open: visible to new devices (x stops it)",
+            Color::Yellow,
+        ),
+        DaemonState::Up(s) if s.network_running => {
+            ("Sync on: paired devices can connect", Color::Green)
+        }
+        DaemonState::Up(s) if s.locked => ("Locked: Settings > Data key unlocks it", Color::Yellow),
+        DaemonState::Up(s) if is_fresh(s) => (
+            "New device: n joins a group (or set both passwords to start one)",
+            Color::Cyan,
+        ),
+        DaemonState::Up(s) if s.sync_enabled => (
+            "Sync on, but networking failed: see the daemon log",
+            Color::Red,
+        ),
+        DaemonState::Up(_) => ("Sync off: Settings > Sync", Color::DarkGray),
+        _ => ("Daemon not reachable", Color::DarkGray),
     };
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("  {activity}"),
+        Style::default().fg(color),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  n: add device / join    x: stop / cancel join",
+        Style::default().fg(Color::DarkGray),
+    )));
 
     frame.render_widget(
-        Paragraph::new(detail_lines).block(
+        Paragraph::new(lines).block(
             Block::bordered()
                 .title(" Details ")
                 .border_type(BorderType::Rounded),
@@ -1217,21 +1070,7 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
     let inner = outer_block.inner(area);
     frame.render_widget(outer_block, area);
 
-    let [section_area, list_area] =
-        Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(inner);
-
-    let section_tabs = Tabs::new(["  Basic  ", "  Advanced  "])
-        .select(match app.settings_section {
-            SettingsSection::Basic => 0,
-            SettingsSection::Advanced => 1,
-        })
-        .style(Style::default().fg(Color::DarkGray))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
-    frame.render_widget(section_tabs, section_area);
+    let [_, list_area] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
 
     const LABEL_WIDTH: usize = 30;
     let settings = app.active_settings();
@@ -1312,16 +1151,10 @@ fn render_logs(frame: &mut Frame, area: Rect, app: &mut App) {
 
 fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
     let help = match app.active_tab {
-        Tab::Devices => " q:Quit  Tab:Switch  ↑↓:Navigate  n:Add device/Join  x:Stop ",
-        Tab::Settings => " q:Quit  Tab:Switch  ←→:Section  ↑↓:Navigate  Enter:Edit ",
+        Tab::Devices => " q:Quit  Tab:Switch  ↑↓:Select  n:Add device/Join  x:Stop ",
+        Tab::Settings => " q:Quit  Tab:Switch  ↑↓:Navigate  Enter:Edit ",
         Tab::Logs => " q:Quit  Tab:Switch  ↑↓:Scroll  f:Follow ",
     };
-
-    let connected = app
-        .devices
-        .iter()
-        .filter(|d| d.status == DeviceStatus::Connected)
-        .count();
 
     let (daemon_str, daemon_color) = match &app.daemon {
         DaemonState::Unknown => ("daemon: …".to_owned(), Color::DarkGray),
@@ -1361,7 +1194,7 @@ fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
         DaemonState::NoLink => ("daemon: link stopped".to_owned(), Color::Red),
     };
 
-    let status_str = format!(" {daemon_str}  {connected} connected ");
+    let status_str = format!(" {daemon_str}");
 
     // each on its own full-width line: the state can be as long as it
     // needs (it is cut at the edge), the keys are never covered
@@ -1602,18 +1435,8 @@ fn render_confirm_change_popup(frame: &mut Frame, area: Rect, kind: KeyKind) {
     );
 }
 
-fn render_security_warning_popup(
-    frame: &mut Frame,
-    area: Rect,
-    section: SettingsSection,
-    idx: usize,
-    app: &App,
-) {
-    let settings = match section {
-        SettingsSection::Basic => &app.settings_basic,
-        SettingsSection::Advanced => &app.settings_advanced,
-    };
-    let Some(setting) = settings.get(idx) else {
+fn render_security_warning_popup(frame: &mut Frame, area: Rect, idx: usize, app: &App) {
+    let Some(setting) = app.settings.get(idx) else {
         return;
     };
     let Some(warn_msg) = setting.warn_message else {
@@ -1811,26 +1634,21 @@ mod tests {
     #[test]
     fn new_starts_with_empty_state() {
         let app = App::new();
-        assert!(app.devices.is_empty());
+        assert!(app.peers.is_empty());
         assert!(app.logs.is_empty());
         assert!(!app.should_quit);
     }
 
+    /// Test that only settings the daemon really has are offered: no
+    /// switch or field that does nothing
     #[test]
-    fn new_has_expected_basic_settings() {
+    fn new_has_only_real_settings() {
         let app = App::new();
-        let labels: Vec<_> = app.settings_basic.iter().map(|s| s.label).collect();
-        assert!(labels.contains(&"Auth key"));
-        assert!(labels.contains(&"Data key"));
-        assert!(labels.contains(&AUTO_LOGIN_LABEL));
-    }
-
-    #[test]
-    fn new_has_expected_advanced_settings() {
-        let app = App::new();
-        let labels: Vec<_> = app.settings_advanced.iter().map(|s| s.label).collect();
-        assert!(labels.contains(&"Listen address"));
-        assert!(labels.contains(&"Listen port"));
+        let labels: Vec<_> = app.settings.iter().map(|s| s.label).collect();
+        assert_eq!(
+            labels,
+            [AUTH_KEY_LABEL, DATA_KEY_LABEL, AUTO_LOGIN_LABEL, SYNC_LABEL]
+        );
     }
 
     // ── Settings display ──────────────────────────────────────────────────
@@ -1840,7 +1658,6 @@ mod tests {
         let s = Setting {
             label: "Auth key",
             kind: SettingKind::Secret { configured: false },
-            value: String::new(),
             warn_message: None,
         };
         let (text, _) = s.display_value();
@@ -1852,7 +1669,6 @@ mod tests {
         let s = Setting {
             label: "Auth key",
             kind: SettingKind::Secret { configured: true },
-            value: String::new(),
             warn_message: None,
         };
         let (text, _) = s.display_value();
@@ -1864,45 +1680,20 @@ mod tests {
         let on = Setting {
             label: "x",
             kind: SettingKind::Bool(true),
-            value: String::new(),
             warn_message: None,
         };
         let off = Setting {
             label: "x",
             kind: SettingKind::Bool(false),
-            value: String::new(),
             warn_message: None,
         };
         assert_eq!(on.display_value().0, "on");
         assert_eq!(off.display_value().0, "off");
     }
 
-    #[test]
-    fn text_setting_empty_shows_not_set() {
-        let s = Setting {
-            label: "x",
-            kind: SettingKind::Text,
-            value: String::new(),
-            warn_message: None,
-        };
-        assert_eq!(s.display_value().0, "[not set]");
-    }
-
-    #[test]
-    fn text_setting_with_value_shows_value() {
-        let s = Setting {
-            label: "x",
-            kind: SettingKind::Text,
-            value: "0.0.0.0".into(),
-            warn_message: None,
-        };
-        assert_eq!(s.display_value().0, "0.0.0.0");
-    }
-
     // ── daemon link ───────────────────────────────────────────────────────
 
-    fn select(app: &mut App, section: SettingsSection, label: &str) {
-        app.switch_settings_section(section);
+    fn select(app: &mut App, label: &str) {
         app.settings_selected = app
             .active_settings()
             .iter()
@@ -1941,7 +1732,7 @@ mod tests {
     #[test]
     fn test_password_sent_as_typed_and_wiped() {
         let mut app = App::new();
-        select(&mut app, SettingsSection::Basic, AUTH_KEY_LABEL);
+        select(&mut app, AUTH_KEY_LABEL);
 
         type_and_enter(&mut app, " hunter two 2 ");
 
@@ -1954,10 +1745,9 @@ mod tests {
         assert!(app.input_buf.is_empty());
         assert!(!app.logs.iter().any(|l| l.contains("hunter")));
         assert!(
-            !app.settings_basic
+            !app.settings
                 .iter()
-                .chain(app.settings_advanced.iter())
-                .any(|s| s.label.to_lowercase().contains("salt") || s.value.contains("hunter"))
+                .any(|s| s.label.to_lowercase().contains("salt"))
         );
         assert_eq!(
             app.setting_mut(AUTH_KEY_LABEL).unwrap().kind,
@@ -1969,7 +1759,7 @@ mod tests {
     #[test]
     fn test_data_password_and_empty_input() {
         let mut app = App::new();
-        select(&mut app, SettingsSection::Basic, DATA_KEY_LABEL);
+        select(&mut app, DATA_KEY_LABEL);
 
         type_and_enter(&mut app, "");
         assert!(app.outbox.is_empty());
@@ -2003,7 +1793,7 @@ mod tests {
     #[test]
     fn test_short_new_password_not_sent() {
         let mut app = App::new();
-        select(&mut app, SettingsSection::Basic, DATA_KEY_LABEL);
+        select(&mut app, DATA_KEY_LABEL);
 
         type_and_enter(&mut app, &"a".repeat(MIN_NEW_PASSWORD_LEN - 1));
 
@@ -2025,11 +1815,11 @@ mod tests {
         );
         assert!(app.logs.iter().any(|l| l.contains("locked")));
 
-        select(&mut app, SettingsSection::Basic, AUTH_KEY_LABEL);
+        select(&mut app, AUTH_KEY_LABEL);
         type_and_enter(&mut app, "auth password 1");
         assert!(app.outbox.is_empty());
 
-        select(&mut app, SettingsSection::Basic, DATA_KEY_LABEL);
+        select(&mut app, DATA_KEY_LABEL);
         type_and_enter(&mut app, "data password 1");
         let [Command::Unlock(update)] = app.outbox.as_slice() else {
             panic!("expected one Unlock command");
@@ -2045,23 +1835,17 @@ mod tests {
     fn test_auto_login_goes_through_daemon() {
         let mut app = App::new();
         handle_link_event(&mut app, up_locked(false, false));
-        select(&mut app, SettingsSection::Basic, AUTO_LOGIN_LABEL);
+        select(&mut app, AUTO_LOGIN_LABEL);
         let idx = app.settings_selected;
 
         // turning on shows the warning first
         handle_settings_enter(&mut app);
-        assert_eq!(
-            app.active_popup,
-            ActivePopup::SecurityWarning {
-                section: SettingsSection::Basic,
-                idx
-            }
-        );
-        handle_security_warning_input(&mut app, KeyCode::Char('n'), SettingsSection::Basic, idx);
+        assert_eq!(app.active_popup, ActivePopup::SecurityWarning { idx });
+        handle_security_warning_input(&mut app, KeyCode::Char('n'), idx);
         assert!(app.outbox.is_empty());
 
         handle_settings_enter(&mut app);
-        handle_security_warning_input(&mut app, KeyCode::Char('y'), SettingsSection::Basic, idx);
+        handle_security_warning_input(&mut app, KeyCode::Char('y'), idx);
         assert!(matches!(
             app.outbox.as_slice(),
             [Command::SetAutoLogin(true)]
@@ -2119,7 +1903,7 @@ mod tests {
         );
         app.outbox.clear();
         app.active_tab = Tab::Settings;
-        select(&mut app, SettingsSection::Basic, DATA_KEY_LABEL);
+        select(&mut app, DATA_KEY_LABEL);
 
         handle_settings_enter(&mut app);
         assert_eq!(app.active_popup, ActivePopup::None);
@@ -2159,7 +1943,7 @@ mod tests {
     fn test_password_change_asks_first() {
         let mut app = App::new();
         handle_link_event(&mut app, up(true, true));
-        select(&mut app, SettingsSection::Basic, DATA_KEY_LABEL);
+        select(&mut app, DATA_KEY_LABEL);
 
         handle_settings_enter(&mut app);
         assert_eq!(
@@ -2184,27 +1968,15 @@ mod tests {
     #[test]
     fn test_setup_and_unlock_dont_ask() {
         let mut app = App::new();
-        select(&mut app, SettingsSection::Basic, AUTH_KEY_LABEL);
+        select(&mut app, AUTH_KEY_LABEL);
         handle_settings_enter(&mut app);
         assert_eq!(app.active_popup, ActivePopup::EditSetting);
 
         let mut app = App::new();
         handle_link_event(&mut app, up_locked(true, false));
-        select(&mut app, SettingsSection::Basic, DATA_KEY_LABEL);
+        select(&mut app, DATA_KEY_LABEL);
         handle_settings_enter(&mut app);
         assert_eq!(app.active_popup, ActivePopup::EditSetting);
-    }
-
-    /// Test that ordinary text settings are still trimmed and stored
-    #[test]
-    fn test_text_setting_still_trimmed() {
-        let mut app = App::new();
-        select(&mut app, SettingsSection::Advanced, "Listen port");
-
-        type_and_enter(&mut app, " 4000 ");
-
-        assert_eq!(app.setting_mut("Listen port").unwrap().value, "4000");
-        assert!(app.outbox.is_empty());
     }
 
     /// Test that daemon status drives the key flags and the paired list
@@ -2307,7 +2079,7 @@ mod tests {
         );
 
         app.outbox.clear();
-        select(&mut app, SettingsSection::Basic, SYNC_LABEL);
+        select(&mut app, SYNC_LABEL);
         handle_settings_enter(&mut app);
         assert!(matches!(app.outbox.as_slice(), [Command::SetSync(false)]));
         // still on until the daemon says otherwise
@@ -2491,6 +2263,96 @@ mod tests {
         for key in ["q:Quit", "n:Add device/Join", "x:Stop"] {
             assert!(keys.contains(key), "{key} missing in: {keys}");
         }
+    }
+
+    fn screen(app: &mut App) -> String {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| ui(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn status_with(peers: &[&str], status: Status) -> LinkEvent {
+        LinkEvent::Refreshed(Ok((
+            status,
+            peers
+                .iter()
+                .enumerate()
+                .map(|(i, name)| PeerInfo {
+                    fingerprint: [u8::try_from(i).unwrap(); 8],
+                    name: (*name).into(),
+                })
+                .collect(),
+            None,
+        )))
+    }
+
+    /// Test that the Devices tab lists the daemon's paired devices with the
+    /// selected one's details and what this device is doing now, and has no
+    /// made-up "connected" count
+    #[test]
+    fn test_devices_tab_shows_paired_and_activity() {
+        let mut app = App::new();
+        let mut status = Status {
+            auth_key_set: true,
+            data_key_set: true,
+            saved: true,
+            network_running: true,
+            sync_enabled: true,
+            trusted_peers: 2,
+            ..Status::default()
+        };
+        handle_link_event(&mut app, status_with(&["laptop", "phone"], status));
+
+        let shown = screen(&mut app);
+        assert!(shown.contains("laptop") && shown.contains("phone"));
+        assert!(shown.contains(&fingerprint_hex(&[0; 8])));
+        assert!(shown.contains("Sync on"));
+        assert!(!shown.contains("connected"));
+
+        app.next_peer();
+        assert!(screen(&mut app).contains(&fingerprint_hex(&[1; 8])));
+
+        status.adding_device = true;
+        handle_link_event(&mut app, status_with(&["laptop", "phone"], status));
+        assert!(screen(&mut app).contains("Add device is open"));
+
+        // the hint fits the state: a fresh device joins, a locked one unlocks
+        handle_link_event(&mut app, status_with(&[], Status::default()));
+        assert!(screen(&mut app).contains("n joins a group"));
+        let locked = Status {
+            locked: true,
+            saved: true,
+            ..Status::default()
+        };
+        handle_link_event(&mut app, status_with(&[], locked));
+        assert!(screen(&mut app).contains("Locked"));
+    }
+
+    /// Test that the selection follows the list: it moves back when the
+    /// selected device goes, and there is none when the list is empty
+    #[test]
+    fn test_peer_selection_clamped() {
+        let mut app = App::new();
+        handle_link_event(&mut app, status_with(&["a", "b", "c"], Status::default()));
+        assert_eq!(app.peer_list_state.selected(), Some(0));
+        app.prev_peer();
+        assert_eq!(app.selected_peer().unwrap().name, "c");
+
+        handle_link_event(&mut app, status_with(&["a"], Status::default()));
+        assert_eq!(app.selected_peer().unwrap().name, "a");
+
+        handle_link_event(&mut app, status_with(&[], Status::default()));
+        assert_eq!(app.peer_list_state.selected(), None);
+        app.next_peer();
+        assert!(app.selected_peer().is_none());
     }
 
     /// Test that the join popup shows stars, never the password

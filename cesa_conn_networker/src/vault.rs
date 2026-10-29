@@ -1,8 +1,3 @@
-/*
-TODO:
-device identity (DeviceKeypairs) and the trusted peers go into the vault once the daemon starts the networker
-*/
-
 //! The encrypted vault: everything the daemon keeps across restarts.
 //! Nothing is stored unencrypted, configs included.
 //!

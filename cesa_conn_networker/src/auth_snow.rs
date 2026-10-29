@@ -1,6 +1,5 @@
 /*
 TODO:
-persist DeviceKeypairs (private keys encrypted / in the OS keychain)
 sync the trusted peer list between devices, allow revoking one device
  */
 
@@ -1047,7 +1046,7 @@ fn verify_peer_signature(
 /// whether the peer is known. The server checks the client's signature before
 /// sending its own. The handshake hash is unique per connection and identical
 /// on both sides, so a valid signature proves the peer took part in this exact
-/// handshake. Everything is appended to `transcript` in the order above.
+/// handshake.
 ///
 /// Returns the peer's (verified) verification key.
 async fn exchange_signatures(
@@ -1056,7 +1055,6 @@ async fn exchange_signatures(
     handshake_hash: &Zeroizing<[u8; 32]>,
     stored_key: Option<&[u8; MLDSA87_VK_LEN]>,
     device_keypairs: &DeviceKeypairs,
-    transcript: &mut Zeroizing<Vec<u8>>,
 ) -> Result<[u8; MLDSA87_VK_LEN], AuthSnowErrors> {
     let our_key = device_keypairs.mldsa_kep.verification_key.as_slice();
 
@@ -1103,11 +1101,6 @@ async fn exchange_signatures(
             )
             .await?;
 
-            transcript.extend_from_slice(our_key);
-            transcript.extend_from_slice(our_signature);
-            transcript.extend_from_slice(&peer_key);
-            transcript.extend_from_slice(&peer_signature);
-
             (peer_key, peer_signature)
         }
         Role::Server => {
@@ -1126,11 +1119,6 @@ async fn exchange_signatures(
                 TIMEOUT,
             )
             .await?;
-
-            transcript.extend_from_slice(&peer_key);
-            transcript.extend_from_slice(&peer_signature);
-            transcript.extend_from_slice(our_key);
-            transcript.extend_from_slice(our_signature);
 
             (peer_key, peer_signature)
         }
@@ -1308,7 +1296,6 @@ async fn identify_peer(
     handshake_hash: &Zeroizing<[u8; 32]>,
     device_keypairs: &DeviceKeypairs,
     trusted_peers: &TrustedPeers,
-    transcript: &mut Zeroizing<Vec<u8>>,
 ) -> Result<(TrustedPeer, bool), AuthSnowErrors> {
     // cloned, so the read lock is released before any network I/O
     let stored_peer = trusted_peers
@@ -1330,7 +1317,6 @@ async fn identify_peer(
             .as_ref()
             .map(|peer| &peer.mldsa_verification_key),
         device_keypairs,
-        transcript,
     )
     .await?;
 
@@ -1665,6 +1651,9 @@ async fn handshake_server(
 
     // 3. PSK
     let secure_psk = derive_secure_psk(&key1, &hybrid_kep, &transcript)?;
+    // its only use: Noise and the signatures bind to the handshake hash,
+    // which covers the PSK (and with it this transcript)
+    drop(transcript);
 
     // 4. Noise
     let (mut secure_connection, peer_static, handshake_hash) =
@@ -1678,7 +1667,6 @@ async fn handshake_server(
         &handshake_hash,
         device_keypairs,
         trusted_peers,
-        &mut transcript,
     )
     .await?;
 
@@ -1718,6 +1706,9 @@ async fn handshake_client(
 
     // 3. PSK
     let secure_psk = derive_secure_psk(&key1, &hybrid_kep, &transcript)?;
+    // its only use: Noise and the signatures bind to the handshake hash,
+    // which covers the PSK (and with it this transcript)
+    drop(transcript);
 
     // 4. Noise
     let (mut secure_connection, peer_static, handshake_hash) =
@@ -1731,7 +1722,6 @@ async fn handshake_client(
         &handshake_hash,
         device_keypairs,
         trusted_peers,
-        &mut transcript,
     )
     .await?;
 
