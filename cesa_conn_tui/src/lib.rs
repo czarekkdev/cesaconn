@@ -1044,10 +1044,12 @@ fn handle_security_warning_input(
 fn ui(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
+    // two status lines: the daemon's state above, the keys below, so a long
+    // state never covers the keys the user needs
     let [header, content, statusbar] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(0),
-        Constraint::Length(1),
+        Constraint::Length(2),
     ])
     .areas(area);
 
@@ -1359,23 +1361,20 @@ fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
         DaemonState::NoLink => ("daemon: link stopped".to_owned(), Color::Red),
     };
 
-    let right_str = format!(" {daemon_str}  {connected} connected ");
+    let status_str = format!(" {daemon_str}  {connected} connected ");
 
-    let [help_area, right_area] = Layout::horizontal([
-        Constraint::Min(0),
-        Constraint::Length(to_u16(right_str.len())),
-    ])
-    .areas(area);
+    // each on its own full-width line: the state can be as long as it
+    // needs (it is cut at the edge), the keys are never covered
+    let [status_area, help_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
 
+    frame.render_widget(
+        Paragraph::new(status_str).style(Style::default().fg(daemon_color)),
+        status_area,
+    );
     frame.render_widget(
         Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
         help_area,
-    );
-    frame.render_widget(
-        Paragraph::new(right_str)
-            .style(Style::default().fg(daemon_color))
-            .alignment(Alignment::Right),
-        right_area,
     );
 }
 
@@ -2467,6 +2466,31 @@ mod tests {
         app.outbox.clear();
         handle_link_event(&mut app, LinkEvent::AddDeviceStopped(Ok(())));
         assert!(matches!(app.outbox.as_slice(), [Command::Refresh]));
+    }
+
+    /// Test that a long daemon state never covers the key help: on a narrow
+    /// terminal every key of the Devices tab is still shown in full
+    #[test]
+    fn test_statusbar_keys_never_covered() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut app = App::new();
+        handle_link_event(&mut app, up_network(true, None));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| ui(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| -> String {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect()
+        };
+        let (status, keys) = (row(22), row(23));
+
+        assert!(status.contains("daemon: keys 2/2"), "status: {status}");
+        for key in ["q:Quit", "n:Add device/Join", "x:Stop"] {
+            assert!(keys.contains(key), "{key} missing in: {keys}");
+        }
     }
 
     /// Test that the join popup shows stars, never the password
