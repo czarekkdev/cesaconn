@@ -13,7 +13,7 @@
 //!   a daemon of the same user, and on macOS only to one whose signature
 //!   satisfies [`DAEMON_CODE_REQUIREMENT`].
 //!
-//! Wire format (version 5), one request and one response per connection:
+//! Wire format (version 6), one request and one response per connection:
 //! `frame = length (u32 LE, 1..=MAX_FRAME_LEN) || body`
 //!
 //! Request body: `kind (1) || payload`
@@ -48,10 +48,11 @@
 //!   bit 1 = data key set, bit 2 = network running, bit 3 = vault locked,
 //!   bit 4 = keys saved (encrypted vault), bit 5 = automatic login on,
 //!   bit 6 = Sync switched on, bit 7 = "Add device" window open; flags2 bit 0
-//!   = joining a group, other bits must be 0; unlock wait = seconds until
+//!   = joining a group, bit 1 = the open "Add device" window found a device
+//!   of another group, other bits must be 0; unlock wait = seconds until
 //!   `Unlock` is accepted again after too many wrong data passwords (0 = now).
 //!   Versions 2 to 4 were shorter, so a mismatched UI and daemon fail with
-//!   `Malformed`.
+//!   `Malformed`; version 5 refuses flags2 bit 1, so it fails loudly too.
 //! * SetAuthPassword / SetDataPassword / Unlock / SetAutoLogin / SetSync /
 //!   AddDevice / AnswerPairing / JoinGroup / CancelJoin / StopAddDevice: empty
 //! * ListPeers: `count (u16 LE) || count * (fingerprint (8) || name len (1) || name)`
@@ -132,7 +133,11 @@ const REQ_STOP_ADD_DEVICE: u8 = 0x0F;
 
 /* status flags2 */
 /// flags2: joining a group
-const STATUS2_JOINING: u8 = 0b1;
+const STATUS2_JOINING: u8 = 0b01;
+/// flags2: the open "Add device" window found a device of another group
+const STATUS2_OTHER_GROUP: u8 = 0b10;
+/// every flags2 bit this version knows
+const STATUS2_KNOWN: u8 = STATUS2_JOINING | STATUS2_OTHER_GROUP;
 
 /// Shortest new password the daemon accepts (characters; bytes if not UTF-8). Anyone holding the vault
 /// file and the keychain salts can guess the data password offline, so short
@@ -359,6 +364,9 @@ pub struct Status {
     pub pending_pairings: u8,
     /// A join is running (fetching the group's salts, pairing).
     pub joining: bool,
+    /// The open "Add device" window found a device of another group (other
+    /// salts): pairing with it can't work, it has to be reset and join.
+    pub other_group_nearby: bool,
 }
 
 /// A pairing waiting for the user (public data only: the handshake hash
@@ -541,7 +549,14 @@ impl Response {
                     | u8::from(s.adding_device) << 7;
 
                 body.push(flags);
-                body.push(if s.joining { STATUS2_JOINING } else { 0 });
+                body.push(
+                    if s.joining { STATUS2_JOINING } else { 0 }
+                        | if s.other_group_nearby {
+                            STATUS2_OTHER_GROUP
+                        } else {
+                            0
+                        },
+                );
                 body.extend_from_slice(&s.trusted_peers.to_le_bytes());
                 body.extend_from_slice(&s.unlock_wait_secs.to_le_bytes());
                 body.push(s.pending_pairings);
@@ -603,7 +618,7 @@ impl Response {
             Request::Status => {
                 let (flags, flags2, peers, unlock_wait_secs, pending_pairings) = match payload {
                     [flags, flags2, a, b, c, d, w0, w1, pending]
-                        if flags2 & !STATUS2_JOINING == 0 =>
+                        if flags2 & !STATUS2_KNOWN == 0 =>
                     {
                         (
                             *flags,
@@ -629,6 +644,7 @@ impl Response {
                     unlock_wait_secs,
                     pending_pairings,
                     joining: flags2 & STATUS2_JOINING != 0,
+                    other_group_nearby: flags2 & STATUS2_OTHER_GROUP != 0,
                 }))
             }
             Request::SetAuthPassword(_)
@@ -1065,14 +1081,16 @@ mod tests {
             Response::decode(&Request::Status, &[RESP_OK, 0, 0, 0, 0, 0, 0, 0, 0]),
             Err(IpcErrors::Malformed)
         );
-        for flags2 in [0b10u8, 0x80] {
+        for flags2 in [0b100u8, 0x80] {
             assert_eq!(
                 Response::decode(&Request::Status, &[RESP_OK, 0, flags2, 0, 0, 0, 0, 0, 0, 0]),
                 Err(IpcErrors::Malformed)
             );
         }
         let joining = Response::decode(&Request::Status, &[RESP_OK, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
-        assert!(matches!(joining, Ok(Response::Status(s)) if s.joining));
+        assert!(matches!(joining, Ok(Response::Status(s)) if s.joining && !s.other_group_nearby));
+        let other = Response::decode(&Request::Status, &[RESP_OK, 0, 2, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(matches!(other, Ok(Response::Status(s)) if s.other_group_nearby && !s.joining));
     }
 
     /// Test that the pairing answer round-trips and its decoding is strict
@@ -1165,6 +1183,7 @@ mod tests {
             adding_device: true,
             pending_pairings: 3,
             joining: true,
+            other_group_nearby: true,
         });
         assert_eq!(
             Response::decode(&Request::Status, &status.encode()),

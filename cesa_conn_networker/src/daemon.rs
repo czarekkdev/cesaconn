@@ -28,6 +28,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use subtle::ConstantTimeEq;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
 use tokio::sync::{RwLock, Semaphore};
@@ -275,6 +276,8 @@ pub struct Daemon {
     adding: AtomicBool,
     /// The open invite window, so the user can end it early.
     invite: RwLock<Option<InviteSlot>>,
+    /// The open window found a device of another group (reset per window).
+    other_group: Arc<AtomicBool>,
     /// Generation of the next invite window.
     next_invite: std::sync::atomic::AtomicU64,
     /// The running join, if any (its pairing is asked about too).
@@ -362,6 +365,7 @@ impl Daemon {
             pairings: RwLock::default(),
             adding: AtomicBool::new(false),
             invite: RwLock::default(),
+            other_group: Arc::default(),
             next_invite: std::sync::atomic::AtomicU64::new(0),
             join: RwLock::default(),
             next_join: std::sync::atomic::AtomicU64::new(0),
@@ -556,6 +560,9 @@ impl Daemon {
             trusted_peers: u32::try_from(trusted_peers).unwrap_or(u32::MAX),
             network_running,
             adding_device: network_running && self.adding.load(Ordering::SeqCst),
+            other_group_nearby: network_running
+                && self.adding.load(Ordering::SeqCst)
+                && self.other_group.load(Ordering::SeqCst),
             pending_pairings: u8::try_from(pending_pairings).unwrap_or(u8::MAX),
             joining,
             ..status
@@ -1365,7 +1372,7 @@ impl Daemon {
 
             select! {
                 () = token.cancelled() => {},
-                () = invite_window(context, id, window.clone()) => {},
+                () = invite_window(context, id, window.clone(), daemon.other_group.clone()) => {},
             }
             // the salt goes away with the window, whatever ended it; a
             // window the user stopped (or a newer one) isn't touched here
@@ -1409,6 +1416,8 @@ impl Daemon {
         if self.adding.swap(true, Ordering::SeqCst) {
             return Ok(None);
         }
+        // a new window starts without the last one's findings
+        self.other_group.store(false, Ordering::SeqCst);
 
         let window = CancellationToken::new();
         let generation = self.next_invite.fetch_add(1, Ordering::SeqCst);
@@ -1844,11 +1853,78 @@ fn listen(listener: TcpListener, context: NetworkerContext, token: CancellationT
 /// The LAN part of the invite window ([`Daemon::add_device`]): announce
 /// this device until `window` ends, and meanwhile search for other members
 /// and connect to every one found; waits for those connections.
-async fn invite_window(context: NetworkerContext, id: InstanceId, window: CancellationToken) {
+async fn invite_window(
+    context: NetworkerContext,
+    id: InstanceId,
+    window: CancellationToken,
+    other_group: Arc<AtomicBool>,
+) {
     tokio::join!(
         announce_until(id, window.clone()),
-        search_and_connect(context, id, window.clone()),
+        search_and_connect(context, id, window.clone(), other_group),
     );
+}
+
+/// What a found device's salt says about its group.
+#[derive(Debug, PartialEq)]
+enum GroupCheck {
+    /// Same `a_salt`: a device of this group.
+    Same,
+    /// Another `a_salt`: a device of another group. SPAKE2 would fail for
+    /// sure (the salt is bound into it), so connecting only costs both
+    /// sides a guess-limiter slot.
+    Different,
+    /// No answer (no salt query there, rate limited, an older build).
+    Unknown,
+}
+
+/// What the invite window does with one device it found.
+#[derive(Debug, PartialEq)]
+enum Found {
+    /// This side connects (lower id).
+    Connect,
+    /// The other side connects (it has the lower id).
+    TheyConnect,
+    /// Another group: nobody connects, the user is told.
+    OtherGroup,
+}
+
+/// Decides about a device found during "Add device": a device of another
+/// group is reported (`other_group`) instead of a doomed handshake, on both
+/// sides whichever would connect; otherwise only the lower id connects, so
+/// a pair makes one connection (and one prompt each), not two.
+async fn on_found(
+    own_a_salt: &[u8; 32],
+    salt_addr: SocketAddr,
+    id: InstanceId,
+    their_id: InstanceId,
+    other_group: &AtomicBool,
+) -> Found {
+    if check_group(own_a_salt, salt_addr).await == GroupCheck::Different {
+        warn!(%salt_addr, "found a device of a different group (other salts): not connecting; to add it, reset it and use Join on it");
+        other_group.store(true, Ordering::SeqCst);
+        return Found::OtherGroup;
+    }
+
+    if id < their_id {
+        Found::Connect
+    } else {
+        Found::TheyConnect
+    }
+}
+
+/// Asks the device at `salt_addr` for its group salt and compares it with
+/// `own_a_salt`. Unauthenticated, like every salt answer: a forged answer
+/// can at most make this device skip a real member (a DoS, like forged
+/// announcements), never pair with the wrong one.
+async fn check_group(own_a_salt: &[u8; 32], salt_addr: SocketAddr) -> GroupCheck {
+    match query_salt(salt_addr).await {
+        Ok(theirs) if bool::from(theirs.as_slice().ct_eq(own_a_salt.as_slice())) => {
+            GroupCheck::Same
+        }
+        Ok(_) => GroupCheck::Different,
+        Err(_) => GroupCheck::Unknown,
+    }
 }
 
 /// Announces this device in [`MAX_BROADCAST_DURATION`] rounds until `window`
@@ -1876,7 +1952,13 @@ async fn announce_until(id: InstanceId, window: CancellationToken) {
 /// should connect to, then waits for those connections. Searching the whole
 /// window (not only its start) matters: the two users rarely press "Add
 /// device" at the same moment, and only the lower id connects.
-async fn search_and_connect(context: NetworkerContext, id: InstanceId, window: CancellationToken) {
+async fn search_and_connect(
+    context: NetworkerContext,
+    id: InstanceId,
+    window: CancellationToken,
+    other_group: Arc<AtomicBool>,
+) {
+    let own_a_salt = context.keys.read().await.a_salt.clone();
     let mut connects = JoinSet::new();
     // one connection per address and window (bounded by the search caps)
     let mut tried: Vec<std::net::IpAddr> = Vec::new();
@@ -1905,17 +1987,25 @@ async fn search_and_connect(context: NetworkerContext, id: InstanceId, window: C
             }
             tried.push(addr.ip());
 
-            // both devices hear each other: only the lower id connects, so a
-            // pair makes one connection (and one prompt each), not two
-            if id < their_id {
+            // its own task: a device that doesn't answer the group check
+            // (up to the timeouts) never holds up the search or the others
+            let (context, own_a_salt, other_group) =
+                (context.clone(), own_a_salt.clone(), other_group.clone());
+            connects.spawn(async move {
                 // only the IP comes from discovery (an unauthenticated hint)
-                connects.spawn(connect_to(
-                    context.clone(),
-                    SocketAddr::new(addr.ip(), TCP_PORT),
-                ));
-            } else {
-                debug!(%addr, "found device connects to us");
-            }
+                let salt_addr = SocketAddr::new(addr.ip(), SALT_PORT);
+                match on_found(&own_a_salt, salt_addr, id, their_id, &other_group).await {
+                    Found::Connect => {
+                        // a full handshake: boxed, so the future isn't kept on the stack
+                        Box::pin(connect_to(context, SocketAddr::new(addr.ip(), TCP_PORT))).await
+                    }
+                    Found::TheyConnect => {
+                        debug!(%addr, "found device connects to us");
+                        Ok(())
+                    }
+                    Found::OtherGroup => Ok(()),
+                }
+            });
         }
     }
 
@@ -3618,6 +3708,72 @@ mod tests {
         assert!(third.window.is_cancelled());
         sleep(Duration::from_millis(50)).await;
         assert!(TcpStream::connect(member.salt_addr).await.is_err());
+    }
+
+    /// Test that the group check tells a device of this group, a device of
+    /// another group and a device that doesn't answer apart, and that the
+    /// status reports another group only during the window that found it
+    #[tokio::test]
+    async fn test_check_group() {
+        let (storage_a, storage_b, storage_c) = (
+            TestStorage::new("group-a"),
+            TestStorage::new("group-b"),
+            TestStorage::new("group-c"),
+        );
+        // A and B: one group (B got A's salts); C: its own group
+        let (a, b) = group_of_two(&storage_a, &storage_b).await;
+        let c = storage_c.daemon_on_localhost().await;
+        setup(&c).await;
+        ask(&c, Request::SetSync(true)).await.unwrap();
+
+        let own = a.keys.read().await.a_salt.clone().unwrap();
+        let _b_window = b.open_invite().await.unwrap().unwrap();
+        let _c_window = c.open_invite().await.unwrap().unwrap();
+
+        assert_eq!(check_group(&own, b.salt_addr).await, GroupCheck::Same);
+        assert_eq!(check_group(&own, c.salt_addr).await, GroupCheck::Different);
+        // no salt query there (no window, an older build)
+        assert_eq!(
+            check_group(&own, free_local_addr()).await,
+            GroupCheck::Unknown
+        );
+
+        // a found device: another group is skipped and reported, whatever
+        // the ids; this group (or no answer) follows the lower-id rule
+        let (x, y) = (
+            InstanceId::generate().unwrap(),
+            InstanceId::generate().unwrap(),
+        );
+        let (low, high) = (x.min(y), x.max(y));
+        // C answered the check above: wait out its per-source rate limit
+        sleep(crate::salt_service::ANSWER_INTERVAL).await;
+        let seen = AtomicBool::new(false);
+        assert_eq!(
+            on_found(&own, c.salt_addr, low, high, &seen).await,
+            Found::OtherGroup
+        );
+        assert!(seen.load(Ordering::SeqCst));
+        // this group (B, waited out too) and no answer follow the ids
+        let seen = AtomicBool::new(false);
+        assert_eq!(
+            on_found(&own, b.salt_addr, low, high, &seen).await,
+            Found::Connect
+        );
+        assert_eq!(
+            on_found(&own, free_local_addr(), high, low, &seen).await,
+            Found::TheyConnect
+        );
+        assert!(!seen.load(Ordering::SeqCst));
+
+        // the status shows it only while the window that found it is open
+        let _a_window = a.open_invite().await.unwrap().unwrap();
+        a.other_group.store(true, Ordering::SeqCst);
+        assert!(a.status().await.other_group_nearby);
+        ask(&a, Request::StopAddDevice).await.unwrap();
+        assert!(!a.status().await.other_group_nearby);
+        // and a new window starts clean
+        let _again = a.open_invite().await.unwrap().unwrap();
+        assert!(!a.status().await.other_group_nearby);
     }
 
     /// Test that only a fresh device with storage may join, and one join

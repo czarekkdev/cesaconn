@@ -423,7 +423,7 @@ Frames that carry a request are read into `Zeroizing` buffers (a request may
 hold a password). Compile-time asserts keep the largest request and the
 largest `ListPeers` answer under `MAX_FRAME_LEN`.
 
-### 7.4 Wire format, version 5 **[built]**
+### 7.4 Wire format, version 6 **[built]**
 
 ```
 frame    = length (u32 LE, 1..=MAX_FRAME_LEN) || body
@@ -451,7 +451,9 @@ response = 0x00 || payload        (success)
 
 Status flags: bit 0 auth key set, 1 data key set, 2 network running, 3 vault
 locked, 4 keys saved, 5 automatic login, 6 Sync switched on, 7 "Add device"
-window open. Flags2: bit 0 joining a group, every other bit must be 0.
+window open. Flags2: bit 0 joining a group, bit 1 the open "Add device" window found a
+device of another group (13), every other bit must be 0 (so a version 5
+UI refuses a version 6 status loudly).
 Unlock wait: seconds until `Unlock` is accepted again (0 = now). Pending
 pairings: how many wait for the user; the UI asks `PendingPairing` only
 then. Versions 2 to 4 had shorter status answers; they are `Malformed`, so a
@@ -1216,6 +1218,20 @@ device:
    press it at the same moment; at most 16 devices per window;
 4. asks the user about new devices (next paragraph).
 
+**Another group nearby.** Before the id rule, the window asks every found
+device's salt query (3233) for its `a_salt` and compares it with its own
+(constant time). A different salt means another group: SPAKE2 is bound to
+the salt and would fail for sure, so nobody connects (no guess-limiter slot
+burnt on either side), the daemon logs it and `Status.other_group_nearby`
+tells the UI for as long as this window is open (reset with every new
+window). The TUI logs once "A device nearby is in a different group ... reset
+it, then n there joins" and shows it on the Devices tab. This is the usual
+mistake of setting the passwords on every device, which makes one group per
+device. No answer (no window there, rate limited, an older build) changes
+nothing: the id rule decides as before. The answer is unauthenticated, so a
+forged one can at most make this device skip a real member (a DoS like a
+forged announcement, 18.11), never pair with the wrong one.
+
 The window ends after 2 min (later only while its own connections finish),
 when the user stops it (`StopAddDevice`, `x` in the TUI), or with
 networking (Sync off, shutdown); the salt port closes, the `d_salt` offer
@@ -1309,7 +1325,9 @@ Tests (`cargo test --workspace --all-features`):
   and reconnecting after a restart, pairing outside the window, rejected and
   stale answers, the prompt cap; joining a group end to end and its failure
   paths (11.7); stopping "Add device" early (salt port, offer, prompts, a
-  newer window untouched, Sync off);
+  newer window untouched, Sync off); another group nearby (same / other /
+  no answer, skipped and reported whatever the ids, the status only during
+  the window that found it);
 - salt query: exact answer, junk refused, per-source rate limit and its
   memory bound, nothing after the window;
 - `auth_snow` / networker: end-to-end localhost handshakes, first pairing,
@@ -1398,7 +1416,8 @@ Stated plainly so nobody relies on a property that isn't there.
     costs it one handshake attempt and fails without pw1. Such an attacker
     can also jam "Add device" (forged announcements with the real devices'
     addresses and low ids, so neither side connects); that is a denial of
-    service, never a wrong pairing. The same goes for a join: forged
+    service, never a wrong pairing. A forged salt answer can likewise make
+    a member skip a real member as "another group" (13). The same goes for a join: forged
     announcements or a rogue salt service can make a join fail (each fake
     salt costs the joiner one Argon2 run, at most 5 per join), never join
     the wrong group.
