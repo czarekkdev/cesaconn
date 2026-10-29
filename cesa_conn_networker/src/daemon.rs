@@ -41,8 +41,8 @@ use zeroize::Zeroizing;
 use cesa_conn_crypto::{crand::random_array, pswd_manager::derive_key};
 use cesa_conn_system::{
     ipc::{
-        DaemonError, JoinPasswords, MAX_LISTED_PEERS, MIN_NEW_PASSWORD_LEN, PairingPrompt,
-        PasswordUpdate, PeerInfo, Request, Response, Status, socket_path,
+        DaemonError, FINGERPRINT_LEN, JoinPasswords, MAX_LISTED_PEERS, MIN_NEW_PASSWORD_LEN,
+        PairingPrompt, PasswordUpdate, PeerInfo, Request, Response, Status, socket_path,
     },
     keychain::{Item, OsKeychain, SecretStore},
     pairing_code::PairingCode,
@@ -262,7 +262,12 @@ fn wait_secs(not_before: Option<Instant>, now: Instant) -> u16 {
 /// Everything the daemon owns. Shared between IPC handlers.
 pub struct Daemon {
     keys: RwLock<KeySlots>,
-    trusted_peers: Arc<RwLock<Vec<TrustedPeer>>>,
+    /// The paired devices. The handle itself is replaced by a reset, so a
+    /// handshake of the old network that finishes late pairs into the old,
+    /// dropped list, never into the fresh device's.
+    trusted_peers: RwLock<Arc<RwLock<Vec<TrustedPeer>>>>,
+    /// Counts resets: a join that started before one never commits after it.
+    resets: std::sync::atomic::AtomicU64,
     // one Argon2 run (64 MiB) at a time, so clients can't stack up memory
     derive_slot: Arc<Semaphore>,
     // one state change (set password / unlock / auto-login / sync) at a time, end to end
@@ -357,7 +362,8 @@ impl Daemon {
     ) -> Self {
         Self {
             keys: RwLock::default(),
-            trusted_peers: Arc::default(),
+            trusted_peers: RwLock::default(),
+            resets: std::sync::atomic::AtomicU64::new(0),
             derive_slot: Arc::new(Semaphore::new(1)),
             change_slot: Arc::new(Semaphore::new(1)),
             storage,
@@ -443,6 +449,8 @@ impl Daemon {
             Request::Unlock(update) => self.unlock(update).await,
             Request::SetAutoLogin(on) => self.set_auto_login(on).await,
             Request::SetSync(on) => self.set_sync(on).await,
+            Request::ForgetPeer(fingerprint) => self.forget_peer(&fingerprint).await,
+            Request::ResetDevice => self.reset_device().await,
             Request::Status
             | Request::ListPeers
             | Request::PendingPairing
@@ -542,7 +550,7 @@ impl Daemon {
                 ..Status::default()
             }
         };
-        let trusted_peers = self.trusted_peers.read().await.len();
+        let trusted_peers = self.peer_list().await.read().await.len();
         let network_running = self
             .network
             .read()
@@ -569,8 +577,14 @@ impl Daemon {
         }
     }
 
+    /// The current paired-devices list (the handle; see `trusted_peers`).
+    async fn peer_list(&self) -> Arc<RwLock<Vec<TrustedPeer>>> {
+        self.trusted_peers.read().await.clone()
+    }
+
     async fn peers(&self) -> Vec<PeerInfo> {
-        self.trusted_peers
+        self.peer_list()
+            .await
             .read()
             .await
             .iter()
@@ -681,7 +695,8 @@ impl Daemon {
     /// The trusted peers, encoded for the vault. Read before the key lock is
     /// taken, so the two locks are never held together.
     async fn encoded_peers(&self) -> Result<Zeroizing<Vec<u8>>, DaemonError> {
-        let peers = self.trusted_peers.read().await;
+        let list = self.peer_list().await;
+        let peers = list.read().await;
         let encoded = encode_peers(&peers).ok_or_else(|| {
             error!("trusted peers don't fit in the vault");
             DaemonError::StorageFailed
@@ -965,7 +980,7 @@ impl Daemon {
             DaemonError::StorageFailed
         })?;
 
-        *self.trusted_peers.write().await = peers;
+        *self.peer_list().await.write().await = peers;
 
         let mut keys = self.keys.write().await;
         keys.a_key = Some(opened.contents.a_key);
@@ -1059,6 +1074,112 @@ impl Daemon {
             info!("sync on");
         } else {
             info!("sync off");
+        }
+
+        Ok(())
+    }
+
+    /// Removes the paired device(s) with this fingerprint from this device:
+    /// from memory first (new handshakes treat it as unknown at once), then
+    /// from the vault; a failed save puts them back and changes nothing.
+    ///
+    /// Local only: the device still knows the group passwords and this
+    /// device, and may pair again through "Add device" if the user accepts.
+    /// Keeping it out for good needs new group passwords (daemon.md 14.1).
+    async fn forget_peer(&self, fingerprint: &[u8; FINGERPRINT_LEN]) -> Result<(), DaemonError> {
+        {
+            let keys = self.keys.read().await;
+            if keys.locked {
+                return Err(DaemonError::Locked);
+            }
+        }
+
+        let list = self.peer_list().await;
+        let is_it = |peer: &TrustedPeer| bool::from(peer.fingerprint().ct_eq(fingerprint));
+        // every match: two keys with one 64-bit fingerprint are one device
+        // in practice, and the user picked it by that fingerprint
+        let removed: Vec<(usize, TrustedPeer)> = {
+            let mut peers = list.write().await;
+            let removed = peers
+                .iter()
+                .enumerate()
+                .filter(|(_, peer)| is_it(peer))
+                .map(|(index, peer)| (index, peer.clone()))
+                .collect();
+            peers.retain(|peer| !is_it(peer));
+            drop(peers);
+            removed
+        };
+
+        if removed.is_empty() {
+            return Err(DaemonError::UnknownPeer);
+        }
+
+        // RAM only (no storage, nothing saved yet): nothing more to do
+        if self.keys.read().await.vault.is_some()
+            && let Err(e) = self.reseal(None).await
+        {
+            // saved first, kept second: put them back where they were
+            let mut peers = list.write().await;
+            for (index, peer) in removed {
+                let at = index.min(peers.len());
+                peers.insert(at, peer);
+            }
+            drop(peers);
+            return Err(e);
+        }
+
+        info!(count = removed.len(), "forgot a paired device");
+        Ok(())
+    }
+
+    /// Wipes this device back to fresh, as if CesaConn never ran: it leaves
+    /// its group. Allowed while locked (the way out of a forgotten data
+    /// password: the vault is lost anyway) and without any password: the
+    /// same user can delete these files by hand, a reset reveals nothing.
+    ///
+    /// Order: networking, invite and join end first (nothing new pairs);
+    /// the vault file goes next, the decisive step (no vault, no group:
+    /// the keychain items mean nothing without it, the daemon starts fresh);
+    /// then memory; the keychain items last. A failed vault delete changes
+    /// nothing else; a failed keychain delete still leaves a fresh device
+    /// and is reported, a second reset removes the leftovers.
+    async fn reset_device(self: &Arc<Self>) -> Result<(), DaemonError> {
+        // a join that started before never commits after this
+        self.resets.fetch_add(1, Ordering::SeqCst);
+        self.cancel_join().await;
+        // the bridge finishes on its own (its save sees no vault)
+        drop(self.stop_network().await);
+
+        if let Some(storage) = &self.storage {
+            let path = storage.path.clone();
+            blocking(move || vault::delete_file(&path))
+                .await?
+                .map_err(storage_error)?;
+        }
+
+        // the keys are wiped (zeroized) with the old slots
+        *self.keys.write().await = KeySlots::default();
+        // a new list: a late handshake of the old network can't add to it
+        *self.trusted_peers.write().await = Arc::default();
+        self.pairings.write().await.waiting.clear();
+        self.other_group.store(false, Ordering::SeqCst);
+        warn!("this device was reset: keys, vault and paired devices are gone");
+
+        if let Some(storage) = &self.storage {
+            for item in [Item::Salts, Item::DataKey] {
+                let store = storage.store.clone();
+                match blocking(move || store.delete(item)).await {
+                    Ok(Ok(())) => {}
+                    _ => {
+                        error!(
+                            ?item,
+                            "removing a keychain item failed: reset again to remove it"
+                        );
+                        return Err(DaemonError::StorageFailed);
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -1184,7 +1305,7 @@ impl Daemon {
         let context = NetworkerContext {
             keys: Arc::new(RwLock::new(keys)),
             device_keypairs: Arc::new(DeviceKeypairs::from_seed(&identity)),
-            trusted_peers: self.trusted_peers.clone(),
+            trusted_peers: self.peer_list().await,
             pairing,
             guess_limiter: self.guess_limiter.clone(),
             // offered only while an invite window is open
@@ -1503,6 +1624,8 @@ impl Daemon {
         if !self.is_fresh().await {
             return Err(DaemonError::AlreadyInGroup);
         }
+        // a reset from here on makes this join void
+        let resets = self.resets.load(Ordering::SeqCst);
 
         // this device's identity, kept by the vault once the join commits
         let identity = DeviceKeypairs::new_seed().map_err(|e| {
@@ -1533,7 +1656,7 @@ impl Daemon {
                 () = token.cancelled() => info!("join cancelled"),
                 result = timeout(
                     Duration::from_secs(JOIN_WINDOW),
-                    daemon.run_join(passwords, identity),
+                    daemon.run_join(passwords, identity, resets),
                 ) => match result {
                     Ok(Ok(())) => info!("joined the group"),
                     Ok(Err(e)) => warn!(error = %e, "join failed"),
@@ -1606,6 +1729,7 @@ impl Daemon {
         self: &Arc<Self>,
         passwords: JoinPasswords,
         identity: Zeroizing<[u8; IDENTITY_SEED_LEN]>,
+        resets: u64,
     ) -> Result<(), DaemonError> {
         let mut attempts = 0u32;
 
@@ -1622,9 +1746,9 @@ impl Daemon {
                         // its own task: a timeout or CancelJoin from here on
                         // can't cut the commit half-way (keychain without vault)
                         let daemon = self.clone();
-                        return tokio::spawn(
-                            async move { daemon.commit_join(joined, identity).await },
-                        )
+                        return tokio::spawn(async move {
+                            daemon.commit_join(joined, identity, resets).await
+                        })
                         .await
                         .map_err(|_| DaemonError::Internal)?;
                     }
@@ -1776,6 +1900,7 @@ impl Daemon {
         self: &Arc<Self>,
         joined: Joined,
         identity: Zeroizing<[u8; IDENTITY_SEED_LEN]>,
+        resets: u64,
     ) -> Result<(), DaemonError> {
         let turn = self
             .change_slot
@@ -1784,6 +1909,11 @@ impl Daemon {
             .await
             .map_err(|_| DaemonError::Internal)?;
 
+        // the user reset this device meanwhile: the join belongs to before
+        if self.resets.load(Ordering::SeqCst) != resets {
+            warn!("a join from before the reset finished: dropped, nothing kept");
+            return Err(DaemonError::Internal);
+        }
         // the state may have changed while the user was pairing
         if !self.is_fresh().await {
             return Err(DaemonError::AlreadyInGroup);
@@ -1796,7 +1926,7 @@ impl Daemon {
             keys.d_key = Some(joined.d_key);
             keys.d_salt = Some(joined.d_salt);
         }
-        self.trusted_peers.write().await.push(joined.peer);
+        self.peer_list().await.write().await.push(joined.peer);
 
         self.create_vault(Some(identity), Config { sync: true })
             .await;
@@ -2248,6 +2378,7 @@ mod tests {
                     0x0B => DaemonError::PairingExpired,
                     0x0C => DaemonError::AlreadyInGroup,
                     0x0D => DaemonError::JoinRunning,
+                    0x0E => DaemonError::UnknownPeer,
                     _ => DaemonError::Internal,
                 }),
                 _ => panic!("unexpected response"),
@@ -2837,7 +2968,8 @@ mod tests {
         let storage = TestStorage::new("peers");
         let daemon = storage.daemon().await;
         daemon
-            .trusted_peers
+            .peer_list()
+            .await
             .write()
             .await
             .push(TrustedPeer::for_test(7, "phone"));
@@ -2954,7 +3086,7 @@ mod tests {
         for _ in 0..500 {
             let restarted = storage.daemon_on_localhost().await;
             restarted.unlock(update(DATA_PW)).await.unwrap();
-            if restarted.trusted_peers.read().await.len() == count {
+            if restarted.peer_list().await.read().await.len() == count {
                 return;
             }
             sleep(Duration::from_millis(20)).await;
@@ -3822,6 +3954,204 @@ mod tests {
         ask(&fresh, Request::CancelJoin).await.unwrap();
     }
 
+    /// The fingerprints of `daemon`'s paired devices, in order.
+    async fn fingerprints(daemon: &Arc<Daemon>) -> Vec<[u8; FINGERPRINT_LEN]> {
+        daemon.peers().await.iter().map(|p| p.fingerprint).collect()
+    }
+
+    /// Makes the vault directory read-only (writes and deletes fail) or
+    /// owner-only again.
+    fn vault_dir_writable(storage: &TestStorage, writable: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if writable { 0o700 } else { 0o500 };
+        std::fs::set_permissions(&storage.dir, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Test that forgetting a device removes it from memory and the vault,
+    /// refuses an unknown fingerprint and a locked vault, and that a failed
+    /// save puts it back in its place
+    #[tokio::test]
+    async fn test_forget_peer() {
+        let storage = TestStorage::new("forget");
+        let daemon = storage.daemon().await;
+        setup(&daemon).await;
+        let (phone, laptop, tablet) = (
+            TrustedPeer::for_test(7, "phone"),
+            TrustedPeer::for_test(8, "laptop"),
+            TrustedPeer::for_test(9, "tablet"),
+        );
+        let (fp_phone, fp_laptop, fp_tablet) = (
+            phone.fingerprint(),
+            laptop.fingerprint(),
+            tablet.fingerprint(),
+        );
+        daemon
+            .peer_list()
+            .await
+            .write()
+            .await
+            .extend([phone, laptop, tablet]);
+        daemon.save_peers().await;
+
+        assert_eq!(
+            ask(&daemon, Request::ForgetPeer([0xEE; 8])).await,
+            Err(DaemonError::UnknownPeer)
+        );
+
+        // a failed save changes nothing: the device is back in its place
+        vault_dir_writable(&storage, false);
+        assert_eq!(
+            ask(&daemon, Request::ForgetPeer(fp_laptop)).await,
+            Err(DaemonError::StorageFailed)
+        );
+        vault_dir_writable(&storage, true);
+        assert_eq!(
+            fingerprints(&daemon).await,
+            [fp_phone, fp_laptop, fp_tablet]
+        );
+
+        ask(&daemon, Request::ForgetPeer(fp_laptop)).await.unwrap();
+        assert_eq!(fingerprints(&daemon).await, [fp_phone, fp_tablet]);
+        assert_eq!(daemon.status().await.trusted_peers, 2);
+
+        // saved: gone after a restart too; locked, nothing can be forgotten
+        let restarted = storage.daemon().await;
+        assert_eq!(
+            ask(&restarted, Request::ForgetPeer(fp_phone)).await,
+            Err(DaemonError::Locked)
+        );
+        ask(&restarted, Request::Unlock(update(DATA_PW)))
+            .await
+            .unwrap();
+        assert_eq!(fingerprints(&restarted).await, [fp_phone, fp_tablet]);
+    }
+
+    /// Test that a reset wipes everything (vault file, keychain items, keys,
+    /// paired devices, networking), works while locked, and leaves a device
+    /// that starts fresh and may join
+    #[tokio::test]
+    async fn test_reset_device() {
+        let storage = TestStorage::new("reset");
+        let daemon = storage.daemon_on_localhost().await;
+        setup(&daemon).await;
+        ask(&daemon, Request::SetAutoLogin(true)).await.unwrap();
+        ask(&daemon, Request::SetSync(true)).await.unwrap();
+        daemon
+            .peer_list()
+            .await
+            .write()
+            .await
+            .push(TrustedPeer::for_test(7, "phone"));
+        daemon.save_peers().await;
+        assert!(daemon.status().await.network_running);
+        assert!(storage.store.has(Item::Salts).await && storage.store.has(Item::DataKey).await);
+
+        ask(&daemon, Request::ResetDevice).await.unwrap();
+
+        let fresh = Status::default();
+        let status = daemon.status().await;
+        assert_eq!(
+            (
+                status.auth_key_set,
+                status.data_key_set,
+                status.saved,
+                status.locked
+            ),
+            (false, false, false, false)
+        );
+        assert_eq!(
+            (
+                status.network_running,
+                status.sync_enabled,
+                status.trusted_peers
+            ),
+            (fresh.network_running, fresh.sync_enabled, 0)
+        );
+        assert!(daemon.is_fresh().await);
+        assert!(!storage.path().exists());
+        assert!(!storage.store.has(Item::Salts).await);
+        assert!(!storage.store.has(Item::DataKey).await);
+
+        // a restart finds nothing either
+        let restarted = storage.daemon_on_localhost().await;
+        assert!(restarted.is_fresh().await);
+
+        // locked (a forgotten data password): reset is the way out
+        setup(&restarted).await;
+        let locked = storage.daemon_on_localhost().await;
+        assert!(locked.status().await.locked);
+        ask(&locked, Request::ResetDevice).await.unwrap();
+        assert!(locked.is_fresh().await);
+        assert!(!storage.path().exists());
+    }
+
+    /// Test that a failed vault delete changes nothing, and that a failed
+    /// keychain delete still leaves a fresh device and a second reset
+    /// removes the leftovers
+    #[tokio::test]
+    async fn test_reset_device_failures() {
+        let storage = TestStorage::new("reset-fail");
+        let daemon = storage.daemon().await;
+        setup(&daemon).await;
+
+        vault_dir_writable(&storage, false);
+        assert_eq!(
+            ask(&daemon, Request::ResetDevice).await,
+            Err(DaemonError::StorageFailed)
+        );
+        vault_dir_writable(&storage, true);
+        assert!(daemon.status().await.saved);
+        assert!(storage.path().exists());
+
+        storage.store.fail.store(true, Ordering::SeqCst);
+        assert_eq!(
+            ask(&daemon, Request::ResetDevice).await,
+            Err(DaemonError::StorageFailed)
+        );
+        storage.store.fail.store(false, Ordering::SeqCst);
+        assert!(daemon.is_fresh().await);
+        assert!(!storage.path().exists());
+        assert!(storage.store.has(Item::Salts).await);
+
+        ask(&daemon, Request::ResetDevice).await.unwrap();
+        assert!(!storage.store.has(Item::Salts).await);
+    }
+
+    /// Test that nothing from before a reset comes back: a handshake of the
+    /// old network that finishes late adds to the old list, and a join that
+    /// started before never commits
+    #[tokio::test]
+    async fn test_reset_device_late_arrivals() {
+        let storage = TestStorage::new("reset-late");
+        let daemon = storage.daemon_on_localhost().await;
+        setup(&daemon).await;
+
+        let old_list = daemon.peer_list().await;
+        ask(&daemon, Request::ResetDevice).await.unwrap();
+        old_list
+            .write()
+            .await
+            .push(TrustedPeer::for_test(7, "late"));
+        assert_eq!(daemon.status().await.trusted_peers, 0);
+
+        // a join that began before the reset (resets was 0 then)
+        let joined = Joined {
+            a_key: AuthKey::from_bytes(&[1; 32]),
+            a_salt: Zeroizing::new([2; 32]),
+            d_key: DataKey::from_bytes(&[3; 32]),
+            d_salt: Zeroizing::new([4; 32]),
+            peer: TrustedPeer::for_test(9, "member"),
+        };
+        assert!(
+            daemon
+                .commit_join(joined, DeviceKeypairs::new_seed().unwrap(), 0)
+                .await
+                .is_err()
+        );
+        assert!(daemon.is_fresh().await);
+        assert!(!storage.path().exists());
+    }
+
     /// Test that a join's commit refuses a device that got keys while the
     /// user was pairing, and changes nothing
     #[tokio::test]
@@ -3839,7 +4169,7 @@ mod tests {
             peer: TrustedPeer::for_test(9, "member"),
         };
         let result = daemon
-            .commit_join(joined, DeviceKeypairs::new_seed().unwrap())
+            .commit_join(joined, DeviceKeypairs::new_seed().unwrap(), 0)
             .await;
 
         assert_eq!(result, Err(DaemonError::AlreadyInGroup));

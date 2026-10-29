@@ -16,8 +16,8 @@ use std::thread;
 
 use cesa_conn_system::{
     ipc::{
-        self, IpcErrors, JoinPasswords, PairingPrompt, PasswordUpdate, PeerInfo, Request, Response,
-        Status,
+        self, FINGERPRINT_LEN, IpcErrors, JoinPasswords, PairingPrompt, PasswordUpdate, PeerInfo,
+        Request, Response, Status,
     },
     pairing_code::PairingCode,
 };
@@ -60,6 +60,10 @@ pub enum Command {
     CancelJoin,
     /// End the "Add device" window early.
     StopAddDevice,
+    /// Remove the paired device with this fingerprint from this device.
+    ForgetPeer([u8; FINGERPRINT_LEN]),
+    /// Wipe this device back to fresh (it leaves its group).
+    ResetDevice,
 }
 
 /// What a refresh brings back: status, paired devices and the pairing
@@ -101,6 +105,10 @@ pub enum LinkEvent {
     JoinCancelled(Result<(), IpcErrors>),
     /// Answer to [`Command::StopAddDevice`].
     AddDeviceStopped(Result<(), IpcErrors>),
+    /// Answer to [`Command::ForgetPeer`].
+    PeerForgotten(Result<(), IpcErrors>),
+    /// Answer to [`Command::ResetDevice`].
+    DeviceReset(Result<(), IpcErrors>),
     /// The worker is gone (its runtime couldn't start, or it panicked).
     WorkerStopped,
 }
@@ -207,6 +215,12 @@ async fn run_command(socket: Option<&PathBuf>, command: Command) -> LinkEvent {
         }
         Command::StopAddDevice => {
             LinkEvent::AddDeviceStopped(send_done(socket, Request::StopAddDevice).await)
+        }
+        Command::ForgetPeer(fingerprint) => {
+            LinkEvent::PeerForgotten(send_done(socket, Request::ForgetPeer(fingerprint)).await)
+        }
+        Command::ResetDevice => {
+            LinkEvent::DeviceReset(send_done(socket, Request::ResetDevice).await)
         }
     }
 }
@@ -323,7 +337,7 @@ mod tests {
             rt.block_on(async move {
                 let listener = UnixListener::bind(&server_path).unwrap();
 
-                for _ in 0..12 {
+                for _ in 0..14 {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     let body = ipc::read_frame(&mut stream).await.unwrap();
 
@@ -342,7 +356,9 @@ mod tests {
                         | Request::AnswerPairing { .. }
                         | Request::JoinGroup(_)
                         | Request::CancelJoin
-                        | Request::StopAddDevice => {
+                        | Request::StopAddDevice
+                        | Request::ForgetPeer(_)
+                        | Request::ResetDevice => {
                             seen_tx.send(body.to_vec()).unwrap();
                             Response::Done.encode()
                         }
@@ -485,6 +501,20 @@ mod tests {
         assert!(matches!(
             Request::decode(&seen_rx.recv().unwrap()).unwrap(),
             Request::StopAddDevice
+        ));
+
+        // forget carries the fingerprint, reset the confirm bytes
+        assert!(link.send(Command::ForgetPeer([9; FINGERPRINT_LEN])));
+        assert_eq!(wait_for_event(&link), LinkEvent::PeerForgotten(Ok(())));
+        assert!(matches!(
+            Request::decode(&seen_rx.recv().unwrap()),
+            Some(Request::ForgetPeer([9, 9, 9, 9, 9, 9, 9, 9]))
+        ));
+        assert!(link.send(Command::ResetDevice));
+        assert_eq!(wait_for_event(&link), LinkEvent::DeviceReset(Ok(())));
+        assert!(matches!(
+            Request::decode(&seen_rx.recv().unwrap()),
+            Some(Request::ResetDevice)
         ));
 
         server.join().unwrap();

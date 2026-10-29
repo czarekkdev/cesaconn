@@ -423,7 +423,7 @@ Frames that carry a request are read into `Zeroizing` buffers (a request may
 hold a password). Compile-time asserts keep the largest request and the
 largest `ListPeers` answer under `MAX_FRAME_LEN`.
 
-### 7.4 Wire format, version 6 **[built]**
+### 7.4 Wire format, version 7 **[built]**
 
 ```
 frame    = length (u32 LE, 1..=MAX_FRAME_LEN) || body
@@ -447,6 +447,8 @@ response = 0x00 || payload        (success)
 | `0x0D` | JoinGroup | `auth len (u16 LE) \|\| auth password \|\| data password`, each `1..=MAX_PASSWORD_LEN`, consumed exactly | empty (the join runs in the background) |
 | `0x0E` | CancelJoin | none | empty |
 | `0x0F` | StopAddDevice | none | empty (also when no window is open) |
+| `0x10` | ForgetPeer | `fingerprint (8)`, exactly | empty (14.1) |
+| `0x11` | ResetDevice | exactly the 8 bytes `CN-RESET` | empty (14.2) |
 | `0x02`, `0x03` | retired (v1 sent `salt \|\| password`) | refused, so a mismatched UI and daemon fail loudly | |
 
 Status flags: bit 0 auth key set, 1 data key set, 2 network running, 3 vault
@@ -478,7 +480,13 @@ Error codes: `0x01` BadRequest, `0x02` KeyDerivationFailed, `0x03` Internal,
 while networking doesn't run), `0x0B` PairingExpired (no waiting pairing has
 that id and code: answered already, timed out, or a different pairing),
 `0x0C` AlreadyInGroup (JoinGroup on a device with keys, a vault or a lock),
-`0x0D` JoinRunning (JoinGroup while a join runs).
+`0x0D` JoinRunning (JoinGroup while a join runs), `0x0E` UnknownPeer
+(ForgetPeer: no paired device has that fingerprint).
+
+`ResetDevice` carries fixed confirm bytes so that nothing sent by mistake
+(a wrong kind byte, a UI bug) decodes as a reset; the user's confirmation
+itself is in the UI (typing `RESET`, 7.5). Version 7 only adds requests and
+an error code: a version 6 daemon answers the new requests with `BadRequest`.
 
 An answer names the id **and the code** the user saw. Ids start at 0 again
 when the daemon restarts, so an id alone could land on a newer pairing that
@@ -1062,7 +1070,7 @@ caveat).
 
 The salts are stored as before: `a_salt` in the vault, `d_salt` in the
 keychain. A device that loses its vault or keychain, or a RAM-only daemon
-after a restart, re-joins through another member (vault reset, section 14).
+after a restart, re-joins through another member (reset, 14.2).
 If every device is gone, the group is gone and a new one is created.
 
 ### 11.7 IPC additions
@@ -1276,15 +1284,57 @@ login.
 
 ---
 
-## 14. Rotation, revocation, reset **[open]**
+## 14. Rotation, revocation, reset
 
-- **Group password rotation**: a password change means new salts and keys,
-  re-distributed to the remaining devices. Until it exists, refuse or warn on
-  a local change once peers exist.
-- **Trusted-peer sync and revocation**: needs a protocol design he reviews
-  first. A revocation is a new group without the revoked device.
-- **Vault reset** for lost keychain salts or a forgotten pw2: delete the vault
-  and re-join the group.
+- **Group password rotation** **[open]**: a password change means new salts
+  and keys, re-distributed to the remaining devices. Until it exists, refuse
+  or warn on a local change once peers exist.
+- **Trusted-peer sync and revocation** **[open]**: needs a protocol design he
+  reviews first. A revocation is a new group without the revoked device.
+
+### 14.1 Forgetting a device (local) **[built]**
+
+`ForgetPeer(fingerprint)` (TUI: `d` on Devices, then `y`) removes every
+trusted peer with that fingerprint (two keys sharing a 64-bit fingerprint
+are one device in practice; the user picked it by that fingerprint). Memory
+first, so new handshakes treat it as unknown at once, then the vault; a
+failed save puts the entries back in their places and reports
+`StorageFailed`. Refused while locked (`Locked`); unknown fingerprint:
+`UnknownPeer`.
+
+It is **local, not a revocation**: the forgotten device still knows both
+group passwords and its own trust in this device. It can't connect as a
+paired device any more, but it can pair again through "Add device" if the
+user accepts the prompt. Keeping it out for good needs new group passwords
+on every other device (rotation, above). The TUI says so in the prompt and
+the log.
+
+### 14.2 Resetting a device **[built]**
+
+`ResetDevice` (TUI: Settings > "Reset this device", type `RESET`, Enter)
+wipes this device back to fresh: it leaves its group, the other devices keep
+their keys and their trust in it (forget it there). It also is the way out of
+a forgotten data password or lost keychain salts (the vault can't be opened
+anyway), so it works while locked, and it asks for no password: the same
+user can delete the files by hand, a reset reveals nothing and the IPC gates
+(7.2) decide who may ask.
+
+Order, under the change slot:
+1. the reset counter goes up, a running join is cancelled, networking stops
+   (invite window, salt port, prompts);
+2. the vault file is deleted (directory fsynced). This is the decisive step:
+   without a vault the daemon starts fresh and ignores keychain items. If it
+   fails, nothing else changed (`StorageFailed`, networking follows the
+   unchanged state again);
+3. memory: the key slots are dropped (zeroized), the trusted-peer list is
+   **replaced by a new one**, prompts cleared;
+4. the keychain items `salts` and `data-key` are deleted. A failure leaves a
+   fresh device and returns `StorageFailed`; a second reset removes them.
+
+Nothing from before comes back: a handshake of the old network that
+finishes late pairs into the old, dropped list (the daemon and the next
+network only see the new one), and a join's commit checks the reset counter
+it started with and refuses after a reset.
 
 ---
 
@@ -1327,7 +1377,12 @@ Tests (`cargo test --workspace --all-features`):
   paths (11.7); stopping "Add device" early (salt port, offer, prompts, a
   newer window untouched, Sync off); another group nearby (same / other /
   no answer, skipped and reported whatever the ids, the status only during
-  the window that found it);
+  the window that found it); forgetting a device (memory and vault, unknown
+  fingerprint, locked, a failed save restoring the order) and resetting
+  (everything wiped while running and while locked, a restart finds nothing,
+  a failed vault delete changes nothing, a failed keychain delete and the
+  second reset, a late handshake into the old list, a join from before the
+  reset never committing) (14.1, 14.2);
 - salt query: exact answer, junk refused, per-source rate limit and its
   memory bound, nothing after the window;
 - `auth_snow` / networker: end-to-end localhost handshakes, first pairing,
@@ -1339,7 +1394,8 @@ Tests (`cargo test --workspace --all-features`):
 - IPC: framing bounds, strict decoding, decoders on random input, peer gates
   and code requirements over real sockets, socket permissions, stale and
   foreign socket files;
-- vault: format, padding, tampering, sizes, atomic writes, directory checks.
+- vault: format, padding, tampering, sizes, atomic writes, deletion,
+  directory checks.
 
 Every new protection gets a test that fails without it.
 
@@ -1432,6 +1488,10 @@ Stated plainly so nobody relies on a property that isn't there.
 13. **No password rotation yet** (14): changing a password on one member
     changes its key but not the others', so that device stops pairing with
     the group until the others change too.
+14. **Forgetting is not revoking** (14.1): a forgotten device still knows the
+    group passwords and can ask to pair again in any "Add device" window; only
+    the user's `n` keeps it out. A reset (14.2) only wipes this device: the
+    others keep trusting it until they forget it.
 
 ---
 
@@ -1462,6 +1522,12 @@ Decided:
 - IPC command set grows with the UI.
 - Argon2id pinned (v0x13, 64 MiB, t = 3, p = 1).
 - Minimum new password length 12 characters.
+- Forget and reset are local (14.1, 14.2); revocation waits for rotation.
+
+Proposed in the forget/reset PR, for his review:
+- a reset needs no password, works while locked and is confirmed by typing
+  `RESET` (14.2);
+- forgetting removes every peer with the fingerprint (14.1).
 
 Proposed in the networking PR, for his review:
 - new devices are only asked about inside an "Add device" window (13);
@@ -1504,5 +1570,7 @@ Next, one stacked PR each, every failure path tested:
 1. group rotation, trusted-peer sync and revocation (section 14, after his
    protocol review); until then a local password change once peers exist
    should warn or be refused;
-2. vault reset;
-3. clipboard v1 (section 12, after the access and delivery decisions).
+2. clipboard v1 (section 12, after the access and delivery decisions).
+
+Built since: forgetting a device and resetting this device (14.1, 14.2,
+IPC version 7).

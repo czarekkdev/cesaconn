@@ -13,7 +13,7 @@
 //!   a daemon of the same user, and on macOS only to one whose signature
 //!   satisfies [`DAEMON_CODE_REQUIREMENT`].
 //!
-//! Wire format (version 6), one request and one response per connection:
+//! Wire format (version 7), one request and one response per connection:
 //! `frame = length (u32 LE, 1..=MAX_FRAME_LEN) || body`
 //!
 //! Request body: `kind (1) || payload`
@@ -38,6 +38,11 @@
 //!   group of a device whose user opened "Add device"
 //! * `0x0E` CancelJoin: none; ends a running join and wipes its passwords
 //! * `0x0F` StopAddDevice: none; ends the "Add device" window early
+//! * `0x10` ForgetPeer: `fingerprint (8)`; removes that paired device from
+//!   this device (memory and vault)
+//! * `0x11` ResetDevice: `"CN-RESET" (8)`; wipes this device back to fresh
+//!   (vault file, keychain items, keys, paired devices). The fixed bytes make
+//!   sure a reset is never decoded from anything sent by mistake
 //! * `0x02` / `0x03` are retired (version 1 sent `salt || password` there).
 //!   They are refused, so a mismatched UI and daemon fail loudly instead of
 //!   deriving a key from the wrong bytes.
@@ -54,7 +59,8 @@
 //!   Versions 2 to 4 were shorter, so a mismatched UI and daemon fail with
 //!   `Malformed`; version 5 refuses flags2 bit 1, so it fails loudly too.
 //! * SetAuthPassword / SetDataPassword / Unlock / SetAutoLogin / SetSync /
-//!   AddDevice / AnswerPairing / JoinGroup / CancelJoin / StopAddDevice: empty
+//!   AddDevice / AnswerPairing / JoinGroup / CancelJoin / StopAddDevice /
+//!   ForgetPeer / ResetDevice: empty
 //! * ListPeers: `count (u16 LE) || count * (fingerprint (8) || name len (1) || name)`
 //! * PendingPairing: `0x00` (none) or `0x01 || id (u32 LE) || code (8) ||
 //!   name len (1) || name`; every code byte is below
@@ -130,6 +136,11 @@ const REQ_ANSWER_PAIRING: u8 = 0x0C;
 const REQ_JOIN_GROUP: u8 = 0x0D;
 const REQ_CANCEL_JOIN: u8 = 0x0E;
 const REQ_STOP_ADD_DEVICE: u8 = 0x0F;
+const REQ_FORGET_PEER: u8 = 0x10;
+const REQ_RESET_DEVICE: u8 = 0x11;
+
+/// The payload of `ResetDevice`: nothing sent by mistake decodes as a reset.
+pub const RESET_CONFIRM: [u8; 8] = *b"CN-RESET";
 
 /* status flags2 */
 /// flags2: joining a group
@@ -233,6 +244,8 @@ pub enum DaemonError {
     AlreadyInGroup = 0x0C,
     /// JoinGroup: a join is running already (cancel it first).
     JoinRunning = 0x0D,
+    /// ForgetPeer: no paired device has this fingerprint.
+    UnknownPeer = 0x0E,
 }
 
 impl DaemonError {
@@ -251,6 +264,7 @@ impl DaemonError {
             0x0B => Some(Self::PairingExpired),
             0x0C => Some(Self::AlreadyInGroup),
             0x0D => Some(Self::JoinRunning),
+            0x0E => Some(Self::UnknownPeer),
             _ => None,
         }
     }
@@ -285,6 +299,7 @@ impl fmt::Display for DaemonError {
                 "this device has keys already: only a fresh device joins a group"
             ),
             DaemonError::JoinRunning => write!(f, "a join is running already"),
+            DaemonError::UnknownPeer => write!(f, "no paired device has that fingerprint"),
         }
     }
 }
@@ -330,6 +345,10 @@ pub enum Request {
     CancelJoin,
     /// End the "Add device" window before its time is up.
     StopAddDevice,
+    /// Remove the paired device with this fingerprint from this device.
+    ForgetPeer([u8; FINGERPRINT_LEN]),
+    /// Wipe this device back to fresh (it leaves its group).
+    ResetDevice,
 }
 
 /// The two group passwords for `JoinGroup`, each in its own exact-size
@@ -449,6 +468,12 @@ impl Request {
             Request::PendingPairing => (REQ_PENDING_PAIRING, None),
             Request::CancelJoin => (REQ_CANCEL_JOIN, None),
             Request::StopAddDevice => (REQ_STOP_ADD_DEVICE, None),
+            Request::ForgetPeer(fingerprint) => {
+                return Zeroizing::new([&[REQ_FORGET_PEER][..], fingerprint].concat());
+            }
+            Request::ResetDevice => {
+                return Zeroizing::new([&[REQ_RESET_DEVICE][..], &RESET_CONFIRM].concat());
+            }
             Request::JoinGroup(passwords) => {
                 let (auth, data) = (&passwords.auth.password, &passwords.data.password);
                 // the encoder never cuts: a too long password goes out whole
@@ -503,6 +528,10 @@ impl Request {
             REQ_PENDING_PAIRING if payload.is_empty() => Some(Request::PendingPairing),
             REQ_CANCEL_JOIN if payload.is_empty() => Some(Request::CancelJoin),
             REQ_STOP_ADD_DEVICE if payload.is_empty() => Some(Request::StopAddDevice),
+            REQ_FORGET_PEER => payload.try_into().ok().map(Request::ForgetPeer),
+            // a public constant, not a secret: nothing for timing to reveal
+            // nosemgrep: cesa.net.non-constant-time-compare
+            REQ_RESET_DEVICE if payload == RESET_CONFIRM => Some(Request::ResetDevice),
             REQ_JOIN_GROUP => {
                 let (auth_len, rest) = payload.split_first_chunk::<2>()?;
                 let auth_len = usize::from(u16::from_le_bytes(*auth_len));
@@ -657,6 +686,8 @@ impl Response {
             | Request::JoinGroup(_)
             | Request::CancelJoin
             | Request::StopAddDevice
+            | Request::ForgetPeer(_)
+            | Request::ResetDevice
                 if payload.is_empty() =>
             {
                 Ok(Response::Done)
@@ -670,7 +701,9 @@ impl Response {
             | Request::AnswerPairing { .. }
             | Request::JoinGroup(_)
             | Request::CancelJoin
-            | Request::StopAddDevice => Err(IpcErrors::Malformed),
+            | Request::StopAddDevice
+            | Request::ForgetPeer(_)
+            | Request::ResetDevice => Err(IpcErrors::Malformed),
             Request::ListPeers => decode_peers(payload).ok_or(IpcErrors::Malformed),
             Request::PendingPairing => decode_pairing(payload).ok_or(IpcErrors::Malformed),
         }
@@ -948,6 +981,8 @@ mod tests {
             },
             Request::CancelJoin,
             Request::StopAddDevice,
+            Request::ForgetPeer([1, 2, 3, 4, 5, 6, 7, 8]),
+            Request::ResetDevice,
             Request::JoinGroup(JoinPasswords {
                 auth: update(b"auth pass"),
                 data: update(b" data "),
@@ -1034,6 +1069,19 @@ mod tests {
         assert_eq!(passwords.data.password.as_slice(), b"b ");
         assert!(Request::decode(&[REQ_CANCEL_JOIN, 0]).is_none());
         assert!(Request::decode(&[REQ_STOP_ADD_DEVICE, 0]).is_none());
+        // forget: exactly a fingerprint
+        assert!(Request::decode(&[REQ_FORGET_PEER, 1, 2, 3, 4, 5, 6, 7, 8]).is_some());
+        assert!(Request::decode(&[REQ_FORGET_PEER, 1, 2, 3, 4, 5, 6, 7]).is_none());
+        assert!(Request::decode(&[REQ_FORGET_PEER, 1, 2, 3, 4, 5, 6, 7, 8, 9]).is_none());
+        // reset: only with the exact confirm bytes
+        let reset = |confirm: &[u8]| [&[REQ_RESET_DEVICE][..], confirm].concat();
+        assert!(matches!(
+            Request::decode(&reset(&RESET_CONFIRM)),
+            Some(Request::ResetDevice)
+        ));
+        assert!(Request::decode(&reset(b"")).is_none());
+        assert!(Request::decode(&reset(b"CN-RESEX")).is_none());
+        assert!(Request::decode(&reset(b"CN-RESET!")).is_none());
     }
 
     /// Test that every daemon error code round-trips, and unknown status bits are refused
@@ -1053,6 +1101,7 @@ mod tests {
             DaemonError::PairingExpired,
             DaemonError::AlreadyInGroup,
             DaemonError::JoinRunning,
+            DaemonError::UnknownPeer,
         ] {
             assert_eq!(
                 Response::decode(&Request::Status, &Response::encode_error(e)),
@@ -1062,7 +1111,7 @@ mod tests {
 
         // unknown error codes are refused
         assert_eq!(
-            Response::decode(&Request::Status, &[RESP_ERR, 0x0E]),
+            Response::decode(&Request::Status, &[RESP_ERR, 0x0F]),
             Err(IpcErrors::Malformed)
         );
 
