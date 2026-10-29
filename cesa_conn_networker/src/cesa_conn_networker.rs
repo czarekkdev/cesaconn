@@ -30,6 +30,7 @@ mod guess_limiter;
 mod hybrid_kex;
 #[cfg(unix)]
 mod ipc_server;
+mod salt_service;
 mod spake2;
 mod tcp_networker;
 #[cfg(feature = "test-commands")]

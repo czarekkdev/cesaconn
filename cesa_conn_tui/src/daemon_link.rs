@@ -15,7 +15,10 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
 use cesa_conn_system::{
-    ipc::{self, IpcErrors, PairingPrompt, PasswordUpdate, PeerInfo, Request, Response, Status},
+    ipc::{
+        self, IpcErrors, JoinPasswords, PairingPrompt, PasswordUpdate, PeerInfo, Request, Response,
+        Status,
+    },
     pairing_code::PairingCode,
 };
 
@@ -51,6 +54,10 @@ pub enum Command {
         code: PairingCode,
         accept: bool,
     },
+    /// Join the group of a device with "Add device" open (both passwords).
+    JoinGroup(JoinPasswords),
+    /// End a running join.
+    CancelJoin,
 }
 
 /// What a refresh brings back: status, paired devices and the pairing
@@ -86,6 +93,10 @@ pub enum LinkEvent {
         accept: bool,
         result: Result<(), IpcErrors>,
     },
+    /// Answer to [`Command::JoinGroup`] (the join runs on in the daemon).
+    JoinStarted(Result<(), IpcErrors>),
+    /// Answer to [`Command::CancelJoin`].
+    JoinCancelled(Result<(), IpcErrors>),
     /// The worker is gone (its runtime couldn't start, or it panicked).
     WorkerStopped,
 }
@@ -183,6 +194,13 @@ async fn run_command(socket: Option<&PathBuf>, command: Command) -> LinkEvent {
             accept,
             result: send_done(socket, Request::AnswerPairing { id, code, accept }).await,
         },
+        // the passwords move into the request, wiped when it is dropped
+        Command::JoinGroup(passwords) => {
+            LinkEvent::JoinStarted(send_done(socket, Request::JoinGroup(passwords)).await)
+        }
+        Command::CancelJoin => {
+            LinkEvent::JoinCancelled(send_done(socket, Request::CancelJoin).await)
+        }
     }
 }
 
@@ -298,7 +316,7 @@ mod tests {
             rt.block_on(async move {
                 let listener = UnixListener::bind(&server_path).unwrap();
 
-                for _ in 0..9 {
+                for _ in 0..11 {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     let body = ipc::read_frame(&mut stream).await.unwrap();
 
@@ -314,7 +332,9 @@ mod tests {
                         | Request::SetAutoLogin(_)
                         | Request::SetSync(_)
                         | Request::AddDevice
-                        | Request::AnswerPairing { .. } => {
+                        | Request::AnswerPairing { .. }
+                        | Request::JoinGroup(_)
+                        | Request::CancelJoin => {
                             seen_tx.send(body.to_vec()).unwrap();
                             Response::Done.encode()
                         }
@@ -427,6 +447,29 @@ mod tests {
                 code: [1, 2, 3, 4, 5, 6, 7, 8],
                 accept: true
             }
+        ));
+
+        // both passwords reach the daemon exactly as given
+        assert!(link.send(Command::JoinGroup(JoinPasswords {
+            auth: PasswordUpdate {
+                password: Zeroizing::new(b"group auth".to_vec()),
+            },
+            data: PasswordUpdate {
+                password: Zeroizing::new(b" group data ".to_vec()),
+            },
+        })));
+        assert_eq!(wait_for_event(&link), LinkEvent::JoinStarted(Ok(())));
+        let Some(Request::JoinGroup(sent)) = Request::decode(&seen_rx.recv().unwrap()) else {
+            panic!("not a JoinGroup");
+        };
+        assert_eq!(sent.auth.password.as_slice(), b"group auth");
+        assert_eq!(sent.data.password.as_slice(), b" group data ");
+
+        assert!(link.send(Command::CancelJoin));
+        assert_eq!(wait_for_event(&link), LinkEvent::JoinCancelled(Ok(())));
+        assert!(matches!(
+            Request::decode(&seen_rx.recv().unwrap()).unwrap(),
+            Request::CancelJoin
         ));
 
         server.join().unwrap();

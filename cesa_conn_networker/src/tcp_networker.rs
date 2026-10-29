@@ -12,8 +12,8 @@ use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
 
 use crate::auth_snow::{
-    AuthSnowErrors, DATA_LAYER_OVERHEAD, DeviceKeypairs, Keys, Pairing, SecureConnection, Tags,
-    TrustedPeer, TrustedPeers, auth_incoming, auth_outgoing,
+    AuthSnowErrors, Authenticated, DATA_LAYER_OVERHEAD, DeviceKeypairs, Keys, Pairing,
+    SecureConnection, Tags, TrustedPeer, TrustedPeers, auth_incoming, auth_outgoing,
 };
 use crate::guess_limiter::GuessLimiter;
 
@@ -34,6 +34,10 @@ pub enum ActionType {
     ConnectNewDevice = 0x02,
     /// Synchronizes clipboard content between devices.
     ClipboardSync = 0x03,
+    /// A joining device asks for the group's `d_salt` on the connection
+    /// that just paired it; the member answers `d_salt (32)` through Noise
+    /// only (the joiner has no `d_key` yet). Header length must be 0.
+    GroupSalt = 0x04,
 }
 
 impl ActionType {
@@ -47,6 +51,7 @@ impl ActionType {
             0x01 => Some(Self::Debug),
             0x02 => Some(Self::ConnectNewDevice),
             0x03 => Some(Self::ClipboardSync),
+            0x04 => Some(Self::GroupSalt),
             _ => None,
         }
     }
@@ -98,7 +103,16 @@ pub struct NetworkerContext {
     pub pairing: Pairing,
     /// Counts wrong passwords per source and locks guessers out.
     pub guess_limiter: Arc<GuessLimiter>,
+    /// The group's `d_salt` while this member's invite window is open,
+    /// `None` otherwise (see [`ActionType::GroupSalt`]).
+    pub salt_offer: SaltOffer,
 }
+
+/// The `d_salt` a member hands to devices that join during its invite window.
+pub type SaltOffer = Arc<RwLock<Option<Zeroizing<[u8; 32]>>>>;
+
+/// Length of a `GroupSalt` answer: the 32-byte `d_salt`.
+const GROUP_SALT_LEN: usize = 32;
 
 /// One packet received from an authenticated peer.
 pub struct ReceivedPacket {
@@ -132,6 +146,9 @@ pub enum TcpNetworkerErrors {
     FailedToDecryptData,
     /// The peer is locked out after too many wrong passwords ([`GuessLimiter`]).
     LockedOut,
+    /// `GroupSalt` outside an invite window, or not on the connection that
+    /// just paired the two devices.
+    NotInvited,
 }
 
 impl fmt::Display for TcpNetworkerErrors {
@@ -152,6 +169,10 @@ impl fmt::Display for TcpNetworkerErrors {
             TcpNetworkerErrors::LockedOut => {
                 write!(f, "peer is locked out after too many wrong passwords")
             }
+            TcpNetworkerErrors::NotInvited => write!(
+                f,
+                "group salt only goes to a device paired just now, in an invite window"
+            ),
         }
     }
 }
@@ -204,9 +225,14 @@ pub async fn recv_handler(
     debug!(%peer_addr, "recv_handler started, authenticating peer");
 
     let context_keys = context.keys.clone();
+    let salt_offer = context.salt_offer.clone();
 
     // 1. authentication
-    let Some((mut secure_connection, peer)) = auth_incoming(
+    let Some(Authenticated {
+        connection: mut secure_connection,
+        peer,
+        newly_paired,
+    }) = auth_incoming(
         context.keys,
         &context.device_keypairs,
         context.trusted_peers,
@@ -253,6 +279,21 @@ pub async fn recv_handler(
     // unknown values fall back to Default, so newer peers stay compatible
     let action_type = ActionType::from_u8(*action_byte).unwrap_or(ActionType::Default);
 
+    // a joiner asking for d_salt: no payload, the answer goes back instead
+    if action_type == ActionType::GroupSalt {
+        if size != 0 {
+            warn!(%peer_addr, size, "GroupSalt with a payload, rejecting");
+            return Err(TcpNetworkerErrors::DataTooLarge);
+        }
+        send_group_salt(&mut secure_connection, newly_paired, &salt_offer, peer_addr).await?;
+
+        return Ok(Some(ReceivedPacket {
+            peer,
+            action_type,
+            data: Zeroizing::new(Vec::new()),
+        }));
+    }
+
     // 3. payload (size bounded above)
     let data = if size == 0 {
         Zeroizing::new(Vec::new())
@@ -285,6 +326,36 @@ pub async fn recv_handler(
         action_type,
         data,
     }))
+}
+
+/// Member side of [`ActionType::GroupSalt`]: sends `d_salt` through Noise,
+/// only on the connection that just paired the two devices and only while
+/// the invite window offers it. Anyone else gets nothing: an already paired
+/// peer doesn't need it, and outside the window nobody was invited.
+async fn send_group_salt(
+    secure_connection: &mut SecureConnection,
+    newly_paired: bool,
+    salt_offer: &SaltOffer,
+    peer_addr: SocketAddr,
+) -> Result<(), TcpNetworkerErrors> {
+    // copied under the guard, which is dropped before any network I/O
+    let offer = salt_offer.read().await.clone();
+
+    let Some(d_salt) = offer.filter(|_| newly_paired) else {
+        warn!(%peer_addr, newly_paired, "group salt asked for outside an invite or by a known peer, refusing");
+        return Err(TcpNetworkerErrors::NotInvited);
+    };
+
+    secure_connection
+        .write_chunked(d_salt.as_slice(), Tags::Regular)
+        .await
+        .map_err(|e| {
+            warn!(%peer_addr, error = %e, "failed to send the group salt");
+            TcpNetworkerErrors::FailedToWriteToStream
+        })?;
+
+    info!(%peer_addr, "sent the group salt to the device paired just now");
+    Ok(())
 }
 
 /// Accepts incoming connections in a loop, spawning a `recv_handler` task for each one.
@@ -395,48 +466,12 @@ pub async fn connect_handler(
     // cloned, so the read lock is released before any network I/O
     let d_key = context.keys.read().await.d_key.clone();
 
-    // a fake server gets one password guess from our confirmation value per
-    // connection, so servers that keep failing are locked out as well
-    if context.guess_limiter.is_locked(connect_addr.ip()).await {
-        warn!(%connect_addr, "server is locked out after failed confirmations, not connecting");
-        return Err(TcpNetworkerErrors::LockedOut);
-    }
-
-    let guess_limiter = context.guess_limiter.clone();
-
     // 1. authentication
-    let authenticated = auth_outgoing(
-        context.keys,
-        &context.device_keypairs,
-        context.trusted_peers,
-        IncomingConnection::new(outgoing_connection, connect_addr),
-        &context.pairing,
-    )
-    .await;
-
-    let authenticated = match authenticated {
-        Ok(authenticated) => authenticated,
-        Err(e) => {
-            // after we sent our confirmation value, any failure (wrong value,
-            // the server hanging up or stalling) may have been a guess against it
-            if matches!(
-                e,
-                AuthSnowErrors::FailedToConfirmMutualAuthSpake2 | AuthSnowErrors::HandshakeTimeout
-            ) {
-                guess_limiter.record_failure(connect_addr.ip()).await;
-            }
-            warn!(%connect_addr, error = %e, "authentication of outgoing connection failed");
-            return Err(TcpNetworkerErrors::FailedToAuthenticate);
-        }
-    };
-
-    let Some((mut secure_connection, peer)) = authenticated else {
-        warn!(%connect_addr, "server failed SPAKE2 confirmation (wrong a_key), closing");
-        guess_limiter.record_failure(connect_addr.ip()).await;
-        return Err(TcpNetworkerErrors::FailedToAuthenticate);
-    };
-
-    guess_limiter.record_success(connect_addr.ip()).await;
+    let Authenticated {
+        connection: mut secure_connection,
+        peer,
+        ..
+    } = authenticate_outgoing(context, connect_addr, outgoing_connection).await?;
 
     debug!(%connect_addr, peer = %peer.name(), "peer authenticated, sending init header");
 
@@ -474,6 +509,117 @@ pub async fn connect_handler(
 
     info!(%connect_addr, peer = %peer.name(), action_type = ?action_type, data_len = size, "connect_handler completed successfully");
     Ok(())
+}
+
+/// The client side of authentication with the guess limiter around it:
+/// refuses a locked-out server, counts failed confirmations against it.
+async fn authenticate_outgoing(
+    context: NetworkerContext,
+    connect_addr: SocketAddr,
+    outgoing_connection: TcpStream,
+) -> Result<Authenticated, TcpNetworkerErrors> {
+    // a fake server gets one password guess from our confirmation value per
+    // connection, so servers that keep failing are locked out as well
+    if context.guess_limiter.is_locked(connect_addr.ip()).await {
+        warn!(%connect_addr, "server is locked out after failed confirmations, not connecting");
+        return Err(TcpNetworkerErrors::LockedOut);
+    }
+
+    let guess_limiter = context.guess_limiter.clone();
+
+    let authenticated = auth_outgoing(
+        context.keys,
+        &context.device_keypairs,
+        context.trusted_peers,
+        IncomingConnection::new(outgoing_connection, connect_addr),
+        &context.pairing,
+    )
+    .await;
+
+    let authenticated = match authenticated {
+        Ok(authenticated) => authenticated,
+        Err(e) => {
+            // after we sent our confirmation value, any failure (wrong value,
+            // the server hanging up or stalling) may have been a guess against it
+            if matches!(
+                e,
+                AuthSnowErrors::FailedToConfirmMutualAuthSpake2 | AuthSnowErrors::HandshakeTimeout
+            ) {
+                guess_limiter.record_failure(connect_addr.ip()).await;
+            }
+            warn!(%connect_addr, error = %e, "authentication of outgoing connection failed");
+            return Err(TcpNetworkerErrors::FailedToAuthenticate);
+        }
+    };
+
+    let Some(authenticated) = authenticated else {
+        warn!(%connect_addr, "server failed SPAKE2 confirmation (wrong a_key), closing");
+        guess_limiter.record_failure(connect_addr.ip()).await;
+        return Err(TcpNetworkerErrors::FailedToAuthenticate);
+    };
+
+    guess_limiter.record_success(connect_addr.ip()).await;
+
+    Ok(authenticated)
+}
+
+/// Joiner side of [`ActionType::GroupSalt`]: authenticates (the user pairs
+/// the devices), asks for the group's `d_salt` and reads it.
+///
+/// 1. authentication ([`auth_outgoing`]); must pair the devices just now
+/// 2. -> init header: `GroupSalt`, length 0
+/// 3. <- `d_salt (32)` through Noise
+///
+/// The salt is only taken from the connection whose pairing the user just
+/// confirmed: a peer we knew already could otherwise swap the data salt.
+pub async fn join_handler(
+    context: NetworkerContext,
+    connect_addr: SocketAddr,
+    outgoing_connection: TcpStream,
+) -> Result<(TrustedPeer, Zeroizing<[u8; 32]>), TcpNetworkerErrors> {
+    // 1. authentication
+    let Authenticated {
+        connection: mut secure_connection,
+        peer,
+        newly_paired,
+    } = authenticate_outgoing(context, connect_addr, outgoing_connection).await?;
+
+    if !newly_paired {
+        warn!(%connect_addr, "the device was paired already: not taking a group salt from it");
+        return Err(TcpNetworkerErrors::NotInvited);
+    }
+
+    // 2. init header, no payload
+    let mut init_data = Vec::with_capacity(INIT_HEADER_LEN);
+    init_data.push(ActionType::GroupSalt as u8);
+    init_data.extend_from_slice(&0u64.to_le_bytes());
+
+    secure_connection
+        .write_timeout(&init_data, Tags::Regular)
+        .await
+        .map_err(|e| {
+            warn!(%connect_addr, error = %e, "failed to ask for the group salt");
+            TcpNetworkerErrors::FailedToWriteToStream
+        })?;
+
+    // 3. exactly 32 bytes
+    let received = secure_connection
+        .read_chunked(GROUP_SALT_LEN, Tags::Regular)
+        .await
+        .map_err(|e| {
+            warn!(%connect_addr, error = %e, "no group salt from the device");
+            TcpNetworkerErrors::FailedToReadFromStream
+        })?;
+
+    let mut d_salt = Zeroizing::new([0u8; GROUP_SALT_LEN]);
+    let bytes = received
+        .get(..GROUP_SALT_LEN)
+        .filter(|_| received.len() == GROUP_SALT_LEN)
+        .ok_or(TcpNetworkerErrors::FailedToReadFromStream)?;
+    d_salt.copy_from_slice(bytes);
+
+    info!(%connect_addr, peer = %peer.name(), "received the group salt");
+    Ok((peer, d_salt))
 }
 
 /// Initiates an outgoing TCP connection to `connect_addr` and passes it to `connect_handler`.
@@ -558,12 +704,14 @@ mod tests {
         NetworkerContext {
             keys: Arc::new(RwLock::new(Keys::new(
                 AuthKey::from_bytes(&a_key),
+                &[0x5A; 32],
                 DataKey::from_bytes(&d_key),
             ))),
             device_keypairs: Arc::new(DeviceKeypairs::generate().unwrap()),
             trusted_peers: Arc::new(RwLock::new(Vec::new())),
             pairing: Pairing::answer_all(accept),
             guess_limiter: Arc::new(GuessLimiter::new()),
+            salt_offer: SaltOffer::default(),
         }
     }
 
@@ -608,12 +756,13 @@ mod tests {
             Some(ActionType::ConnectNewDevice)
         );
         assert_eq!(ActionType::from_u8(0x03), Some(ActionType::ClipboardSync));
+        assert_eq!(ActionType::from_u8(0x04), Some(ActionType::GroupSalt));
     }
 
     /// Test that unknown wire bytes are rejected instead of panicking
     #[test]
     fn test_action_type_from_u8_unknown() {
-        for v in 0x04..=0xFF {
+        for v in 0x05..=0xFF {
             assert_eq!(ActionType::from_u8(v), None);
         }
     }
@@ -631,6 +780,7 @@ mod tests {
             TcpNetworkerErrors::DataTooLarge,
             TcpNetworkerErrors::FailedToDecryptData,
             TcpNetworkerErrors::LockedOut,
+            TcpNetworkerErrors::NotInvited,
         ];
 
         for e in errors {
@@ -724,6 +874,124 @@ mod tests {
         assert_eq!(packet.action_type, ActionType::ConnectNewDevice);
         assert!(packet.data.is_empty());
         assert_eq!(server_peers.read().await.len(), 1);
+    }
+
+    const D_SALT: [u8; 32] = [0xD5; 32];
+
+    /// Runs one join (client asks for the group salt) against a server and
+    /// returns both results.
+    async fn join_exchange(
+        server: NetworkerContext,
+        client: NetworkerContext,
+    ) -> (
+        Result<Option<ReceivedPacket>, TcpNetworkerErrors>,
+        Result<(TrustedPeer, Zeroizing<[u8; 32]>), TcpNetworkerErrors>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let incoming = listener.accept().await.unwrap();
+            recv_handler(incoming, server).await
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let client_result = join_handler(client, addr, stream).await;
+
+        (server_task.await.unwrap(), client_result)
+    }
+
+    /// Test that a device paired just now during an invite window gets
+    /// exactly the offered d_salt
+    #[tokio::test]
+    async fn test_group_salt_to_new_device_in_invite() {
+        let server = make_context(TEST_A_KEY, ACCEPT_ALL);
+        *server.salt_offer.write().await = Some(Zeroizing::new(D_SALT));
+
+        let (server_result, client_result) =
+            join_exchange(server, make_context(TEST_A_KEY, ACCEPT_ALL)).await;
+
+        assert_eq!(*client_result.unwrap().1, D_SALT);
+        let packet = server_result.unwrap().unwrap();
+        assert_eq!(packet.action_type, ActionType::GroupSalt);
+    }
+
+    /// Test that without an invite window the salt is never sent
+    #[tokio::test]
+    async fn test_group_salt_refused_without_invite() {
+        let (server_result, client_result) = join_exchange(
+            make_context(TEST_A_KEY, ACCEPT_ALL),
+            make_context(TEST_A_KEY, ACCEPT_ALL),
+        )
+        .await;
+
+        assert_eq!(server_result.err(), Some(TcpNetworkerErrors::NotInvited));
+        assert_eq!(
+            client_result.err(),
+            Some(TcpNetworkerErrors::FailedToReadFromStream)
+        );
+    }
+
+    /// Test that a peer paired before gets no salt, even in an invite window,
+    /// and that a joiner doesn't ask a peer it already knew
+    #[tokio::test]
+    async fn test_group_salt_only_on_the_pairing_connection() {
+        let server = make_context(TEST_A_KEY, ACCEPT_ALL);
+        let client = make_context(TEST_A_KEY, ACCEPT_ALL);
+        *server.salt_offer.write().await = Some(Zeroizing::new(D_SALT));
+
+        // pair them first
+        let (_, paired) = exchange(
+            server.clone(),
+            client.clone(),
+            ActionType::ConnectNewDevice,
+            b"",
+        )
+        .await;
+        assert_eq!(paired, Ok(()));
+
+        // the joiner side refuses to ask a peer it knew already
+        let (_, client_result) = join_exchange(server.clone(), client.clone()).await;
+        assert_eq!(client_result.err(), Some(TcpNetworkerErrors::NotInvited));
+
+        // and the member side refuses a peer it knew already: a raw request
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let incoming = listener.accept().await.unwrap();
+            recv_handler(incoming, server).await
+        });
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let sent = connect_handler(
+            client,
+            addr,
+            stream,
+            ActionType::GroupSalt,
+            Zeroizing::new(Vec::new()),
+        )
+        .await;
+        assert_eq!(sent, Ok(()));
+        assert_eq!(
+            server_task.await.unwrap().err(),
+            Some(TcpNetworkerErrors::NotInvited)
+        );
+    }
+
+    /// Test that a GroupSalt request with a payload is refused
+    #[tokio::test]
+    async fn test_group_salt_with_payload_refused() {
+        let server = make_context(TEST_A_KEY, ACCEPT_ALL);
+        *server.salt_offer.write().await = Some(Zeroizing::new(D_SALT));
+
+        let (server_result, _) = exchange(
+            server,
+            make_context(TEST_A_KEY, ACCEPT_ALL),
+            ActionType::GroupSalt,
+            b"x",
+        )
+        .await;
+
+        assert_eq!(server_result.err(), Some(TcpNetworkerErrors::DataTooLarge));
     }
 
     /// Test that a peer with a different a_key gets nothing and pairs nothing

@@ -41,7 +41,21 @@ impl Tags {
     }
 }
 
-/// Server side of the SPAKE2 exchange (role B) using `a_key` as the password.
+/* SPAKE2 identities: role label || the group's a_salt */
+/// identity of the client (role A)
+const CLIENT_IDENTITY: &[u8] = b"CesaConn-client";
+/// identity of the server (role B)
+const SERVER_IDENTITY: &[u8] = b"CesaConn-server";
+
+/// A SPAKE2 identity: `label || a_salt`. The salt is public; binding it
+/// here means two devices with different salts fail the SPAKE2
+/// confirmation explicitly, whatever keys they derived.
+fn identity(label: &[u8], a_salt: &[u8; 32]) -> Identity {
+    Identity::new(&[label, a_salt.as_slice()].concat())
+}
+
+/// Server side of the SPAKE2 exchange (role B) using `a_key` as the password
+/// and the group's `a_salt` in both identities.
 ///
 /// 1. -> our SPAKE2 message
 /// 2. <- client's SPAKE2 message
@@ -52,13 +66,14 @@ impl Tags {
 pub async fn spake2_exchange_server(
     stream: &mut TcpStream,
     a_key: &AuthKey,
+    a_salt: &[u8; 32],
     transcript: &mut Zeroizing<Vec<u8>>,
 ) -> Result<Zeroizing<Vec<u8>>, AuthSnowErrors> {
     // identities must match the client's `start_a` call exactly
     let (s1, mut outbound_msg) = Spake2::<Ed25519Group>::start_b(
         &Password::new(a_key.expose().as_slice()),
-        &Identity::new(b"client"),
-        &Identity::new(b"server"),
+        &identity(CLIENT_IDENTITY, a_salt),
+        &identity(SERVER_IDENTITY, a_salt),
     );
 
     OutboundMsg.tag(&mut outbound_msg);
@@ -155,7 +170,8 @@ pub async fn spake2_confirm_mutual_auth_server(
     Ok(true)
 }
 
-/// Client side of the SPAKE2 exchange (role A) using `a_key` as the password.
+/// Client side of the SPAKE2 exchange (role A) using `a_key` as the password
+/// and the group's `a_salt` in both identities.
 ///
 /// 1. -> our SPAKE2 message
 /// 2. <- server's SPAKE2 message
@@ -167,13 +183,14 @@ pub async fn spake2_confirm_mutual_auth_server(
 pub async fn spake2_exchange_client(
     stream: &mut TcpStream,
     a_key: &AuthKey,
+    a_salt: &[u8; 32],
     transcript: &mut Zeroizing<Vec<u8>>,
 ) -> Result<Zeroizing<Vec<u8>>, AuthSnowErrors> {
     // identities must match the server's `start_b` call exactly
     let (s1, mut outbound_msg) = Spake2::<Ed25519Group>::start_a(
         &Password::new(a_key.expose().as_slice()),
-        &Identity::new(b"client"),
-        &Identity::new(b"server"),
+        &identity(CLIENT_IDENTITY, a_salt),
+        &identity(SERVER_IDENTITY, a_salt),
     );
 
     OutboundMsg.tag(&mut outbound_msg);
@@ -290,6 +307,21 @@ mod tests {
         Zeroizing<Vec<u8>>,
         Zeroizing<Vec<u8>>,
     ) {
+        run_salted(server_key, [3u8; 32], client_key, [3u8; 32]).await
+    }
+
+    /// Like [`run`] with each side's own a_salt.
+    async fn run_salted(
+        server_key: [u8; 32],
+        server_salt: [u8; 32],
+        client_key: [u8; 32],
+        client_salt: [u8; 32],
+    ) -> (
+        Result<bool, AuthSnowErrors>,
+        Result<bool, AuthSnowErrors>,
+        Zeroizing<Vec<u8>>,
+        Zeroizing<Vec<u8>>,
+    ) {
         let (mut s, mut c) = pair().await;
         let (sk, ck) = (
             AuthKey::from_bytes(&server_key),
@@ -299,11 +331,11 @@ mod tests {
         let mut ct = Zeroizing::new(Vec::new());
 
         let server = async {
-            let key1 = spake2_exchange_server(&mut s, &sk, &mut st).await?;
+            let key1 = spake2_exchange_server(&mut s, &sk, &server_salt, &mut st).await?;
             spake2_confirm_mutual_auth_server(&mut s, &key1, &mut st).await
         };
         let client = async {
-            let key1 = spake2_exchange_client(&mut c, &ck, &mut ct).await?;
+            let key1 = spake2_exchange_client(&mut c, &ck, &client_salt, &mut ct).await?;
             spake2_confirm_mutual_auth_client(&mut c, &key1, &mut ct).await
         };
         let (sr, cr) = tokio::join!(server, client);
@@ -332,6 +364,16 @@ mod tests {
         assert_ne!(cr, Ok(true));
     }
 
+    /// Test that the same key with a different a_salt fails the
+    /// confirmation (the salt is bound into both identities)
+    #[tokio::test]
+    async fn test_different_salt_rejected() {
+        let (sr, cr, _, _) = run_salted([7u8; 32], [3u8; 32], [7u8; 32], [4u8; 32]).await;
+
+        assert_eq!(sr, Ok(false));
+        assert_ne!(cr, Ok(true));
+    }
+
     /// Test that the exchange gives a fresh key1 every run (ephemeral scalars)
     #[tokio::test]
     async fn test_session_keys_are_fresh() {
@@ -344,8 +386,8 @@ mod tests {
             let mut ct = Zeroizing::new(Vec::new());
 
             let (sk1, ck1) = tokio::join!(
-                spake2_exchange_server(&mut s, &k, &mut st),
-                spake2_exchange_client(&mut c, &k, &mut ct)
+                spake2_exchange_server(&mut s, &k, &[3u8; 32], &mut st),
+                spake2_exchange_client(&mut c, &k, &[3u8; 32], &mut ct)
             );
             let (sk1, ck1) = (sk1.unwrap(), ck1.unwrap());
 

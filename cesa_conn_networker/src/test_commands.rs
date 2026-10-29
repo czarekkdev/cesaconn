@@ -21,7 +21,7 @@ use cesa_conn_system::pairing_code::{PairingCode, symbol};
 use crate::{
     auth_snow::{AuthKey, DataKey, DeviceKeypairs, Keys, Pairing},
     guess_limiter::GuessLimiter,
-    tcp_networker::{ActionType, NetworkerContext, TCP_PORT, connect, recv},
+    tcp_networker::{ActionType, NetworkerContext, SaltOffer, TCP_PORT, connect, recv},
     udp_networker::{InstanceId, UdpNetworkerErrors, udp_broadcast_presence, udp_find_broadcaster},
 };
 
@@ -98,6 +98,7 @@ fn make_context(keys: Arc<RwLock<Keys>>) -> Option<NetworkerContext> {
         trusted_peers: Arc::new(RwLock::new(Vec::new())),
         pairing: terminal_pairing(),
         guess_limiter: Arc::new(GuessLimiter::new()),
+        salt_offer: SaltOffer::default(),
     })
 }
 
@@ -135,6 +136,7 @@ fn test_keys(password: &str, salts: &[u8; SALTS_LEN]) -> Option<Arc<RwLock<Keys>
     match derived {
         Ok((a_key, d_key)) => Some(Arc::new(RwLock::new(Keys::new(
             AuthKey::new(a_key),
+            a_salt,
             DataKey::new(d_key),
         )))),
         Err(e) => {
