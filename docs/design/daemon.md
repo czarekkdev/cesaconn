@@ -1361,7 +1361,12 @@ The security gate (`security/README.md`) runs on every push: zeroize, lock and
 network rules (semgrep), clippy (every rustc and clippy warning), ThreadSanitizer,
 Miri on the crypto crate, cargo-audit / cargo-deny, gitleaks. Every critical
 finding, every warning and every coverage gap blocks; `unwrap` / `expect`
-outside tests are critical. Only notes pass: reviewed upstream-only dependency
+outside tests are critical. A failing test blocks too: CI's only full test
+run is the ThreadSanitizer one, which runs with `--no-fail-fast` and reports
+every `FAILED` test, a test binary that died and any unexplained cargo exit
+code (before, failures there only showed up as a count in the report and the
+gate passed). The gate checks its own parsing first (`selftest`, real cargo
+output, every run). Only notes pass: reviewed upstream-only dependency
 findings in `security/accepted.json` (never in `deny.toml`) and unused code
 (visible until the networking code is wired up). Code that doesn't build is a
 coverage gap, never clean.

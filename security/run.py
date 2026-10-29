@@ -17,8 +17,12 @@ Checks
   audit     cargo-audit (RustSec)     - vulnerabilities / unsound crates
   deny      cargo-deny                - registry sources, licenses, bans
   gitleaks  committed secrets
-  miri      (full) UB in cesa_conn_crypto tests
-  tsan      (full, Linux nightly) data races in tests
+  miri      (full) UB in cesa_conn_crypto tests (a failing test blocks too)
+  tsan      (full, Linux nightly) data races in tests; it is also the one
+            place CI runs every test, so a failing test, a crashed test
+            binary or an unexplained cargo exit code blocks
+  selftest  (always) the gate's own test-result parsing, on real cargo
+            output: a gate that stopped seeing failures must not pass
 
 Severity
   critical  -> blocks (exit 1)
@@ -353,6 +357,32 @@ def check_gitleaks(git_range: str | None) -> ToolResult:
 PASSED_RE = re.compile(r"test result: \w+\. (\d+) passed; (\d+) failed")
 
 
+FAILED_TEST_RE = re.compile(r"^test (\S+) \.\.\. FAILED$", re.M)
+CRASH_RE = re.compile(r"process didn't exit successfully: `[^`]*` \((.+)\)")
+TARGET_FAILED_RE = re.compile(r"^error: test failed, to rerun pass `([^`]+)`", re.M)
+
+
+def test_failures(code: int, text: str, races: bool = False) -> list[str]:
+    """What failed in a `cargo test --no-fail-fast` run; [] if nothing did.
+
+    A failing test prints `test NAME ... FAILED`. A test binary that dies
+    (abort, signal, exit) prints no such line and its other targets still say
+    `test result: ok`, so `process didn't exit successfully` counts too, and
+    so does any other non-zero exit nothing above explains. Under TSan a race
+    makes the binary exit non-zero as well: with `races` set (already
+    reported as critical) only the failing test names are listed.
+    """
+    failures = [f"test {name} FAILED" for name in FAILED_TEST_RE.findall(text)]
+    if races:
+        return failures
+    failures += [f"test binary died ({why})" for why in CRASH_RE.findall(text)]
+    if code not in (0, 124) and not failures:
+        targets = TARGET_FAILED_RE.findall(text)
+        failures.append(f"cargo test exited with {code}" +
+                        (f" (targets: {', '.join(targets)})" if targets else ""))
+    return failures
+
+
 def count_tests(text: str) -> str:
     p = f = 0
     for m in PASSED_RE.finditer(text):
@@ -371,7 +401,8 @@ def check_miri() -> ToolResult:
         return r
     for crate in MIRI_CRATES:
         skip = [a for t in MIRI_SKIP for a in ("--skip", t)]
-        code, out, err = run(["cargo", "+nightly", "miri", "test", "-p", crate, "--", *skip],
+        code, out, err = run(["cargo", "+nightly", "miri", "test", "--no-fail-fast", "-p", crate,
+                              "--", *skip],
                              env={"MIRIFLAGS": "-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check"},
                              timeout=int(os.environ.get("CESA_MIRI_TIMEOUT", "2400")))
         text = out + err
@@ -383,9 +414,10 @@ def check_miri() -> ToolResult:
                                       loc.group(1) if loc else crate, int(loc.group(2)) if loc else 0))
         if code == 124:
             r.findings.append(Finding("miri", "timeout", "info", f"Miri timed out on {crate} (partial coverage)"))
-        elif code != 0 and not r.findings:
+        elif failures := test_failures(code, text, races=bool(r.findings)):
             r.findings.append(Finding("miri", "tests-failed", "warning",
-                                      f"Tests fail under Miri for {crate}:\n{text[-1200:]}"))
+                                      f"Tests fail under Miri for {crate}:\n" +
+                                      "\n".join(failures[:30]) + f"\n{text[-800:]}", crate))
     return r
 
 
@@ -405,8 +437,9 @@ def check_tsan() -> ToolResult:
            "CARGO_TARGET_DIR": str(ROOT / "target" / "tsan")}
     broken = []
     for crate in CRATES:
+        # --no-fail-fast: one failing target must not hide the tests after it
         code, out, err = run(["cargo", "+nightly", "test", "-Zbuild-std", "--target", target, "-p", crate,
-                              "--all-targets", "--all-features"], env=env,
+                              "--all-targets", "--all-features", "--no-fail-fast"], env=env,
                              timeout=int(os.environ.get("CESA_TSAN_TIMEOUT", "1800")))
         text = out + err
         if code != 0 and not PASSED_RE.search(text):
@@ -433,8 +466,93 @@ def check_tsan() -> ToolResult:
         if code == 124:
             r.findings.append(Finding("tsan", "timeout", "warning",
                                       f"{crate} tests timed out under TSan - possible deadlock or hang"))
+        # the only full test run in CI: a failing test must block like a race
+        elif failures := test_failures(code, text, races=bool(seen)):
+            r.findings.append(Finding("tsan", "tests-failed", "warning",
+                                      f"{crate}: tests fail ({len(failures)}):\n" +
+                                      "\n".join(failures[:30]), crate))
     if broken:
         r.note = (r.note + "; " if r.note else "") + "NOT tested: " + ", ".join(broken)
+    return r
+
+
+# ---- the gate's own parsing --------------------------------------------------
+# Real `cargo test --no-fail-fast` output (trimmed): failing tests in two
+# targets, and a test binary that aborted while every `test result` says ok.
+SELFTEST_FAILED = """running 3 tests
+test tests::ok ... ok
+test tests::bad_two ... FAILED
+test tests::bad_one ... FAILED
+
+failures:
+    tests::bad_one
+    tests::bad_two
+
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`
+
+running 2 tests
+test integration_ok ... ok
+test integration_bad ... FAILED
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--test it`
+error: 2 targets failed:
+    `--lib`
+    `--test it`
+"""
+SELFTEST_CRASH = """running 1 test
+test tests::ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+running 2 tests
+error: test failed, to rerun pass `--test crash`
+
+Caused by:
+  process didn't exit successfully: `target/debug/deps/crash-7626f39ab25e2ddc` (signal: 6, SIGABRT: process abort signal)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: 1 target failed:
+    `--test crash`
+"""
+SELFTEST_CLEAN = """running 2 tests
+test a ... ok
+test b ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+"""
+
+
+def check_selftest() -> ToolResult:
+    """The gate checks itself: failures it must see, and a clean run it must pass."""
+    r = ToolResult("selftest")
+    cases = [
+        ("two failing targets", test_failures(101, SELFTEST_FAILED),
+         ["test tests::bad_two FAILED", "test tests::bad_one FAILED",
+          "test integration_bad FAILED"]),
+        ("crashed test binary", test_failures(101, SELFTEST_CRASH),
+         ["test binary died (signal: 6, SIGABRT: process abort signal)"]),
+        ("unexplained exit code", test_failures(1, SELFTEST_CLEAN), ["cargo test exited with 1"]),
+        ("clean run", test_failures(0, SELFTEST_CLEAN), []),
+        ("timeout is reported elsewhere", test_failures(124, SELFTEST_CLEAN), []),
+        ("race already reported", test_failures(66, SELFTEST_CRASH, races=True), []),
+        ("race keeps failing names", test_failures(101, SELFTEST_FAILED, races=True),
+         ["test tests::bad_two FAILED", "test tests::bad_one FAILED",
+          "test integration_bad FAILED"]),
+        ("counting", [count_tests(SELFTEST_FAILED)], ["2 tests passed, 3 failed"]),
+    ]
+    for name, got, want in cases:
+        if got != want:
+            r.findings.append(Finding("selftest", "parser-broken", "critical",
+                                      f"gate self-test '{name}': got {got!r}, want {want!r}",
+                                      "security/run.py"))
+    r.note = f"{len(cases)} cases"
     return r
 
 
@@ -590,16 +708,19 @@ def main() -> int:
     ap.add_argument("--fast", action="store_true", help="static checks only (pre-push hook)")
     ap.add_argument("--range", default=os.environ.get("CESA_GIT_RANGE"),
                     help="git log range for secret scanning, e.g. origin/main..HEAD")
-    ap.add_argument("--only", help="comma-separated subset: semgrep,clippy,audit,deny,gitleaks,miri,tsan")
+    ap.add_argument("--only", help="comma-separated subset: "
+                    "selftest,semgrep,clippy,audit,deny,gitleaks,miri,tsan")
     a = ap.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
 
-    checks = [("semgrep", check_semgrep), ("clippy", check_clippy), ("audit", check_audit),
+    checks = [("selftest", check_selftest),
+              ("semgrep", check_semgrep), ("clippy", check_clippy), ("audit", check_audit),
               ("deny", check_deny), ("gitleaks", lambda: check_gitleaks(a.range))]
     if not a.fast:
         checks += [("miri", check_miri), ("tsan", check_tsan)]
     if a.only:
-        want = set(a.only.split(","))
+        # the self-test always runs: every partial run (CI runs two) parses too
+        want = set(a.only.split(",")) | {"selftest"}
         checks = [c for c in checks if c[0] in want]
 
     results = []

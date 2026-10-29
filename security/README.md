@@ -19,6 +19,8 @@ code scanning (Security -> Code scanning).
 | Network / protocol | semgrep `network.yml` | length read from the wire used as an allocation size without an upper bound (remote memory DoS), secret/MAC/confirmation compared with `==` instead of constant-time `ct_eq`, fixed/zero AEAD nonce | socket reads awaited without `timeout(...)` (slowloris), sockets bound to `0.0.0.0`/`[::]`, u64 wire length cast `as usize`, `unwrap`/`expect` on network/crypto results |
 | Races | semgrep + ThreadSanitizer | `static mut`, `unsafe impl Send/Sync`, any TSan data race | check-then-act / lost update (read guard, then separate write guard), `Ordering::Relaxed`, test hang under TSan |
 | UB | Miri (`cesa_conn_crypto`) | Undefined Behavior | tests failing under Miri |
+| Failing tests | ThreadSanitizer run (CI's only full test run, `--no-fail-fast`) | | a `test ... FAILED`, a test binary that died (abort, signal) although every other `test result` says ok, any cargo exit code nothing else explains |
+| The gate itself | `selftest` (every run, also `--fast` and `--only`) | its test-result parsing gives a wrong answer on recorded real cargo output | |
 | Dependencies | cargo-audit, cargo-deny | RustSec vulnerability or *unsound* advisory, non-crates.io source | unmaintained/yanked, duplicate versions, licenses |
 | Secrets in git | gitleaks | any detected secret in history / pushed commits | |
 | Panics | clippy + semgrep `hygiene.yml` | `unwrap`/`expect` outside tests, and `allow(clippy::unwrap_used / expect_used)` anywhere | `panic`/indexing/arithmetic overflow/truncating casts outside tests |
