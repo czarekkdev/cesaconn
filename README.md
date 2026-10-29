@@ -74,8 +74,9 @@ CesaConn is designed with privacy as a core principle, not an afterthought:
 CesaConn is in development; nothing syncs data yet. What works today
 (macOS; Linux and Windows don't keep keys yet, see `docs/design/daemon.md`):
 
-- the daemon keeps both keys in an encrypted vault (unlock after a restart,
-  optional automatic login through the OS keychain);
+- the daemon keeps both keys in an encrypted vault: after a restart the UI
+  asks for the data password right away (or turn on the optional automatic
+  login through the OS keychain);
 - two of your devices find each other on the local network, authenticate
   (SPAKE2 + post-quantum hybrid key exchange + Noise) and pair once after
   you compare an 8-emoji code on both screens;
