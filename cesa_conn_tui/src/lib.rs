@@ -37,6 +37,10 @@ const DATA_KEY_LABEL: &str = "Data key";
 const AUTO_LOGIN_LABEL: &str = "Automatic login";
 const SYNC_LABEL: &str = "Sync";
 
+/// Logged once when "Add device" finds a device of another group.
+const OTHER_GROUP_HINT: &str = "[ WARN] A device nearby is in a different group (other passwords setup): \
+     it can't pair with this one. On that device: reset it (no passwords set), then n there joins this group";
+
 /// How often the daemon's status is asked for (seconds).
 const REFRESH_INTERVAL: u64 = 2;
 
@@ -680,6 +684,10 @@ fn handle_link_event(app: &mut App, event: LinkEvent) {
 
             let was_locked = matches!(&app.daemon, DaemonState::Up(s) if s.locked);
             let was_joining = matches!(&app.daemon, DaemonState::Up(s) if s.joining);
+            let had_other_group = matches!(&app.daemon, DaemonState::Up(s) if s.other_group_nearby);
+            if status.other_group_nearby && !had_other_group {
+                app.push_log(OTHER_GROUP_HINT);
+            }
             if was_joining && !status.joining {
                 app.push_log(if status.saved {
                     "[ INFO] Joined the group: keys saved, sync on"
@@ -1022,6 +1030,10 @@ fn render_devices(frame: &mut Frame, area: Rect, app: &mut App) {
         DaemonState::Up(s) if s.joining => (
             "Joining a group: compare the code when it appears (x cancels)",
             Color::Yellow,
+        ),
+        DaemonState::Up(s) if s.adding_device && s.other_group_nearby => (
+            "A device nearby is in another group: reset it, then n there joins",
+            Color::Red,
         ),
         DaemonState::Up(s) if s.adding_device => (
             "Add device is open: visible to new devices (x stops it)",
@@ -2334,6 +2346,37 @@ mod tests {
         };
         handle_link_event(&mut app, status_with(&[], locked));
         assert!(screen(&mut app).contains("Locked"));
+    }
+
+    /// Test that a device of another group is reported once in the log and
+    /// shown on the Devices tab while the window is open
+    #[test]
+    fn test_other_group_hint() {
+        let mut app = App::new();
+        let mut status = Status {
+            auth_key_set: true,
+            data_key_set: true,
+            saved: true,
+            network_running: true,
+            sync_enabled: true,
+            adding_device: true,
+            other_group_nearby: true,
+            ..Status::default()
+        };
+        handle_link_event(&mut app, status_with(&[], status));
+        handle_link_event(&mut app, status_with(&[], status));
+
+        let hints = app
+            .logs
+            .iter()
+            .filter(|l| l.contains("different group"))
+            .count();
+        assert_eq!(hints, 1);
+        assert!(screen(&mut app).contains("another group"));
+
+        status.other_group_nearby = false;
+        handle_link_event(&mut app, status_with(&[], status));
+        assert!(!screen(&mut app).contains("another group"));
     }
 
     /// Test that the selection follows the list: it moves back when the

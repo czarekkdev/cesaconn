@@ -96,6 +96,11 @@ Pair two devices on the same network:
 2. new device: Devices > `n` (Join a group), enter the same two passwords;
 3. both show the same 8 emoji with names: press `y` on both.
 
+Set the passwords on the **first device only**. A device where you set them
+yourself starts its own group and can't pair with the others; Add device
+then says "a device nearby is in a different group". Reset that device (no
+passwords set) and press `n` there to join.
+
 Allow incoming connections when macOS asks (UDP 3636, TCP 3232 and 3233).
 The full design, threat model and known limits are in
 [`docs/design/daemon.md`](docs/design/daemon.md).
