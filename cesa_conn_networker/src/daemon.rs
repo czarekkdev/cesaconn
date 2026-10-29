@@ -166,6 +166,15 @@ struct JoinSlot {
     token: CancellationToken,
 }
 
+/// An open invite window: cancelling `window` ends it; `offer` is the
+/// `d_salt` offer it set.
+struct InviteSlot {
+    /// Tells this window apart from a later one.
+    generation: u64,
+    window: CancellationToken,
+    offer: SaltOffer,
+}
+
 /// Where a join looks for the member: its salt query and its listener.
 #[derive(Clone, Copy, Debug)]
 struct MemberAddrs {
@@ -264,6 +273,10 @@ pub struct Daemon {
     pairings: RwLock<PendingPairings>,
     /// The "Add device" window is open: only then are new devices asked about.
     adding: AtomicBool,
+    /// The open invite window, so the user can end it early.
+    invite: RwLock<Option<InviteSlot>>,
+    /// Generation of the next invite window.
+    next_invite: std::sync::atomic::AtomicU64,
     /// The running join, if any (its pairing is asked about too).
     join: RwLock<Option<JoinSlot>>,
     /// Generation of the next join.
@@ -348,6 +361,8 @@ impl Daemon {
             network: RwLock::default(),
             pairings: RwLock::default(),
             adding: AtomicBool::new(false),
+            invite: RwLock::default(),
+            next_invite: std::sync::atomic::AtomicU64::new(0),
             join: RwLock::default(),
             next_join: std::sync::atomic::AtomicU64::new(0),
             guess_limiter: Arc::new(GuessLimiter::new()),
@@ -391,6 +406,10 @@ impl Daemon {
                 self.cancel_join().await;
                 Response::Done.encode()
             }
+            Request::StopAddDevice => {
+                self.stop_add_device().await;
+                Response::Done.encode()
+            }
             change => {
                 let Ok(turn) = self.change_slot.clone().acquire_owned().await else {
                     return Response::encode_error(DaemonError::Internal);
@@ -426,7 +445,8 @@ impl Daemon {
             | Request::AnswerPairing { .. }
             | Request::AddDevice
             | Request::JoinGroup(_)
-            | Request::CancelJoin => Err(DaemonError::BadRequest),
+            | Request::CancelJoin
+            | Request::StopAddDevice => Err(DaemonError::BadRequest),
         };
 
         // networking follows the state: keys, lock and the Sync switch
@@ -1195,6 +1215,8 @@ impl Daemon {
         let network = self.network.write().await.take()?;
 
         network.token.cancel();
+        // the invite window ends with networking (salt port, offer)
+        self.end_invite(None).await;
         self.adding.store(false, Ordering::SeqCst);
         // dropped = rejected; the handshakes tell their peers
         self.pairings.write().await.waiting.clear();
@@ -1338,20 +1360,16 @@ impl Daemon {
                 token,
                 id,
                 window,
+                generation,
             } = invite;
-            let offer = context.salt_offer.clone();
 
             select! {
                 () = token.cancelled() => {},
                 () = invite_window(context, id, window.clone()) => {},
             }
-            // the salt goes away with the window, whatever ended it
-            close_invite(&window, &offer).await;
-
-            // cancelled: stop_network closed it already, and a window of a
-            // restarted network must not be closed by this old one
-            if !token.is_cancelled() {
-                daemon.adding.store(false, Ordering::SeqCst);
+            // the salt goes away with the window, whatever ended it; a
+            // window the user stopped (or a newer one) isn't touched here
+            if daemon.end_invite(Some(generation)).await {
                 info!("add device: invite window closed");
             }
         });
@@ -1393,6 +1411,12 @@ impl Daemon {
         }
 
         let window = CancellationToken::new();
+        let generation = self.next_invite.fetch_add(1, Ordering::SeqCst);
+        *self.invite.write().await = Some(InviteSlot {
+            generation,
+            window: window.clone(),
+            offer: context.salt_offer.clone(),
+        });
 
         // the salt query exists only during the window: no port outside it
         match TcpListener::bind(self.salt_addr).await {
@@ -1420,7 +1444,41 @@ impl Daemon {
             token,
             id,
             window,
+            generation,
         }))
+    }
+
+    /// Ends the invite window `generation` (`None`: whichever is open):
+    /// announcing, searching and the salt query stop, `d_salt` is no longer
+    /// offered, no new device is asked about. `false` if that window isn't
+    /// open (ended already, or a newer one is open).
+    async fn end_invite(&self, generation: Option<u64>) -> bool {
+        let slot = {
+            let mut invite = self.invite.write().await;
+            let current = invite.as_ref().map(|slot| slot.generation);
+            if generation.is_some_and(|wanted| current != Some(wanted)) {
+                return false;
+            }
+            invite.take()
+        };
+        let Some(slot) = slot else {
+            return false;
+        };
+
+        close_invite(&slot.window, &slot.offer).await;
+        self.adding.store(false, Ordering::SeqCst);
+        true
+    }
+
+    /// The user stops "Add device" before its 2 min are over. Pairings it
+    /// was asking about are rejected (unless a join still asks about them).
+    async fn stop_add_device(&self) {
+        if self.end_invite(None).await {
+            info!("add device: stopped by the user");
+            if !self.join_running().await {
+                self.pairings.write().await.waiting.clear();
+            }
+        }
     }
 
     /// Starts joining the group of a device whose user opened "Add
@@ -1763,6 +1821,8 @@ struct Invite {
     id: InstanceId,
     /// Cancelled when the window ends; stops the salt query.
     window: CancellationToken,
+    /// This window's generation (see [`Daemon::end_invite`]).
+    generation: u64,
 }
 
 /// Runs the accept loop in its own task until the token is cancelled. If
@@ -3506,6 +3566,58 @@ mod tests {
         sleep(Duration::from_millis(50)).await;
         assert!(query_salt(member.salt_addr).await.is_err());
         assert!(context(&member).await.salt_offer.read().await.is_none());
+    }
+
+    /// Test that the user can stop "Add device" early: the salt port and
+    /// the d_salt offer go away, waiting prompts are rejected, no new
+    /// device is asked about, and a new window can open that the old one's
+    /// end doesn't close
+    #[tokio::test]
+    async fn test_stop_add_device() {
+        let storage = TestStorage::new("stop-invite");
+        let member = storage.daemon_on_localhost().await;
+        setup(&member).await;
+        ask(&member, Request::SetSync(true)).await.unwrap();
+
+        let first = member.open_invite().await.unwrap().unwrap();
+        assert!(member.status().await.adding_device);
+        assert!(query_salt(member.salt_addr).await.is_ok());
+        let (request, answer) = fake_request();
+        member.queue_pairing(request).await;
+        assert!(member.pending_pairing().await.is_some());
+
+        ask(&member, Request::StopAddDevice).await.unwrap();
+
+        assert!(!member.status().await.adding_device);
+        assert!(first.window.is_cancelled());
+        assert!(context(&member).await.salt_offer.read().await.is_none());
+        assert!(member.pending_pairing().await.is_none());
+        // dropped: the handshake reads that as a rejection
+        assert_ne!(answer.await, Ok(true));
+        sleep(Duration::from_millis(50)).await;
+        assert!(TcpStream::connect(member.salt_addr).await.is_err());
+        // nobody new is asked about any more
+        let (request, answer) = fake_request();
+        member.queue_pairing(request).await;
+        assert_eq!(answer.await, Ok(false));
+        // stopping again is harmless
+        ask(&member, Request::StopAddDevice).await.unwrap();
+
+        // a new window; the first one's late end doesn't close it
+        let second = member.open_invite().await.unwrap().unwrap();
+        assert!(!member.end_invite(Some(first.generation)).await);
+        assert!(member.status().await.adding_device);
+        assert!(!second.window.is_cancelled());
+        assert!(context(&member).await.salt_offer.read().await.is_some());
+        assert!(member.end_invite(Some(second.generation)).await);
+        assert!(!member.status().await.adding_device);
+
+        // Sync off ends an open window too: the salt port goes at once
+        let third = member.open_invite().await.unwrap().unwrap();
+        ask(&member, Request::SetSync(false)).await.unwrap();
+        assert!(third.window.is_cancelled());
+        sleep(Duration::from_millis(50)).await;
+        assert!(TcpStream::connect(member.salt_addr).await.is_err());
     }
 
     /// Test that only a fresh device with storage may join, and one join

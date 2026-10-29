@@ -446,6 +446,7 @@ response = 0x00 || payload        (success)
 | `0x0C` | AnswerPairing | `id (u32 LE) \|\| code (8) \|\| accept (exactly 0x00 or 0x01)` | empty |
 | `0x0D` | JoinGroup | `auth len (u16 LE) \|\| auth password \|\| data password`, each `1..=MAX_PASSWORD_LEN`, consumed exactly | empty (the join runs in the background) |
 | `0x0E` | CancelJoin | none | empty |
+| `0x0F` | StopAddDevice | none | empty (also when no window is open) |
 | `0x02`, `0x03` | retired (v1 sent `salt \|\| password`) | refused, so a mismatched UI and daemon fail loudly | |
 
 Status flags: bit 0 auth key set, 1 data key set, 2 network running, 3 vault
@@ -1078,7 +1079,7 @@ change keeps the salts but changes the key: until group rotation exists
 group's auth password, Enter, its data password, Enter (both masked, kept
 only in pre-sized zeroizing buffers, wiped when sent or on Esc); `x` cancels
 a running join; the status bar says "joining a group". On a member, `n`
-opens the invite window.
+opens the invite window and `x` stops it early.
 
 **Verified** (`daemon` tests, two real daemons over localhost, nothing
 injected): a fresh device joins a member with an open window, both users
@@ -1210,8 +1211,12 @@ device:
    press it at the same moment; at most 16 devices per window;
 4. asks the user about new devices (next paragraph).
 
-The window ends after 2 min (later only while its own connections finish);
-the salt port closes and the `d_salt` offer is cleared with it.
+The window ends after 2 min (later only while its own connections finish),
+when the user stops it (`StopAddDevice`, `x` in the TUI), or with
+networking (Sync off, shutdown); the salt port closes, the `d_salt` offer
+is cleared, and pairings it was asking about are rejected. Every window has
+a generation, so the late end of a stopped window can't close a newer one
+the user opened since.
 
 **Pairing only inside the window** (my addition, for his review): a pairing
 request that arrives while this device has no "Add device" window open is
@@ -1298,7 +1303,8 @@ Tests (`cargo test --workspace --all-features`):
   no task; the Sync switch and networking (section 13), two daemons pairing
   and reconnecting after a restart, pairing outside the window, rejected and
   stale answers, the prompt cap; joining a group end to end and its failure
-  paths (11.7);
+  paths (11.7); stopping "Add device" early (salt port, offer, prompts, a
+  newer window untouched, Sync off);
 - salt query: exact answer, junk refused, per-source rate limit and its
   memory bound, nothing after the window;
 - `auth_snow` / networker: end-to-end localhost handshakes, first pairing,
@@ -1317,7 +1323,7 @@ Every new protection gets a test that fails without it.
 Manual two-machine test of the real app (macOS, both devices on one LAN with
 broadcast; allow incoming connections, or open UDP 3636 and TCP 3232 / 3233):
 1. device A: daemon + TUI, set both passwords, Settings > Sync on, then
-   Devices > `n` (invite window, 2 min);
+   Devices > `n` (invite window, 2 min; `x` stops it);
 2. device B (fresh): daemon + TUI, Devices > `n`, the same two passwords;
 3. both show the same 8 emoji with names: `y` on both. B ends up with saved
    keys, Sync on and A as a paired device;
