@@ -69,6 +69,39 @@ CesaConn is designed with privacy as a core principle, not an afterthought:
 
 ---
 
+## Status / try it
+
+CesaConn is in development; nothing syncs data yet. What works today
+(macOS; Linux and Windows don't keep keys yet, see `docs/design/daemon.md`):
+
+- the daemon keeps both keys in an encrypted vault (unlock after a restart,
+  optional automatic login through the OS keychain);
+- two of your devices find each other on the local network, authenticate
+  (SPAKE2 + post-quantum hybrid key exchange + Noise) and pair once after
+  you compare an 8-emoji code on both screens;
+- a new device joins your group with the two passwords and gets the group's
+  salts from a device that has "Add device" open.
+
+Run it (one terminal for the daemon, one for the UI):
+
+```
+cargo run --release -p cesa_conn_networker   # the daemon
+cargo run --release -p cesa_conn_tui         # the terminal UI
+```
+
+Pair two devices on the same network:
+
+1. first device: Settings > set both passwords, turn **Sync** on, then
+   Devices > `n` (Add device, open for 2 minutes);
+2. new device: Devices > `n` (Join a group), enter the same two passwords;
+3. both show the same 8 emoji with names: press `y` on both.
+
+Allow incoming connections when macOS asks (UDP 3636, TCP 3232 and 3233).
+The full design, threat model and known limits are in
+[`docs/design/daemon.md`](docs/design/daemon.md).
+
+---
+
 ## License
 
 CesaConn is licensed under [AGPL 3.0](LICENSE).

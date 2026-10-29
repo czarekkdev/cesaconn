@@ -11,7 +11,8 @@
 mod daemon_link;
 
 use cesa_conn_system::ipc::{
-    DaemonError, IpcErrors, MIN_NEW_PASSWORD_LEN, PairingPrompt, PasswordUpdate, PeerInfo, Status,
+    DaemonError, IpcErrors, JoinPasswords, MIN_NEW_PASSWORD_LEN, PairingPrompt, PasswordUpdate,
+    PeerInfo, Status,
 };
 use cesa_conn_system::pairing_code;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -133,6 +134,15 @@ enum ActivePopup {
     /// "Are you sure?" before changing a password that is already set.
     /// Asked before typing, so no password waits for the answer.
     ConfirmPasswordChange(KeyKind),
+    /// Joining a group: the group's auth password, then its data password.
+    JoinGroup(JoinStep),
+}
+
+/// Which password the join popup asks for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum JoinStep {
+    Auth,
+    Data,
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -156,6 +166,9 @@ pub struct App {
     /// Text typed into a popup. Can hold a password, so it is pre-sized
     /// (never reallocates, which would leave un-wiped copies) and wiped on clear.
     input_buf: Zeroizing<String>,
+    /// The join's auth password while the data password is typed; pre-sized
+    /// like `input_buf` and wiped as soon as the join is sent or cancelled.
+    join_auth: Zeroizing<Vec<u8>>,
 
     pub should_quit: bool,
 
@@ -253,6 +266,7 @@ impl App {
             log_follow: true,
             active_popup: ActivePopup::None,
             input_buf: Zeroizing::new(String::with_capacity(INPUT_CAPACITY)),
+            join_auth: Zeroizing::new(Vec::with_capacity(INPUT_CAPACITY)),
             should_quit: false,
             daemon: DaemonState::Unknown,
             peers: Vec::new(),
@@ -393,6 +407,10 @@ fn handle_input(app: &mut App) -> io::Result<()> {
             handle_confirm_change_input(app, key.code);
             return Ok(());
         }
+        ActivePopup::JoinGroup(step) => {
+            handle_join_input(app, key.code, step);
+            return Ok(());
+        }
         ActivePopup::None => {}
     }
 
@@ -408,6 +426,7 @@ fn handle_input(app: &mut App) -> io::Result<()> {
             KeyCode::Up | KeyCode::Char('k') => app.prev_device(),
             KeyCode::Down | KeyCode::Char('j') => app.next_device(),
             KeyCode::Char('n') => start_add_device(app),
+            KeyCode::Char('x') => cancel_join(app),
             KeyCode::Char('d') => {
                 let selected = app.device_list_state.selected();
                 let addr_str = selected
@@ -535,16 +554,82 @@ fn handle_confirm_change_input(app: &mut App, code: KeyCode) {
     }
 }
 
-/// Asks the daemon to open its "Add device" window, if networking runs.
+/// `n` on Devices. A member with networking on opens its "Add device"
+/// window (invite); a fresh device asks for the group's passwords and
+/// joins; anything else says what is missing.
 fn start_add_device(app: &mut App) {
     match &app.daemon {
         DaemonState::Up(status) if status.network_running => {
             app.outbox.push(Command::AddDevice);
             app.push_log(
-                "[ INFO] Searching for devices: press n on the other device now too, then compare the code",
+                "[ INFO] Add device open for 2 min: press n on the new device (or on another of yours), then compare the code",
             );
         }
+        DaemonState::Up(status) if status.joining => {
+            app.push_log("[ INFO] Joining already: x cancels");
+        }
+        DaemonState::Up(status) if is_fresh(status) => {
+            clear_input(app);
+            app.join_auth.zeroize();
+            app.active_popup = ActivePopup::JoinGroup(JoinStep::Auth);
+        }
         _ => app.push_log("[ WARN] Turn Sync on first (Settings > Sync)"),
+    }
+}
+
+/// No keys and nothing saved: this device can join a group.
+fn is_fresh(status: &Status) -> bool {
+    !status.auth_key_set && !status.data_key_set && !status.locked && !status.saved
+}
+
+/// `x` on Devices: ends a running join.
+fn cancel_join(app: &mut App) {
+    if matches!(&app.daemon, DaemonState::Up(status) if status.joining) {
+        app.outbox.push(Command::CancelJoin);
+        app.push_log("[ INFO] Cancelling the join");
+    }
+}
+
+/// Typing the two group passwords: Enter goes on (then sends), Esc
+/// cancels and wipes both. Passwords are taken exactly as typed.
+fn handle_join_input(app: &mut App, code: KeyCode, step: JoinStep) {
+    match code {
+        KeyCode::Esc => {
+            clear_input(app);
+            app.join_auth.zeroize();
+            app.active_popup = ActivePopup::None;
+        }
+        KeyCode::Enter if app.input_buf.is_empty() => {}
+        KeyCode::Enter => match step {
+            JoinStep::Auth => {
+                // the buffer is pre-sized: this copy never reallocates
+                app.join_auth.zeroize();
+                app.join_auth.extend_from_slice(app.input_buf.as_bytes());
+                clear_input(app);
+                app.active_popup = ActivePopup::JoinGroup(JoinStep::Data);
+            }
+            JoinStep::Data => {
+                app.outbox.push(Command::JoinGroup(JoinPasswords {
+                    auth: PasswordUpdate {
+                        password: Zeroizing::new(app.join_auth.to_vec()),
+                    },
+                    data: PasswordUpdate {
+                        password: Zeroizing::new(app.input_buf.as_bytes().to_vec()),
+                    },
+                }));
+                app.join_auth.zeroize();
+                clear_input(app);
+                app.active_popup = ActivePopup::None;
+                app.push_log(
+                    "[ INFO] Joining: looking for a device with Add device open (takes a moment)",
+                );
+            }
+        },
+        KeyCode::Backspace => {
+            app.input_buf.pop();
+        }
+        KeyCode::Char(c) => push_input(app, c),
+        _ => {}
     }
 }
 
@@ -706,6 +791,14 @@ fn handle_link_event(app: &mut App, event: LinkEvent) {
             }
 
             let was_locked = matches!(&app.daemon, DaemonState::Up(s) if s.locked);
+            let was_joining = matches!(&app.daemon, DaemonState::Up(s) if s.joining);
+            if was_joining && !status.joining {
+                app.push_log(if status.saved {
+                    "[ INFO] Joined the group: keys saved, sync on"
+                } else {
+                    "[ WARN] The join ended without joining (cancelled, timed out, or the passwords didn't match)"
+                });
+            }
             if status.locked && !was_locked {
                 app.push_log(
                     "[ WARN] Saved keys are locked: enter the data password (Settings > Data key)",
@@ -812,6 +905,25 @@ fn handle_link_event(app: &mut App, event: LinkEvent) {
                     app.push_log("[ WARN] Too late: that pairing request expired")
                 }
                 (_, Err(e)) => app.push_log(format!("[ERROR] Answering the pairing failed: {e}")),
+            }
+            app.request_refresh();
+        }
+        LinkEvent::JoinStarted(result) => {
+            match result {
+                Ok(()) => {}
+                Err(IpcErrors::Daemon(DaemonError::AlreadyInGroup)) => app.push_log(
+                    "[ WARN] This device has keys already: only a fresh device joins a group",
+                ),
+                Err(IpcErrors::Daemon(DaemonError::NotSaved)) => app.push_log(
+                    "[ WARN] Joining needs saved keys, and this platform has no keychain backend yet",
+                ),
+                Err(e) => app.push_log(format!("[ERROR] Joining failed: {e}")),
+            }
+            app.request_refresh();
+        }
+        LinkEvent::JoinCancelled(result) => {
+            if let Err(e) = result {
+                app.push_log(format!("[ERROR] Cancelling the join failed: {e}"));
             }
             app.request_refresh();
         }
@@ -934,6 +1046,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
             render_security_warning_popup(frame, area, section, idx, app)
         }
         ActivePopup::ConfirmPasswordChange(kind) => render_confirm_change_popup(frame, area, kind),
+        ActivePopup::JoinGroup(step) => render_join_popup(frame, area, step, app),
         ActivePopup::None => {}
     }
 }
@@ -1062,7 +1175,7 @@ fn render_devices(frame: &mut Frame, area: Rect, app: &mut App) {
                 ]),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  n: add device    d: disconnect",
+                    "  n: add device / join    x: cancel join    d: disconnect",
                     Style::default().fg(Color::DarkGray),
                 )),
             ]
@@ -1181,7 +1294,7 @@ fn render_logs(frame: &mut Frame, area: Rect, app: &mut App) {
 
 fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
     let help = match app.active_tab {
-        Tab::Devices => " q:Quit  Tab:Switch  ↑↓:Navigate  n:Add device  d:Disconnect ",
+        Tab::Devices => " q:Quit  Tab:Switch  ↑↓:Navigate  n:Add device/Join  x:Cancel join ",
         Tab::Settings => " q:Quit  Tab:Switch  ←→:Section  ↑↓:Navigate  Enter:Edit ",
         Tab::Logs => " q:Quit  Tab:Switch  ↑↓:Scroll  f:Follow ",
     };
@@ -1215,6 +1328,7 @@ fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
                     "(memory only)"
                 },
                 match (s.network_running, s.adding_device, s.sync_enabled) {
+                    _ if s.joining => "joining a group",
                     (true, true, _) => "on, adding a device",
                     (true, false, _) => "on",
                     // switched on, but the listener couldn't start (see the daemon log)
@@ -1366,6 +1480,56 @@ fn render_edit_setting_popup(frame: &mut Frame, area: Rect, app: &App) {
             .saturating_add(2)
             .saturating_add(to_u16(display_input.len())),
         popup.y.saturating_add(1),
+    ));
+}
+
+fn render_join_popup(frame: &mut Frame, area: Rect, step: JoinStep, app: &App) {
+    let (title, which) = match step {
+        JoinStep::Auth => (" Join a group (1/2) ", "auth"),
+        JoinStep::Data => (" Join a group (2/2) ", "data"),
+    };
+    // one star per character, the byte length would leak more than the length
+    let stars = "*".repeat(app.input_buf.chars().count());
+
+    let w = 64u16.min(area.width);
+    let h = 8u16.min(area.height);
+    let popup = centered_rect(area, w, h);
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "  On a device of the group: Devices > n (Add device) first.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            format!("  The group's {which} password:"),
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from(format!("  {stars}")),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Enter: next   Esc: cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(title)
+                .title_alignment(Alignment::Center)
+                .border_type(BorderType::Double)
+                .style(Style::default().fg(Color::Cyan)),
+        ),
+        popup,
+    );
+
+    frame.set_cursor_position((
+        popup
+            .x
+            .saturating_add(3)
+            .saturating_add(to_u16(stars.len())),
+        popup.y.saturating_add(3),
     ));
 }
 
@@ -2158,6 +2322,138 @@ mod tests {
         app.outbox.clear();
         start_add_device(&mut app);
         assert!(matches!(app.outbox.as_slice(), [Command::AddDevice]));
+    }
+
+    fn fresh_status(joining: bool) -> LinkEvent {
+        LinkEvent::Refreshed(Ok((
+            Status {
+                joining,
+                ..Status::default()
+            },
+            Vec::new(),
+            None,
+        )))
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            let popup = app.active_popup.clone();
+            if let ActivePopup::JoinGroup(step) = popup {
+                handle_join_input(app, KeyCode::Char(c), step);
+            }
+        }
+    }
+
+    fn press_in_join(app: &mut App, code: KeyCode) {
+        let ActivePopup::JoinGroup(step) = app.active_popup.clone() else {
+            panic!("the join popup isn't open");
+        };
+        handle_join_input(app, code, step);
+    }
+
+    /// Test that n on a fresh device asks for both group passwords and
+    /// sends them exactly as typed, wiping the kept auth password
+    #[test]
+    fn test_join_on_fresh_device() {
+        let mut app = App::new();
+        handle_link_event(&mut app, fresh_status(false));
+        app.outbox.clear();
+
+        start_add_device(&mut app);
+        assert_eq!(app.active_popup, ActivePopup::JoinGroup(JoinStep::Auth));
+
+        // an empty Enter does nothing
+        press_in_join(&mut app, KeyCode::Enter);
+        assert_eq!(app.active_popup, ActivePopup::JoinGroup(JoinStep::Auth));
+
+        type_text(&mut app, " auth pw ");
+        press_in_join(&mut app, KeyCode::Enter);
+        assert_eq!(app.active_popup, ActivePopup::JoinGroup(JoinStep::Data));
+        assert!(app.input_buf.is_empty());
+
+        type_text(&mut app, "data pw");
+        press_in_join(&mut app, KeyCode::Enter);
+        assert_eq!(app.active_popup, ActivePopup::None);
+        assert!(app.join_auth.is_empty());
+        assert!(app.input_buf.is_empty());
+
+        let [Command::JoinGroup(sent)] = app.outbox.as_slice() else {
+            panic!("no JoinGroup sent");
+        };
+        assert_eq!(sent.auth.password.as_slice(), b" auth pw ");
+        assert_eq!(sent.data.password.as_slice(), b"data pw");
+    }
+
+    /// Test that Esc in the join popup sends nothing and wipes the kept
+    /// auth password
+    #[test]
+    fn test_join_cancelled_in_popup_wipes() {
+        let mut app = App::new();
+        handle_link_event(&mut app, fresh_status(false));
+        app.outbox.clear();
+        start_add_device(&mut app);
+
+        type_text(&mut app, "auth secret");
+        press_in_join(&mut app, KeyCode::Enter);
+        assert_eq!(app.join_auth.as_slice(), b"auth secret");
+        type_text(&mut app, "half");
+        press_in_join(&mut app, KeyCode::Esc);
+
+        assert_eq!(app.active_popup, ActivePopup::None);
+        assert!(app.join_auth.is_empty());
+        assert!(app.input_buf.is_empty());
+        assert!(app.outbox.is_empty());
+    }
+
+    /// Test that a device with keys never offers a join, and that x cancels
+    /// a running join (only then)
+    #[test]
+    fn test_join_only_fresh_and_cancel() {
+        let mut app = App::new();
+        handle_link_event(&mut app, up_network(false, None));
+        app.outbox.clear();
+        start_add_device(&mut app);
+        assert_eq!(app.active_popup, ActivePopup::None);
+        assert!(app.outbox.is_empty());
+
+        cancel_join(&mut app);
+        assert!(app.outbox.is_empty());
+
+        handle_link_event(&mut app, fresh_status(true));
+        app.outbox.clear();
+        start_add_device(&mut app);
+        assert_eq!(app.active_popup, ActivePopup::None);
+        cancel_join(&mut app);
+        assert!(matches!(app.outbox.as_slice(), [Command::CancelJoin]));
+
+        // the end of the join is reported
+        handle_link_event(&mut app, fresh_status(false));
+        assert!(app.logs.iter().any(|l| l.contains("ended without joining")));
+    }
+
+    /// Test that the join popup shows stars, never the password
+    #[test]
+    fn test_join_popup_masks_password() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut app = App::new();
+        handle_link_event(&mut app, fresh_status(false));
+        start_add_device(&mut app);
+        type_text(&mut app, "topsecret");
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| ui(frame, &mut app)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(screen.contains("Join a group (1/2)"));
+        assert!(screen.contains("*********"));
+        assert!(!screen.contains("topsecret"));
     }
 
     /// Test that a waiting pairing opens the prompt with every symbol's

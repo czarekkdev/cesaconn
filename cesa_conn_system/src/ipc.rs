@@ -13,7 +13,7 @@
 //!   a daemon of the same user, and on macOS only to one whose signature
 //!   satisfies [`DAEMON_CODE_REQUIREMENT`].
 //!
-//! Wire format (version 4), one request and one response per connection:
+//! Wire format (version 5), one request and one response per connection:
 //! `frame = length (u32 LE, 1..=MAX_FRAME_LEN) || body`
 //!
 //! Request body: `kind (1) || payload`
@@ -33,20 +33,26 @@
 //! * `0x0C` AnswerPairing: `id (u32 LE) || code (8) || accept (1)`, accept
 //!   exactly `0x00` or `0x01`; the code must be the one shown, so an answer
 //!   can never land on another pairing (ids start again after a restart)
+//! * `0x0D` JoinGroup: `auth len (u16 LE) || auth password || data password`,
+//!   both `1..=MAX_PASSWORD_LEN`, consumed exactly; a fresh device joins the
+//!   group of a device whose user opened "Add device"
+//! * `0x0E` CancelJoin: none; ends a running join and wipes its passwords
 //! * `0x02` / `0x03` are retired (version 1 sent `salt || password` there).
 //!   They are refused, so a mismatched UI and daemon fail loudly instead of
 //!   deriving a key from the wrong bytes.
 //!
 //! Response body: `0x00 || payload` on success, `0x01 || error code (1)` on error
-//! * Status: `flags (1) || trusted peers (u32 LE) || unlock wait (u16 LE) ||
-//!   pending pairings (u8)`; flags bit 0 = auth key set, bit 1 = data key set,
-//!   bit 2 = network running, bit 3 = vault locked, bit 4 = keys saved
-//!   (encrypted vault), bit 5 = automatic login on, bit 6 = Sync switched on,
-//!   bit 7 = "Add device" window open; unlock wait = seconds until `Unlock` is
-//!   accepted again after too many wrong data passwords (0 = now). Versions 2
-//!   and 3 were shorter, so a mismatched UI and daemon fail with `Malformed`.
+//! * Status: `flags (1) || flags2 (1) || trusted peers (u32 LE) || unlock
+//!   wait (u16 LE) || pending pairings (u8)`; flags bit 0 = auth key set,
+//!   bit 1 = data key set, bit 2 = network running, bit 3 = vault locked,
+//!   bit 4 = keys saved (encrypted vault), bit 5 = automatic login on,
+//!   bit 6 = Sync switched on, bit 7 = "Add device" window open; flags2 bit 0
+//!   = joining a group, other bits must be 0; unlock wait = seconds until
+//!   `Unlock` is accepted again after too many wrong data passwords (0 = now).
+//!   Versions 2 to 4 were shorter, so a mismatched UI and daemon fail with
+//!   `Malformed`.
 //! * SetAuthPassword / SetDataPassword / Unlock / SetAutoLogin / SetSync /
-//!   AddDevice / AnswerPairing: empty
+//!   AddDevice / AnswerPairing / JoinGroup / CancelJoin: empty
 //! * ListPeers: `count (u16 LE) || count * (fingerprint (8) || name len (1) || name)`
 //! * PendingPairing: `0x00` (none) or `0x01 || id (u32 LE) || code (8) ||
 //!   name len (1) || name`; every code byte is below
@@ -77,8 +83,8 @@ pub const FINGERPRINT_LEN: usize = 8;
 
 /// longest `ListPeers` body: status + count + every peer at full name length
 const MAX_PEERS_BODY: usize = 1 + 2 + MAX_LISTED_PEERS * (FINGERPRINT_LEN + 1 + 255);
-/// longest request body: kind + password
-const MAX_REQUEST_BODY: usize = 1 + MAX_PASSWORD_LEN;
+/// longest request body: kind + auth length + both passwords (JoinGroup)
+const MAX_REQUEST_BODY: usize = 1 + 2 + 2 * MAX_PASSWORD_LEN;
 
 const _: () = assert!(MAX_PEERS_BODY <= MAX_FRAME_LEN as usize);
 const _: () = assert!(MAX_REQUEST_BODY <= MAX_FRAME_LEN as usize);
@@ -119,6 +125,12 @@ const REQ_SET_SYNC: u8 = 0x09;
 const REQ_ADD_DEVICE: u8 = 0x0A;
 const REQ_PENDING_PAIRING: u8 = 0x0B;
 const REQ_ANSWER_PAIRING: u8 = 0x0C;
+const REQ_JOIN_GROUP: u8 = 0x0D;
+const REQ_CANCEL_JOIN: u8 = 0x0E;
+
+/* status flags2 */
+/// flags2: joining a group
+const STATUS2_JOINING: u8 = 0b1;
 
 /// Shortest new password the daemon accepts (characters; bytes if not UTF-8). Anyone holding the vault
 /// file and the keychain salts can guess the data password offline, so short
@@ -209,6 +221,11 @@ pub enum DaemonError {
     /// AnswerPairing: no pairing with this id and code is waiting (answered
     /// already, timed out, or another pairing after a restart).
     PairingExpired = 0x0B,
+    /// JoinGroup: this device has keys or a saved vault already; only a
+    /// fresh device joins.
+    AlreadyInGroup = 0x0C,
+    /// JoinGroup: a join is running already (cancel it first).
+    JoinRunning = 0x0D,
 }
 
 impl DaemonError {
@@ -225,6 +242,8 @@ impl DaemonError {
             0x09 => Some(Self::UnlockDelayed),
             0x0A => Some(Self::NetworkOff),
             0x0B => Some(Self::PairingExpired),
+            0x0C => Some(Self::AlreadyInGroup),
+            0x0D => Some(Self::JoinRunning),
             _ => None,
         }
     }
@@ -254,6 +273,11 @@ impl fmt::Display for DaemonError {
                 )
             }
             DaemonError::PairingExpired => write!(f, "that pairing request is no longer waiting"),
+            DaemonError::AlreadyInGroup => write!(
+                f,
+                "this device has keys already: only a fresh device joins a group"
+            ),
+            DaemonError::JoinRunning => write!(f, "a join is running already"),
         }
     }
 }
@@ -292,6 +316,20 @@ pub enum Request {
         code: PairingCode,
         accept: bool,
     },
+    /// Join the group of a device that has "Add device" open, with the
+    /// group's two passwords.
+    JoinGroup(JoinPasswords),
+    /// End a running join; its passwords are wiped.
+    CancelJoin,
+}
+
+/// The two group passwords for `JoinGroup`, each in its own exact-size
+/// buffer. Wiped on drop; no `Debug` / `Clone`.
+pub struct JoinPasswords {
+    /// The auth password (pw1).
+    pub auth: PasswordUpdate,
+    /// The data password (pw2).
+    pub data: PasswordUpdate,
 }
 
 /// Daemon status (contains no key material).
@@ -315,6 +353,8 @@ pub struct Status {
     pub adding_device: bool,
     /// Pairings waiting for the user's answer.
     pub pending_pairings: u8,
+    /// A join is running (fetching the group's salts, pairing).
+    pub joining: bool,
 }
 
 /// A pairing waiting for the user (public data only: the handshake hash
@@ -395,6 +435,22 @@ impl Request {
             Request::SetSync(on) => return Zeroizing::new(vec![REQ_SET_SYNC, u8::from(*on)]),
             Request::AddDevice => (REQ_ADD_DEVICE, None),
             Request::PendingPairing => (REQ_PENDING_PAIRING, None),
+            Request::CancelJoin => (REQ_CANCEL_JOIN, None),
+            Request::JoinGroup(passwords) => {
+                let (auth, data) = (&passwords.auth.password, &passwords.data.password);
+                // the encoder never cuts: a too long password goes out whole
+                // and the daemon refuses it
+                let auth_len = u16::try_from(auth.len()).unwrap_or(u16::MAX);
+                // sized up front so the buffer never reallocates
+                let mut body = Zeroizing::new(Vec::with_capacity(
+                    3usize.saturating_add(auth.len()).saturating_add(data.len()),
+                ));
+                body.push(REQ_JOIN_GROUP);
+                body.extend_from_slice(&auth_len.to_le_bytes());
+                body.extend_from_slice(auth);
+                body.extend_from_slice(data);
+                return body;
+            }
             Request::AnswerPairing { id, code, accept } => {
                 let mut body = Zeroizing::new(Vec::with_capacity(1 + 4 + PAIRING_CODE_LEN + 1));
                 body.push(REQ_ANSWER_PAIRING);
@@ -432,6 +488,19 @@ impl Request {
             REQ_SET_SYNC => parse_flag(payload).map(Request::SetSync),
             REQ_ADD_DEVICE if payload.is_empty() => Some(Request::AddDevice),
             REQ_PENDING_PAIRING if payload.is_empty() => Some(Request::PendingPairing),
+            REQ_CANCEL_JOIN if payload.is_empty() => Some(Request::CancelJoin),
+            REQ_JOIN_GROUP => {
+                let (auth_len, rest) = payload.split_first_chunk::<2>()?;
+                let auth_len = usize::from(u16::from_le_bytes(*auth_len));
+                if auth_len > rest.len() {
+                    return None;
+                }
+                let (auth, data) = rest.split_at(auth_len);
+                Some(Request::JoinGroup(JoinPasswords {
+                    auth: parse_password_update(auth)?,
+                    data: parse_password_update(data)?,
+                }))
+            }
             REQ_ANSWER_PAIRING => {
                 let (id, rest) = payload.split_first_chunk::<4>()?;
                 let (code, accept) = rest.split_first_chunk::<PAIRING_CODE_LEN>()?;
@@ -466,6 +535,7 @@ impl Response {
                     | u8::from(s.adding_device) << 7;
 
                 body.push(flags);
+                body.push(if s.joining { STATUS2_JOINING } else { 0 });
                 body.extend_from_slice(&s.trusted_peers.to_le_bytes());
                 body.extend_from_slice(&s.unlock_wait_secs.to_le_bytes());
                 body.push(s.pending_pairings);
@@ -525,13 +595,18 @@ impl Response {
 
         match request {
             Request::Status => {
-                let (flags, peers, unlock_wait_secs, pending_pairings) = match payload {
-                    [flags, a, b, c, d, w0, w1, pending] => (
-                        *flags,
-                        u32::from_le_bytes([*a, *b, *c, *d]),
-                        u16::from_le_bytes([*w0, *w1]),
-                        *pending,
-                    ),
+                let (flags, flags2, peers, unlock_wait_secs, pending_pairings) = match payload {
+                    [flags, flags2, a, b, c, d, w0, w1, pending]
+                        if flags2 & !STATUS2_JOINING == 0 =>
+                    {
+                        (
+                            *flags,
+                            *flags2,
+                            u32::from_le_bytes([*a, *b, *c, *d]),
+                            u16::from_le_bytes([*w0, *w1]),
+                            *pending,
+                        )
+                    }
                     _ => return Err(IpcErrors::Malformed),
                 };
 
@@ -547,6 +622,7 @@ impl Response {
                     trusted_peers: peers,
                     unlock_wait_secs,
                     pending_pairings,
+                    joining: flags2 & STATUS2_JOINING != 0,
                 }))
             }
             Request::SetAuthPassword(_)
@@ -556,6 +632,8 @@ impl Response {
             | Request::SetSync(_)
             | Request::AddDevice
             | Request::AnswerPairing { .. }
+            | Request::JoinGroup(_)
+            | Request::CancelJoin
                 if payload.is_empty() =>
             {
                 Ok(Response::Done)
@@ -566,7 +644,9 @@ impl Response {
             | Request::SetAutoLogin(_)
             | Request::SetSync(_)
             | Request::AddDevice
-            | Request::AnswerPairing { .. } => Err(IpcErrors::Malformed),
+            | Request::AnswerPairing { .. }
+            | Request::JoinGroup(_)
+            | Request::CancelJoin => Err(IpcErrors::Malformed),
             Request::ListPeers => decode_peers(payload).ok_or(IpcErrors::Malformed),
             Request::PendingPairing => decode_pairing(payload).ok_or(IpcErrors::Malformed),
         }
@@ -842,6 +922,15 @@ mod tests {
                 code: [0; PAIRING_CODE_LEN],
                 accept: false,
             },
+            Request::CancelJoin,
+            Request::JoinGroup(JoinPasswords {
+                auth: update(b"auth pass"),
+                data: update(b" data "),
+            }),
+            Request::JoinGroup(JoinPasswords {
+                auth: update(&vec![b'a'; MAX_PASSWORD_LEN]),
+                data: update(&vec![b'd'; MAX_PASSWORD_LEN]),
+            }),
         ] {
             let decoded = Request::decode(&req.encode()).unwrap();
             assert_eq!(decoded.encode().as_slice(), req.encode().as_slice());
@@ -899,6 +988,26 @@ mod tests {
         // longest allowed password still fits
         let max = [&[REQ_SET_DATA_PASSWORD][..], &vec![b'a'; MAX_PASSWORD_LEN]].concat();
         assert!(Request::decode(&max).is_some());
+        // join: auth len + auth + data, both 1..=MAX, consumed exactly
+        let join = |auth_len: u16, auth: &[u8], data: &[u8]| {
+            [&[REQ_JOIN_GROUP][..], &auth_len.to_le_bytes(), auth, data].concat()
+        };
+        assert!(Request::decode(&join(2, b"ab", b"cd")).is_some());
+        assert!(Request::decode(&join(0, b"", b"cd")).is_none());
+        assert!(Request::decode(&join(2, b"ab", b"")).is_none());
+        assert!(Request::decode(&join(3, b"ab", b"")).is_none());
+        assert!(Request::decode(&[REQ_JOIN_GROUP, 1]).is_none());
+        let long_auth = vec![b'a'; MAX_PASSWORD_LEN + 1];
+        let auth_len = u16::try_from(long_auth.len()).unwrap();
+        assert!(Request::decode(&join(auth_len, &long_auth, b"cd")).is_none());
+        assert!(Request::decode(&join(2, b"ab", &long_auth)).is_none());
+        // the passwords are split at the length, never trimmed
+        let Some(Request::JoinGroup(passwords)) = Request::decode(&join(3, b" a ", b"b ")) else {
+            panic!("join didn't decode");
+        };
+        assert_eq!(passwords.auth.password.as_slice(), b" a ");
+        assert_eq!(passwords.data.password.as_slice(), b"b ");
+        assert!(Request::decode(&[REQ_CANCEL_JOIN, 0]).is_none());
     }
 
     /// Test that every daemon error code round-trips, and unknown status bits are refused
@@ -916,6 +1025,8 @@ mod tests {
             DaemonError::UnlockDelayed,
             DaemonError::NetworkOff,
             DaemonError::PairingExpired,
+            DaemonError::AlreadyInGroup,
+            DaemonError::JoinRunning,
         ] {
             assert_eq!(
                 Response::decode(&Request::Status, &Response::encode_error(e)),
@@ -925,7 +1036,7 @@ mod tests {
 
         // unknown error codes are refused
         assert_eq!(
-            Response::decode(&Request::Status, &[RESP_ERR, 0x0C]),
+            Response::decode(&Request::Status, &[RESP_ERR, 0x0E]),
             Err(IpcErrors::Malformed)
         );
 
@@ -939,6 +1050,19 @@ mod tests {
             Response::decode(&Request::Status, &[RESP_OK, 0, 0, 0, 0, 0, 0, 0]),
             Err(IpcErrors::Malformed)
         );
+        // version 4 (no flags2) is refused, and unknown flags2 bits too
+        assert_eq!(
+            Response::decode(&Request::Status, &[RESP_OK, 0, 0, 0, 0, 0, 0, 0, 0]),
+            Err(IpcErrors::Malformed)
+        );
+        for flags2 in [0b10u8, 0x80] {
+            assert_eq!(
+                Response::decode(&Request::Status, &[RESP_OK, 0, flags2, 0, 0, 0, 0, 0, 0, 0]),
+                Err(IpcErrors::Malformed)
+            );
+        }
+        let joining = Response::decode(&Request::Status, &[RESP_OK, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(matches!(joining, Ok(Response::Status(s)) if s.joining));
     }
 
     /// Test that the pairing answer round-trips and its decoding is strict
@@ -1030,6 +1154,7 @@ mod tests {
             sync_enabled: true,
             adding_device: true,
             pending_pairings: 3,
+            joining: true,
         });
         assert_eq!(
             Response::decode(&Request::Status, &status.encode()),

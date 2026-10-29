@@ -52,9 +52,12 @@ The daemon **does**:
 - derive `a_key` and `d_key` from the passwords (Argon2id) and keep them;
 - own every salt, the device identity and the trusted-peer list;
 - save its state in the encrypted vault and the OS keychain;
-- answer UI requests (status, set password, unlock, automatic login, list peers);
-- (planned) run discovery, accept and open connections, authenticate peers
-  with `auth_snow`, ask the user to confirm new devices, and move sync data.
+- answer UI requests (status, set password, unlock, automatic login, list
+  peers, Sync, "Add device", pairing answers, joining a group);
+- run discovery, accept and open connections, authenticate peers with
+  `auth_snow`, ask the user to confirm new devices, and hand a joining
+  device the group's salts (sections 11, 13);
+- (planned) move sync data (section 12).
 
 The daemon **never**:
 - sends a key, a salt or any key-derived secret to a UI;
@@ -189,8 +192,11 @@ Tasks while networking runs **[built]** (section 13):
 - the TCP listener (`tcp_networker::recv`), one task per connection;
 - the pairing bridge: pairing requests from the handshakes to the UI, and
   re-sealing the vault after a new peer was saved;
-- during an "Add device" window: UDP announce + search, then one task per
-  outgoing connection.
+- during an "Add device" invite window (2 min): UDP announce, UDP search
+  rounds with one task per outgoing connection, the salt query listener
+  (section 11.4) and the window timer;
+- during a join (section 11): one task that searches, queries the salt,
+  derives and connects; the commit runs as its own task.
 
 Shutdown: Ctrl-C cancels a `CancellationToken`; the IPC server stops
 accepting, the daemon waits for it, stops networking (the bridge saves the
@@ -209,6 +215,7 @@ pub struct Daemon {
     network: RwLock<Option<Network>>,            // token, NetworkerContext, bridge
     pairings: RwLock<PendingPairings>,           // requests waiting for the user
     adding: AtomicBool,                          // "Add device" window open
+    join: RwLock<Option<JoinSlot>>,              // the running join (generation, token)
     guess_limiter: Arc<GuessLimiter>,            // one for the daemon's lifetime
 }
 
@@ -252,6 +259,9 @@ struct KeySlots {
 stateDiagram-v2
     [*] --> Fresh: no vault file
     [*] --> Locked: vault file found
+    Fresh --> Joining: JoinGroup(pw1, pw2)
+    Joining --> Fresh: cancel, 5 min, 5 attempts used up (passwords wiped)
+    Joining --> Open: paired, both salts received, vault created with Sync on
     Fresh --> Partial: SetAuth or SetData
     Partial --> Open: second key set, vault created
     Partial --> RamOnly: second key set, but no storage or the keychain / file write failed
@@ -265,7 +275,10 @@ stateDiagram-v2
 
 `Status` shows it: `auth_key_set`, `data_key_set`, `locked`, `saved`,
 `auto_login`, `sync_enabled`, `network_running`, `adding_device`,
-`trusted_peers`, `unlock_wait_secs`, `pending_pairings`.
+`joining`, `trusted_peers`, `unlock_wait_secs`, `pending_pairings`.
+
+Setting both passwords on a fresh device creates a new group (the daemon
+makes both salts); `JoinGroup` joins an existing one (section 11).
 
 Networking runs exactly while the vault is open, both keys are set and the
 Sync switch is on (section 13); every state change re-checks it.
@@ -340,7 +353,7 @@ already set. The old password is **not** required (his decision).
   (a stale key must not stay behind).
 
 Until group rotation exists (section 14), a local password change once peers
-exist breaks the group. **[planned]**: refuse or warn in that case.
+exist breaks the group. **[planned]**: refuse or warn in that case (18.13).
 
 ### 6.6 Automatic login **[built]**
 
@@ -410,7 +423,7 @@ Frames that carry a request are read into `Zeroizing` buffers (a request may
 hold a password). Compile-time asserts keep the largest request and the
 largest `ListPeers` answer under `MAX_FRAME_LEN`.
 
-### 7.4 Wire format, version 4 **[built]**
+### 7.4 Wire format, version 5 **[built]**
 
 ```
 frame    = length (u32 LE, 1..=MAX_FRAME_LEN) || body
@@ -421,7 +434,7 @@ response = 0x00 || payload        (success)
 
 | Kind | Request | Payload | Success payload |
 |---|---|---|---|
-| `0x01` | Status | none | `flags (1) \|\| trusted peers (u32 LE) \|\| unlock wait (u16 LE, seconds) \|\| pending pairings (u8)` |
+| `0x01` | Status | none | `flags (1) \|\| flags2 (1) \|\| trusted peers (u32 LE) \|\| unlock wait (u16 LE, seconds) \|\| pending pairings (u8)` |
 | `0x04` | ListPeers | none | `count (u16 LE) \|\| count * (fingerprint (8) \|\| name len (1) \|\| name)` |
 | `0x05` | SetAuthPassword | `password` | empty |
 | `0x06` | SetDataPassword | `password` | empty |
@@ -431,14 +444,21 @@ response = 0x00 || payload        (success)
 | `0x0A` | AddDevice | none | empty (the window runs in the background) |
 | `0x0B` | PendingPairing | none | `0x00` (none) or `0x01 \|\| id (u32 LE) \|\| code (8) \|\| name len (1) \|\| name` |
 | `0x0C` | AnswerPairing | `id (u32 LE) \|\| code (8) \|\| accept (exactly 0x00 or 0x01)` | empty |
+| `0x0D` | JoinGroup | `auth len (u16 LE) \|\| auth password \|\| data password`, each `1..=MAX_PASSWORD_LEN`, consumed exactly | empty (the join runs in the background) |
+| `0x0E` | CancelJoin | none | empty |
 | `0x02`, `0x03` | retired (v1 sent `salt \|\| password`) | refused, so a mismatched UI and daemon fail loudly | |
 
 Status flags: bit 0 auth key set, 1 data key set, 2 network running, 3 vault
 locked, 4 keys saved, 5 automatic login, 6 Sync switched on, 7 "Add device"
-window open. Unlock wait: seconds until `Unlock` is accepted again (0 =
-now). Pending pairings: how many wait for the user; the UI asks
-`PendingPairing` only then. Versions 2 and 3 had shorter status answers; they
-are `Malformed`, so a mismatched UI and daemon fail loudly.
+window open. Flags2: bit 0 joining a group, every other bit must be 0.
+Unlock wait: seconds until `Unlock` is accepted again (0 = now). Pending
+pairings: how many wait for the user; the UI asks `PendingPairing` only
+then. Versions 2 to 4 had shorter status answers; they are `Malformed`, so a
+mismatched UI and daemon fail loudly.
+
+`JoinGroup` decodes both passwords into separate exact-size `Zeroizing`
+buffers, never trimmed; the longest request body is
+`1 + 2 + 2 * MAX_PASSWORD_LEN` (a compile-time assert keeps it in a frame).
 
 `PendingPairing` gives the oldest waiting pairing. Its code is 8 symbol
 indices, each below 64 (section 10.7); the decoder refuses anything else, a
@@ -453,7 +473,9 @@ Error codes: `0x01` BadRequest, `0x02` KeyDerivationFailed, `0x03` Internal,
 `0x04` WrongPassword, `0x05` Locked, `0x06` StorageFailed, `0x07` NotSaved,
 `0x08` WeakPassword, `0x09` UnlockDelayed, `0x0A` NetworkOff (AddDevice
 while networking doesn't run), `0x0B` PairingExpired (no waiting pairing has
-that id and code: answered already, timed out, or a different pairing).
+that id and code: answered already, timed out, or a different pairing),
+`0x0C` AlreadyInGroup (JoinGroup on a device with keys, a vault or a lock),
+`0x0D` JoinRunning (JoinGroup while a join runs).
 
 An answer names the id **and the code** the user saw. Ids start at 0 again
 when the daemon restarts, so an id alone could land on a newer pairing that
@@ -580,9 +602,10 @@ to `StorageFailed`, with details only in the daemon log.
   offline. So the result of discovery is only a hint where to connect: only
   the IP is used, the port is fixed, and trust is decided by the TCP handshake
   alone. Forged or replayed announcements can at most cause a failed connection.
-- The daemon does not announce itself all the time: only for the 20 s of an
-  "Add device" window (section 13), announcing and searching at the same
-  time. A search keeps one entry per sending IP (only the IP is used), at
+- The daemon does not announce itself all the time: only during an "Add
+  device" invite window (2 min, section 13), in 20 s rounds, while it also
+  searches in 20 s rounds. A joining device only searches (it never
+  announces, so other members don't connect to it). A search keeps one entry per sending IP (only the IP is used), at
   most 16 (`MAX_FOUND_DEVICES`), and always runs to its deadline, so a flood
   of made-up ids from one address can't push real devices out.
 
@@ -683,7 +706,10 @@ signature already verified.
 ### 10.2 Phase 1: SPAKE2 **[built]**
 
 - Crate `spake2`, `Ed25519Group`, password = the 32 bytes of `a_key`,
-  identities `"client"` (A) and `"server"` (B) on both sides.
+  identities `"CesaConn-client" || a_salt` (A) and `"CesaConn-server" ||
+  a_salt` (B) on both sides. The salt is public; binding it means a device
+  with a different (or fake) `a_salt` fails the confirmation explicitly,
+  whatever key it derived (section 11.4).
 - Each side sends its message (side byte + point = 33 bytes) plus tag `0x01`.
   Both messages, tags included, go into the transcript in the order client,
   server, on both sides. `finish()` checks length and side byte.
@@ -877,7 +903,7 @@ authenticating, so it doesn't pair just to fail afterwards.
 | Debug | `0x01` | test only |
 | ConnectNewDevice | `0x02` | none: pairing happens in auth, the header has length 0 |
 | ClipboardSync | `0x03` | section 12 **[planned]** |
-| GroupSalt | `0x04` | section 11.5 **[planned]** |
+| GroupSalt | `0x04` | section 11.5 **[built]**: header length 0; the member answers `d_salt (32)` through Noise |
 
 Today a received packet is logged and dropped; handing it to an action handler
 comes with the first sync feature.
@@ -906,13 +932,15 @@ in 9.4.
 
 ---
 
-## 11. Groups and salt sync **[planned]**
+## 11. Groups and salt sync **[built]**
 
 ### 11.1 The problem
 
 `a_key = Argon2(pw1, a_salt)` is the SPAKE2 password, so two devices only
 authenticate if they share `a_salt`. The same goes for `d_salt` and `d_key`.
-Today every daemon makes its own random salts, so no two devices agree.
+Every daemon that sets its passwords makes its own random salts, so two
+devices set up separately never agree: the second one has to get the salts
+from the first.
 
 ### 11.2 Options considered
 
@@ -929,45 +957,71 @@ A group is all devices sharing one password pair. It has two public random
 parameters, `a_salt` and `d_salt` (32 bytes each, OS RNG), made once by the
 first device.
 
-Creating (first device): `CreateGroup` with pw1 and pw2; the daemon makes both
-salts, derives both keys and wipes the passwords.
+Creating (first device): setting both passwords (`SetAuthPassword`,
+`SetDataPassword`) on a fresh device; the daemon makes both salts, derives
+both keys and creates the vault. (The planned `CreateGroup` request isn't
+needed: this is the same thing.)
 
-Joining (every other device):
-1. `JoinGroup` with pw1 and pw2;
-2. the daemon can't derive anything yet, so it keeps both passwords in
-   `Zeroizing` buffers in a **join slot**, for at most `JOIN_WINDOW` = 5 min or
-   until the join ends. Timeout, cancel or daemon exit wipes the slot;
-3. **salt fetch** (11.4): get `a_salt` from a member, derive a *candidate*
-   `a_key`. pw1 stays in the slot, so a fake salt can be retried with another
-   member without asking the user again. At most `JOIN_MAX_ATTEMPTS` = 5 salt
-   attempts per window, so a MITM can't make the joiner run Argon2 endlessly;
-4. the normal handshake (section 10), including the pairing code;
-5. the member sends `d_salt` over the secure channel (11.5); the joiner derives `d_key`;
-6. **commit** only after 4 and 5 both succeed; only then wipe the join slot.
-   On failure, wipe the candidates and stay in join mode until the window ends.
+Joining (every other device, the UI's "Add device" on a fresh device):
+1. `JoinGroup` with pw1 and pw2. Only on a **fresh** device (no keys, no
+   salts, no vault, not locked; `AlreadyInGroup` otherwise) with storage
+   (`NotSaved` on RAM-only platforms: a joined device must survive a
+   restart). One join at a time (`JoinRunning`). A new identity seed is made
+   for the join;
+2. the daemon can't derive anything yet, so both passwords move into the
+   join's task in `Zeroizing` buffers: the **join slot**. It ends after
+   `JOIN_WINDOW` = 5 min, after `JOIN_MAX_ATTEMPTS` = 5 salt attempts, on
+   `CancelJoin`, on success, or with the daemon; the passwords are wiped with
+   the task;
+3. search (9.1, 20 s rounds, 5 s pause between rounds that found nobody)
+   for members that announce an open invite window; for each one:
+   **salt fetch** (11.4), then a *candidate* `a_key` from pw1 and that salt
+   (this Argon2 run is one attempt; a failed query costs none). pw1 stays in
+   the slot, so a fake salt can be retried with another member without
+   asking the user again;
+4. the normal handshake (section 10) to the member's port 3232 with the
+   candidate key and the new identity; both users compare the pairing code;
+5. the joiner asks for `d_salt` on that same connection (11.5) and derives
+   `d_key`;
+6. **commit**, as its own task (a timeout or `CancelJoin` can't cut it
+   half-way), under the change slot, only if the device is still fresh:
+   keys, salts, the member as the first trusted peer, a new vault with the
+   join's identity and **Sync on** (joining means syncing), then networking
+   starts. On any failure before it, nothing is kept and the join goes on
+   with the next member until the slot ends.
 
 ### 11.4 Salt fetch (pre-auth, `a_salt` only)
 
-A separate short TCP exchange on the same port, *before* the real handshake,
-so the handshake stays unchanged and Argon2 runs on the joiner between the two
-connections, never inside a handshake an unauthenticated peer can trigger. The
-member does no Argon2 for a salt query.
+A separate short TCP exchange on its own port, `SALT_PORT` = 3233, *before*
+the real handshake, so the handshake stays unchanged and Argon2 runs on the
+joiner between the two connections, never inside a handshake an
+unauthenticated peer can trigger. The member does no Argon2 and no other
+work for a query.
 
 ```
-joiner -> member : SALT_QUERY_MAGIC (8) || version (1)
+joiner -> member : SALT_QUERY_MAGIC "CESASALT" (8) || version 0x01 (1)
 member -> joiner : a_salt (32)
 (close)
 ```
 
-- **Invite window (decided)**: the member answers only if it has a group and
-  only while its user has opened "Add device", for 2 min. No window, no answer, so a closed group
-  reveals nothing.
-- Within the connection cap and the `guess_limiter` lockout, at most one
-  answer per source per 5 s. The query isn't a password guess, so it doesn't
-  touch the guess counter. 5 s timeout, one answer, then close.
+- **Invite window (decided)**: the member answers only while its user has
+  opened "Add device", for 2 min (`INVITE_WINDOW`). The listener on 3233 is
+  bound when the window opens and closed when it ends, so outside a window
+  there is no port and no answer: a closed group reveals nothing. (The
+  first design had the query on port 3232; its own port that exists only
+  during the window is simpler and keeps every byte the listener on 3232
+  reads in the handshake.)
+- At most 4 queries at once (`MAX_SALT_CLIENTS`, more are closed at once),
+  one answer per source (IPv4 address / IPv6 /64) per 5 s, the rate-limit
+  memory bounded (1024 sources); every read and write has the 5 s timeout;
+  anything but the exact 9-byte query gets nothing. The query isn't a
+  password guess, so it doesn't touch the guess limiter (and the limiter
+  isn't asked either: the salt is public, a locked-out guesser learns
+  nothing new from it).
 - **`d_salt` is never sent before authentication.**
-- **`a_salt` goes into the SPAKE2 transcript**, the same on both sides, so a
-  salt mismatch is caught by the SPAKE2 confirmation explicitly.
+- **`a_salt` is bound into SPAKE2** (both identities, 10.2), the same on
+  both sides, so a salt mismatch is caught by the SPAKE2 confirmation
+  explicitly.
 
 Why it is safe: `a_salt` is public by design and gives no offline test of pw1
 (SPAKE2 transcripts don't allow offline guesses). A MITM with a fake salt
@@ -980,12 +1034,17 @@ wrong group. Privacy cost: during the window, anyone on the LAN can read
 ### 11.5 `d_salt` sync (post-auth)
 
 `ActionType::GroupSalt = 0x04`, only inside an authenticated `SecureConnection`:
-- payload `d_salt (32)`, through Noise only (not the `d_key` layer: the joiner
-  has no `d_key` yet);
-- sent only to a peer that was just paired with us, during our invite window;
-- the joiner accepts it only on the **same** connection whose pairing it just
-  confirmed, and only while its join slot is open; anywhere else it is
-  refused, so another (also paired) peer can't swap the data salt later.
+- the joiner sends the init header `GroupSalt` with length 0 (anything else
+  is refused); the member answers `d_salt (32)` through Noise only (not the
+  `d_key` layer: the joiner has no `d_key` yet), then the connection ends;
+- the member sends it only on a connection that **paired the two devices
+  just now** (`Authenticated::newly_paired`) and only while its invite
+  window offers it (`NetworkerContext::salt_offer`, set when the window
+  opens and cleared when it ends); otherwise `NotInvited`, nothing sent;
+- the joiner takes it only on that same connection, only if it paired the
+  devices just now (it trusts nobody yet), and only inside the join; anywhere
+  else nothing asks for it, so another (also paired) peer can't swap the
+  data salt later.
 
 A peer that knows pw1 but not pw2 can pair and receive `d_salt`, but still
 can't read or send synced data without `d_key` (see 18 for the offline-guess
@@ -993,26 +1052,48 @@ caveat).
 
 ### 11.6 Storage effects
 
-The salts are stored as today: `a_salt` in the vault, `d_salt` in the
+The salts are stored as before: `a_salt` in the vault, `d_salt` in the
 keychain. A device that loses its vault or keychain, or a RAM-only daemon
-after a restart, re-joins through another member. If every device is gone, the group is gone and a new one is created.
+after a restart, re-joins through another member (vault reset, section 14).
+If every device is gone, the group is gone and a new one is created.
 
 ### 11.7 IPC additions
 
 | Request | Payload | Note |
 |---|---|---|
-| `CreateGroup` | `pw1_len (2) \|\| pw1 \|\| pw2` | replaces SetAuth/SetData when there is no group |
-| `JoinGroup` | `pw1_len (2) \|\| pw1 \|\| pw2` | opens the join slot |
-| `CancelJoin` | none | wipes the join slot |
-| `OpenInvite` | `seconds (2)`, capped | opens the invite window |
-| `Status` | adds `group: none / joining / member`, `invite_open` | still no salts or keys |
+| `JoinGroup` `0x0D` | `auth len (u16 LE) \|\| pw1 \|\| pw2` | opens the join slot; returns at once |
+| `CancelJoin` `0x0E` | none | ends the join, wipes the slot |
+| `AddDevice` `0x0A` | none | on a member: opens the invite window (2 min), see 13 |
+| `Status` | `flags2` bit 0 `joining` | still no salts or keys |
 
-Bounds: `1 <= pw1_len <= MAX_PASSWORD_LEN`, `1 <= len(pw2) <= MAX_PASSWORD_LEN`,
-payload consumed exactly; both passwords decoded into separate exact-size
-`Zeroizing` buffers, never trimmed. `MAX_REQUEST_BODY` becomes
-`1 + 2 + 2 * MAX_PASSWORD_LEN`, keep the compile-time assert.
-`SetAuthPassword` / `SetDataPassword` stay only for a member that already has
-the group salts; they always use the group salt and never create one.
+Bounds: both passwords `1..=MAX_PASSWORD_LEN`, the payload consumed exactly;
+both decoded into separate exact-size `Zeroizing` buffers, never trimmed.
+`MAX_REQUEST_BODY` is `1 + 2 + 2 * MAX_PASSWORD_LEN`, with the compile-time
+assert. `SetAuthPassword` / `SetDataPassword` on a member keep the group's
+salts (they never make new ones once a salt exists), so a local password
+change keeps the salts but changes the key: until group rotation exists
+(14), it breaks pairing with the other devices.
+
+**In the TUI**: Devices > `n` on a fresh device opens "Join a group": the
+group's auth password, Enter, its data password, Enter (both masked, kept
+only in pre-sized zeroizing buffers, wiped when sent or on Esc); `x` cancels
+a running join; the status bar says "joining a group". On a member, `n`
+opens the invite window.
+
+**Verified** (`daemon` tests, two real daemons over localhost, nothing
+injected): a fresh device joins a member with an open window, both users
+see the same code and accept, the joiner ends with the member's salts and
+keys, a saved vault, Sync on and the member as a trusted peer, and after a
+restart and unlock they reconnect without a prompt. Also tested: a wrong
+pw1 never prompts and keeps the joiner fresh; a fake salt from a rogue salt
+service fails SPAKE2 without a prompt; the salt port exists only during the
+window and the `d_salt` offer ends with it; joining refused on RAM-only,
+member and locked devices, one join at a time, `CancelJoin` and a stale join
+task not ending a newer one; `GroupSalt` only to a device paired on that
+connection during a window, never to a known peer, never with a payload; a
+different `a_salt` fails SPAKE2 (`spake2` tests); the salt query's rate
+limit, its memory bound and junk queries. The real two-machine check is a
+manual test (17).
 
 ---
 
@@ -1111,18 +1192,26 @@ connections at once.
 **Add device** (his decision: outgoing connections only on this explicit
 action, never on every announcement, so strangers' devices on the same LAN
 don't burn each other's guess-limiter slots). `AddDevice` (only while
-networking runs, `NetworkOff` otherwise) opens one window at a time:
-1. for 20 s, announce this device and search at the same time (9.1), with
-   a fresh instance id;
-2. connect to every device found, only the IP from discovery, port 3232,
-   `ConnectNewDevice` (header only). Both devices hear each other, so only
-   the one with the **lower instance id connects**: one connection and one
-   prompt per device pair, not two;
-3. the window stays open until those connections are done and for 20 s more
-   (`HANDSHAKE_DEADLINE`), so the other device's connection to us still
-   finds it open.
+networking runs, `NetworkOff` otherwise) opens one **invite window** at a
+time, for 2 min (`INVITE_WINDOW`), with a fresh instance id. During it the
+device:
+1. announces itself (9.1) in 20 s rounds;
+2. answers salt queries on 3233 and offers `d_salt` to a device it pairs
+   with just now: this is how a **new device joins** (section 11; the new
+   device's user presses "Add device" too, which on a fresh device is
+   "Join a group");
+3. searches in 20 s rounds for the whole window for **other members** with
+   a window open, and connects once to each (only the IP from discovery,
+   port 3232, `ConnectNewDevice`, header only): re-pairing two devices that
+   are both in the group already. Both devices hear each other, so only the
+   one with the **lower instance id connects**: one connection and one
+   prompt per device pair, not two. Searching the whole window (not only
+   its start, as in the first version) matters because the two users rarely
+   press it at the same moment; at most 16 devices per window;
+4. asks the user about new devices (next paragraph).
 
-Both users press "Add device" on their device at about the same time.
+The window ends after 2 min (later only while its own connections finish);
+the salt port closes and the `d_salt` offer is cleared with it.
 
 **Pairing only inside the window** (my addition, for his review): a pairing
 request that arrives while this device has no "Add device" window open is
@@ -1149,16 +1238,15 @@ state change (waits for the change slot). When networking stops, the bridge
 re-seals once more, so a pairing that finished at that moment isn't lost.
 A failed save is logged; the peer stays in RAM and the next change saves it.
 
-**Verified** (`daemon` tests, two real daemons over localhost, both given
-the same salts by the test because salt sync doesn't exist yet): both users
+**Verified** (`daemon` tests, two real daemons over localhost given the same
+salts by the test; the join itself is verified without that, see 11.7): both users
 see the same code, both accept, both vaults hold the other device, and after
 restarting both daemons (Sync comes back with the unlock) they connect again
 without anyone being asked. Also tested: rejection on one side, answers for
 unknown or answered ids, a pairing outside the window (rejected without a
 prompt), Sync off with a pairing waiting, the prompt cap, the key update
 reaching the network, the Sync switch surviving restarts and automatic
-login. The real two-machine check needs salt sync (section 11): until then
-two daemons with the same passwords still derive different keys.
+login.
 
 ---
 
@@ -1209,10 +1297,14 @@ Tests (`cargo test --workspace --all-features`):
   no key or salt in any response over a real socket, a waiting change holding
   no task; the Sync switch and networking (section 13), two daemons pairing
   and reconnecting after a restart, pairing outside the window, rejected and
-  stale answers, the prompt cap;
+  stale answers, the prompt cap; joining a group end to end and its failure
+  paths (11.7);
+- salt query: exact answer, junk refused, per-source rate limit and its
+  memory bound, nothing after the window;
 - `auth_snow` / networker: end-to-end localhost handshakes, first pairing,
-  reconnect without a prompt, one-sided forget, swapped ML-DSA key, wrong
-  `a_key`, rejected pairing, handshake deadline and silent peers, chunking,
+  reconnect without a prompt (`newly_paired` only on the first), one-sided
+  forget, swapped ML-DSA key, wrong `a_key`, a different `a_salt`, rejected
+  pairing, `GroupSalt` only on a pairing connection during a window, handshake deadline and silent peers, chunking,
   the data layer (wrong `d_key`, keys bound to direction and connection),
   size limits, the connection cap, lockouts on both sides;
 - IPC: framing bounds, strict decoding, decoders on random input, peer gates
@@ -1222,8 +1314,17 @@ Tests (`cargo test --workspace --all-features`):
 
 Every new protection gets a test that fails without it.
 
-Manual two-machine test (`--features test-commands`, never in release
-builds): `servertest <pw>` prints fresh random salts and listens on 3232;
+Manual two-machine test of the real app (macOS, both devices on one LAN with
+broadcast; allow incoming connections, or open UDP 3636 and TCP 3232 / 3233):
+1. device A: daemon + TUI, set both passwords, Settings > Sync on, then
+   Devices > `n` (invite window, 2 min);
+2. device B (fresh): daemon + TUI, Devices > `n`, the same two passwords;
+3. both show the same 8 emoji with names: `y` on both. B ends up with saved
+   keys, Sync on and A as a paired device;
+4. restart B's daemon and unlock: A and B reconnect without a prompt.
+
+Low-level test (`--features test-commands`, never in release builds):
+`servertest <pw>` prints fresh random salts and listens on 3232;
 `clienttest <msg> <pw> <salts>` discovers the server over UDP, connects,
 pairs (the 8-emoji pairing code with names, `y/N`) and sends one Debug packet.
 
@@ -1252,7 +1353,7 @@ Stated plainly so nobody relies on a property that isn't there.
    salts) also yields `a_key`.
 3. **Two-key independence and offline guesses on the wire.** A device that
    knows `pw1`, was paired by a user who accepted the code, and has `d_salt`
-   (sent to paired devices once salt sync exists) receives `d_key`-layer
+   (a joining device gets it, 11.5) receives `d_key`-layer
    ciphertexts with a known handshake hash, so it can test `pw2` guesses
    offline. The `d_key` layer stops reading, not guessing, by such a peer;
    a weak pw2 is the risk.
@@ -1283,7 +1384,16 @@ Stated plainly so nobody relies on a property that isn't there.
     costs it one handshake attempt and fails without pw1. Such an attacker
     can also jam "Add device" (forged announcements with the real devices'
     addresses and low ids, so neither side connects); that is a denial of
-    service, never a wrong pairing.
+    service, never a wrong pairing. The same goes for a join: forged
+    announcements or a rogue salt service can make a join fail (each fake
+    salt costs the joiner one Argon2 run, at most 5 per join), never join
+    the wrong group.
+12. **The group salt is readable during an invite window** (11.4): anyone on
+    the LAN can query `a_salt` for those 2 min. It is public by design and
+    gives no offline test of pw1, but it is a stable group identifier.
+13. **No password rotation yet** (14): changing a password on one member
+    changes its key but not the others', so that device stops pairing with
+    the group until the others change too.
 
 ---
 
@@ -1302,6 +1412,10 @@ Decided:
 - Pairing is built before salt sync; the end-to-end check uses tests that
   give both daemons the same salts; the real two-machine check comes with
   salt sync.
+- Salt sync (his choice): one flow. "Add device" on a member opens the 2 min
+  invite window (announce, salt query, `d_salt` to devices paired just now,
+  prompts); "Add device" on a fresh device is "Join a group" with both
+  passwords. The member-to-member search stays for re-pairing.
 - Pairing code: 8 emoji with names, 64-entry table, 48 bits, HKDF from the
   handshake hash, y/n on both devices, 60 s timeout rejects.
 - Password change: "are you sure?" first; the old password isn't required.
@@ -1314,6 +1428,13 @@ Decided:
 Proposed in the networking PR, for his review:
 - new devices are only asked about inside an "Add device" window (13);
 - the lower instance id connects (13).
+
+Proposed in the salt-sync PR, for his review:
+- the salt query on its own port 3233, bound only during the window (11.4);
+- no `CreateGroup`: setting both passwords on a fresh device creates the
+  group (11.3);
+- a joined device starts with Sync on (11.3);
+- the member searches for the whole window, not only its first 20 s (13).
 
 Open:
 - clipboard access (`arboard` vs own code) and delivery model: deferred;
@@ -1337,11 +1458,13 @@ the daemon with Argon2, the vault, the keychain, unlock, automatic login, a
 persistent identity and persistent trusted peers; the Sync switch, "Add
 device" and the pairing prompt with the emoji code (section 13).
 
+Built in the salt-sync PR (stacked on the networking PR): groups and joining
+(section 11): invite window, salt query, join slot, `a_salt` in SPAKE2,
+`GroupSalt`, IPC version 5, "Join a group" in the TUI.
+
 Next, one stacked PR each, every failure path tested:
-1. salt sync: invite window, join slot, salt query, `a_salt` in the SPAKE2
-   transcript, `GroupSalt` (section 11), and with it the real two-machine
-   pairing check;
-2. group rotation, trusted-peer sync and revocation (section 14, after his
-   protocol review);
-3. vault reset;
-4. clipboard v1 (section 12, after the access and delivery decisions).
+1. group rotation, trusted-peer sync and revocation (section 14, after his
+   protocol review); until then a local password change once peers exist
+   should warn or be refused;
+2. vault reset;
+3. clipboard v1 (section 12, after the access and delivery decisions).

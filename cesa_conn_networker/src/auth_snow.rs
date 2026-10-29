@@ -612,13 +612,20 @@ impl DataKey {
 /// Both fields are wrapped in `Zeroizing` so they are wiped from memory on drop.
 pub struct Keys {
     pub a_key: AuthKey,
+    /// The group's `a_salt` (public, but bound into SPAKE2, see `spake2`).
+    pub a_salt: Zeroizing<[u8; 32]>,
     pub d_key: DataKey,
 }
 
 impl Keys {
-    /// Bundles both keys; the types make it impossible to swap them.
-    pub fn new(a_key: AuthKey, d_key: DataKey) -> Self {
-        Self { a_key, d_key }
+    /// Bundles both keys and the auth salt; the types make it impossible to
+    /// swap the keys.
+    pub fn new(a_key: AuthKey, a_salt: &[u8; 32], d_key: DataKey) -> Self {
+        Self {
+            a_key,
+            a_salt: Zeroizing::new(*a_salt),
+            d_key,
+        }
     }
 }
 
@@ -1629,6 +1636,7 @@ type Identified = (SecureConnection, TrustedPeer, Zeroizing<[u8; 32]>, bool);
 async fn handshake_server(
     mut incoming_connection: IncomingConnection,
     a_key: &AuthKey,
+    a_salt: &[u8; 32],
     device_keypairs: &DeviceKeypairs,
     trusted_peers: &TrustedPeers,
 ) -> Result<Option<Identified>, AuthSnowErrors> {
@@ -1639,7 +1647,7 @@ async fn handshake_server(
     let mut transcript = Zeroizing::new(Vec::new());
 
     // 1. SPAKE2
-    let key1 = spake2_exchange_server(stream, a_key, &mut transcript)
+    let key1 = spake2_exchange_server(stream, a_key, a_salt, &mut transcript)
         .await
         .map_err(|_| AuthSnowErrors::FailedToExchangeSpake2)?;
 
@@ -1684,6 +1692,7 @@ async fn handshake_server(
 async fn handshake_client(
     mut outgoing_connection: IncomingConnection,
     a_key: &AuthKey,
+    a_salt: &[u8; 32],
     device_keypairs: &DeviceKeypairs,
     trusted_peers: &TrustedPeers,
 ) -> Result<Option<Identified>, AuthSnowErrors> {
@@ -1691,7 +1700,7 @@ async fn handshake_client(
     let mut transcript = Zeroizing::new(Vec::new());
 
     // 1. SPAKE2
-    let key1 = spake2_exchange_client(stream, a_key, &mut transcript)
+    let key1 = spake2_exchange_client(stream, a_key, a_salt, &mut transcript)
         .await
         .map_err(|_| AuthSnowErrors::FailedToExchangeSpake2)?;
 
@@ -1729,6 +1738,16 @@ async fn handshake_client(
     Ok(Some((secure_connection, peer, handshake_hash, both_saved)))
 }
 
+/// An authenticated connection: the channel, who is on the other end, and
+/// whether this very connection paired them (the user confirmed the code).
+pub struct Authenticated {
+    pub connection: SecureConnection,
+    pub peer: TrustedPeer,
+    /// `true` only if the devices didn't know each other and were paired
+    /// on this connection; the join's `GroupSalt` exchange requires it.
+    pub newly_paired: bool,
+}
+
 /// Runs the automatic part under [`HANDSHAKE_DEADLINE`], then pairing if needed.
 ///
 /// Pairing waits for a human ([`PAIRING_TIMEOUT`]), so it runs after the
@@ -1738,7 +1757,7 @@ async fn finish_auth(
     role: Role,
     trusted_peers: &TrustedPeers,
     pairing: &Pairing,
-) -> Result<Option<(SecureConnection, TrustedPeer)>, AuthSnowErrors> {
+) -> Result<Option<Authenticated>, AuthSnowErrors> {
     let Some((mut secure_connection, peer, handshake_hash, both_saved)) =
         identified.map_err(|_| AuthSnowErrors::HandshakeTimeout)??
     else {
@@ -1759,7 +1778,11 @@ async fn finish_auth(
         pairing.saved.notify_one();
     }
 
-    Ok(Some((secure_connection, peer)))
+    Ok(Some(Authenticated {
+        connection: secure_connection,
+        peer,
+        newly_paired: !both_saved,
+    }))
 }
 
 /// Authenticates an incoming connection (server side).
@@ -1777,14 +1800,23 @@ pub async fn auth_incoming(
     trusted_peers: TrustedPeers,
     incoming_connection: IncomingConnection,
     pairing: &Pairing,
-) -> Result<Option<(SecureConnection, TrustedPeer)>, AuthSnowErrors> {
+) -> Result<Option<Authenticated>, AuthSnowErrors> {
     // cloned, so the read lock is released before any network I/O
-    let a_key = keys.read().await.a_key.clone();
+    let (a_key, a_salt) = {
+        let keys = keys.read().await;
+        (keys.a_key.clone(), keys.a_salt.clone())
+    };
 
     // one deadline for all automatic steps, see HANDSHAKE_DEADLINE
     let identified = timeout(
         Duration::from_secs(HANDSHAKE_DEADLINE),
-        handshake_server(incoming_connection, &a_key, device_keypairs, &trusted_peers),
+        handshake_server(
+            incoming_connection,
+            &a_key,
+            &a_salt,
+            device_keypairs,
+            &trusted_peers,
+        ),
     )
     .await;
 
@@ -1802,13 +1834,22 @@ pub async fn auth_outgoing(
     trusted_peers: TrustedPeers,
     outgoing_connection: IncomingConnection,
     pairing: &Pairing,
-) -> Result<Option<(SecureConnection, TrustedPeer)>, AuthSnowErrors> {
-    let a_key = keys.read().await.a_key.clone();
+) -> Result<Option<Authenticated>, AuthSnowErrors> {
+    let (a_key, a_salt) = {
+        let keys = keys.read().await;
+        (keys.a_key.clone(), keys.a_salt.clone())
+    };
 
     // one deadline for all automatic steps, see HANDSHAKE_DEADLINE
     let identified = timeout(
         Duration::from_secs(HANDSHAKE_DEADLINE),
-        handshake_client(outgoing_connection, &a_key, device_keypairs, &trusted_peers),
+        handshake_client(
+            outgoing_connection,
+            &a_key,
+            &a_salt,
+            device_keypairs,
+            &trusted_peers,
+        ),
     )
     .await;
 
@@ -1823,6 +1864,7 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
     const TEST_A_KEY: [u8; 32] = [0xAB; 32];
+    const TEST_A_SALT: [u8; 32] = [0x5A; 32];
 
     /// Pairing that accepts every device.
     fn accept_all() -> Pairing {
@@ -1847,6 +1889,7 @@ mod tests {
             Self {
                 keys: Arc::new(RwLock::new(Keys::new(
                     AuthKey::from_bytes(&a_key),
+                    &TEST_A_SALT,
                     DataKey::from_bytes(&[0xCD; 32]),
                 ))),
                 keypairs: DeviceKeypairs::generate().unwrap(),
@@ -1855,7 +1898,7 @@ mod tests {
         }
     }
 
-    type AuthResult = Result<Option<(SecureConnection, TrustedPeer)>, AuthSnowErrors>;
+    type AuthResult = Result<Option<Authenticated>, AuthSnowErrors>;
 
     /// Runs auth_incoming / auth_outgoing against each other over localhost.
     async fn handshake(
@@ -1903,8 +1946,16 @@ mod tests {
         let (server_result, client_result) =
             handshake(&server, &client, accept_all(), accept_all()).await;
 
-        let (mut server_conn, client_as_seen) = server_result.unwrap().unwrap();
-        let (mut client_conn, server_as_seen) = client_result.unwrap().unwrap();
+        let Authenticated {
+            connection: mut server_conn,
+            peer: client_as_seen,
+            ..
+        } = server_result.unwrap().unwrap();
+        let Authenticated {
+            connection: mut client_conn,
+            peer: server_as_seen,
+            ..
+        } = client_result.unwrap().unwrap();
 
         // each side identified the other by its real static key
         assert_eq!(
@@ -2200,7 +2251,10 @@ mod tests {
         let client = Device::new(TEST_A_KEY);
 
         let (_s, c) = handshake(&server, &client, accept_all(), accept_all()).await;
-        let (mut conn, _) = c.unwrap().unwrap();
+        let Authenticated {
+            connection: mut conn,
+            ..
+        } = c.unwrap().unwrap();
 
         let too_big = vec![0u8; SECURE_MSG_MAX_PAYLOAD + 1];
         assert_eq!(
@@ -2222,8 +2276,14 @@ mod tests {
         let client = Device::new(TEST_A_KEY);
 
         let (s, c) = handshake(&server, &client, accept_all(), accept_all()).await;
-        let (mut server_conn, _) = s.unwrap().unwrap();
-        let (mut client_conn, _) = c.unwrap().unwrap();
+        let Authenticated {
+            connection: mut server_conn,
+            ..
+        } = s.unwrap().unwrap();
+        let Authenticated {
+            connection: mut client_conn,
+            ..
+        } = c.unwrap().unwrap();
 
         let msg = b"x".to_vec();
         client_conn.write(&msg, Tags::IsSavedTag).await.unwrap();
@@ -2242,8 +2302,14 @@ mod tests {
         let client = Device::new(TEST_A_KEY);
 
         let (s, c) = handshake(&server, &client, accept_all(), accept_all()).await;
-        let (mut server_conn, _) = s.unwrap().unwrap();
-        let (mut client_conn, _) = c.unwrap().unwrap();
+        let Authenticated {
+            connection: mut server_conn,
+            ..
+        } = s.unwrap().unwrap();
+        let Authenticated {
+            connection: mut client_conn,
+            ..
+        } = c.unwrap().unwrap();
 
         for len in [
             0,
@@ -2271,8 +2337,14 @@ mod tests {
         let client = Device::new(TEST_A_KEY);
 
         let (s, c) = handshake(&server, &client, accept_all(), accept_all()).await;
-        let (mut server_conn, _) = s.unwrap().unwrap();
-        let (mut client_conn, _) = c.unwrap().unwrap();
+        let Authenticated {
+            connection: mut server_conn,
+            ..
+        } = s.unwrap().unwrap();
+        let Authenticated {
+            connection: mut client_conn,
+            ..
+        } = c.unwrap().unwrap();
 
         let data = vec![1u8; SECURE_MSG_MAX_PAYLOAD + 10];
 
@@ -2293,8 +2365,14 @@ mod tests {
         let client = Device::new(TEST_A_KEY);
 
         let (s, c) = handshake(&server, &client, accept_all(), accept_all()).await;
-        let (mut server_conn, _) = s.unwrap().unwrap();
-        let (mut client_conn, _) = c.unwrap().unwrap();
+        let Authenticated {
+            connection: mut server_conn,
+            ..
+        } = s.unwrap().unwrap();
+        let Authenticated {
+            connection: mut client_conn,
+            ..
+        } = c.unwrap().unwrap();
 
         // announce more than we send, then hang up
         client_conn
@@ -2313,8 +2391,14 @@ mod tests {
         let client = Device::new(TEST_A_KEY);
 
         let (s, c) = handshake(&server, &client, accept_all(), accept_all()).await;
-        let (mut server_conn, _) = s.unwrap().unwrap();
-        let (mut client_conn, _) = c.unwrap().unwrap();
+        let Authenticated {
+            connection: mut server_conn,
+            ..
+        } = s.unwrap().unwrap();
+        let Authenticated {
+            connection: mut client_conn,
+            ..
+        } = c.unwrap().unwrap();
 
         let d_key = server.keys.read().await.d_key.clone();
         let data: Vec<u8> = (0..=250u8).cycle().take(200_000).collect();
@@ -2340,8 +2424,14 @@ mod tests {
         let client = Device::new(TEST_A_KEY);
 
         let (s, c) = handshake(&server, &client, accept_all(), accept_all()).await;
-        let (mut server_conn, _) = s.unwrap().unwrap();
-        let (mut client_conn, _) = c.unwrap().unwrap();
+        let Authenticated {
+            connection: mut server_conn,
+            ..
+        } = s.unwrap().unwrap();
+        let Authenticated {
+            connection: mut client_conn,
+            ..
+        } = c.unwrap().unwrap();
 
         let send_key = DataKey::from_bytes(&[1u8; 32]);
         let recv_key = DataKey::from_bytes(&[2u8; 32]);
@@ -2361,8 +2451,17 @@ mod tests {
         let d_key = DataKey::from_bytes(&[9u8; 32]);
 
         let (s, c) = handshake(&server, &client, accept_all(), accept_all()).await;
-        let (server_conn, _) = s.unwrap().unwrap();
-        let (client_conn, _) = c.unwrap().unwrap();
+        let Authenticated {
+            connection: server_conn,
+            ..
+        } = s.unwrap().unwrap();
+        let Authenticated {
+            connection: client_conn,
+            newly_paired: first_paired,
+            ..
+        } = c.unwrap().unwrap();
+        // the first connection paired them
+        assert!(first_paired);
 
         let c2s_client = client_conn.data_key(&d_key, true).unwrap();
         let c2s_server = server_conn.data_key(&d_key, false).unwrap();
@@ -2374,7 +2473,13 @@ mod tests {
 
         // a new connection gets new keys (new handshake hash)
         let (_s2, c2) = handshake(&server, &client, accept_all(), accept_all()).await;
-        let (client_conn2, _) = c2.unwrap().unwrap();
+        let Authenticated {
+            connection: client_conn2,
+            newly_paired: second_paired,
+            ..
+        } = c2.unwrap().unwrap();
+        // the second one only reconnected, both already trusted each other
+        assert!(!second_paired);
         assert_ne!(*client_conn2.data_key(&d_key, true).unwrap(), *c2s_client);
     }
 

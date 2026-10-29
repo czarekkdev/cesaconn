@@ -1,6 +1,5 @@
 /*
 TODO:
-salt syncing between devices (docs/design/daemon.md, section 11)
 Linux keychain backend (Secret Service): until then Linux keeps the keys in RAM only
 data-protection keychain (WhenUnlockedThisDeviceOnly) together with release signing
  */
@@ -41,8 +40,8 @@ use zeroize::Zeroizing;
 use cesa_conn_crypto::{crand::random_array, pswd_manager::derive_key};
 use cesa_conn_system::{
     ipc::{
-        DaemonError, MAX_LISTED_PEERS, MIN_NEW_PASSWORD_LEN, PairingPrompt, PasswordUpdate,
-        PeerInfo, Request, Response, Status, socket_path,
+        DaemonError, JoinPasswords, MAX_LISTED_PEERS, MIN_NEW_PASSWORD_LEN, PairingPrompt,
+        PasswordUpdate, PeerInfo, Request, Response, Status, socket_path,
     },
     keychain::{Item, OsKeychain, SecretStore},
     pairing_code::PairingCode,
@@ -50,13 +49,13 @@ use cesa_conn_system::{
 
 use crate::{
     auth_snow::{
-        AuthKey, DataKey, DeviceKeypairs, HANDSHAKE_DEADLINE, IDENTITY_SEED_LEN, Keys,
-        MAX_PENDING_PAIRINGS, Pairing, PairingInbox, PairingRequest, TIMEOUT, TrustedPeer,
-        decode_peers, encode_peers,
+        AuthKey, DataKey, DeviceKeypairs, IDENTITY_SEED_LEN, Keys, MAX_PENDING_PAIRINGS, Pairing,
+        PairingInbox, PairingRequest, TIMEOUT, TrustedPeer, decode_peers, encode_peers,
     },
     guess_limiter::GuessLimiter,
     ipc_server::{self, ClientPolicy},
-    tcp_networker::{self, ActionType, NetworkerContext, TCP_PORT, TcpNetworkerErrors},
+    salt_service::{SALT_PORT, query_salt, serve_salt},
+    tcp_networker::{self, ActionType, NetworkerContext, SaltOffer, TCP_PORT, TcpNetworkerErrors},
     udp_networker::{
         InstanceId, MAX_BROADCAST_DURATION, udp_broadcast_presence, udp_find_broadcasters,
     },
@@ -108,8 +107,23 @@ impl Config {
 }
 
 /* networking */
-/// How long "Add device" announces this device and searches the LAN (seconds).
+/// How long "Add device" searches the LAN for other members (seconds).
 const ADD_DEVICE_SEARCH: u64 = MAX_BROADCAST_DURATION;
+/// How long "Add device" keeps the invite window open: this device is
+/// announced, answers salt queries and asks about new devices (seconds).
+const INVITE_WINDOW: u64 = 120;
+
+/* joining */
+/// Longest a join may run; its passwords are wiped after it (seconds).
+const JOIN_WINDOW: u64 = 5 * 60;
+/// Salt attempts per join: each one costs an Argon2 run, so a fake member
+/// can't make the joiner derive keys endlessly.
+const JOIN_MAX_ATTEMPTS: u32 = 5;
+/// Most devices one invite window connects to (each costs a handshake).
+const MAX_TRIED_PER_WINDOW: usize = 16;
+/// Pause between join searches that found nobody to try (seconds); also
+/// keeps the joiner within the members' salt-query rate limit.
+const JOIN_RETRY_PAUSE: u64 = 5;
 /// How long the bridge may take to save the peers at shutdown (seconds).
 const SHUTDOWN_SAVE_TIMEOUT: u64 = 5;
 
@@ -142,6 +156,30 @@ impl PendingPairings {
     fn prune(&mut self) {
         self.waiting.retain(|(_, request)| !request.is_expired());
     }
+}
+
+/// A running join: cancelling the token ends it and wipes its passwords
+/// (they live only inside the join's task).
+struct JoinSlot {
+    /// Tells this join apart from a later one.
+    generation: u64,
+    token: CancellationToken,
+}
+
+/// Where a join looks for the member: its salt query and its listener.
+#[derive(Clone, Copy, Debug)]
+struct MemberAddrs {
+    salt: SocketAddr,
+    tcp: SocketAddr,
+}
+
+/// What a join attempt brought: everything a joined device keeps.
+struct Joined {
+    a_key: AuthKey,
+    a_salt: Salt,
+    d_key: DataKey,
+    d_salt: Salt,
+    peer: TrustedPeer,
 }
 
 /// The open vault, kept so changes can be re-sealed without the password.
@@ -226,11 +264,21 @@ pub struct Daemon {
     pairings: RwLock<PendingPairings>,
     /// The "Add device" window is open: only then are new devices asked about.
     adding: AtomicBool,
+    /// The running join, if any (its pairing is asked about too).
+    join: RwLock<Option<JoinSlot>>,
+    /// Generation of the next join.
+    next_join: std::sync::atomic::AtomicU64,
     /// One guess limiter for the daemon's lifetime, so a Sync off / on
     /// doesn't forgive a guesser.
     guess_limiter: Arc<GuessLimiter>,
     /// Where the listener binds: every interface on [`TCP_PORT`] (tests: localhost).
     listen_addr: SocketAddr,
+    /// Where the salt query binds during an invite window: every interface
+    /// on [`SALT_PORT`] (tests: localhost).
+    salt_addr: SocketAddr,
+    /// Tests only: the members a join tries instead of searching the LAN.
+    #[cfg(test)]
+    test_members: RwLock<Vec<MemberAddrs>>,
 }
 
 /// Which key a password is for.
@@ -277,11 +325,20 @@ impl Daemon {
     pub fn new(storage: Option<Storage>) -> Self {
         // paired devices on the LAN must reach it; every connection is
         // authenticated (SPAKE2 + signatures) before anything is processed
-        Self::with_listen_addr(storage, SocketAddr::from(([0, 0, 0, 0], TCP_PORT)))
+        Self::with_addrs(
+            storage,
+            SocketAddr::from(([0, 0, 0, 0], TCP_PORT)),
+            SocketAddr::from(([0, 0, 0, 0], SALT_PORT)),
+        )
     }
 
-    /// A daemon whose listener binds `listen_addr`.
-    fn with_listen_addr(storage: Option<Storage>, listen_addr: SocketAddr) -> Self {
+    /// A daemon whose listener binds `listen_addr` and whose salt query
+    /// (during an invite window) binds `salt_addr`.
+    fn with_addrs(
+        storage: Option<Storage>,
+        listen_addr: SocketAddr,
+        salt_addr: SocketAddr,
+    ) -> Self {
         Self {
             keys: RwLock::default(),
             trusted_peers: Arc::default(),
@@ -291,8 +348,13 @@ impl Daemon {
             network: RwLock::default(),
             pairings: RwLock::default(),
             adding: AtomicBool::new(false),
+            join: RwLock::default(),
+            next_join: std::sync::atomic::AtomicU64::new(0),
             guess_limiter: Arc::new(GuessLimiter::new()),
             listen_addr,
+            salt_addr,
+            #[cfg(test)]
+            test_members: RwLock::default(),
         }
     }
 
@@ -319,6 +381,16 @@ impl Daemon {
                 Ok(()) => Response::Done.encode(),
                 Err(e) => Response::encode_error(e),
             },
+            // starts the join and returns: it runs (and waits for the user)
+            // in its own task, taking the change slot only to commit
+            Request::JoinGroup(passwords) => match self.join_group(passwords).await {
+                Ok(()) => Response::Done.encode(),
+                Err(e) => Response::encode_error(e),
+            },
+            Request::CancelJoin => {
+                self.cancel_join().await;
+                Response::Done.encode()
+            }
             change => {
                 let Ok(turn) = self.change_slot.clone().acquire_owned().await else {
                     return Response::encode_error(DaemonError::Internal);
@@ -352,7 +424,9 @@ impl Daemon {
             | Request::ListPeers
             | Request::PendingPairing
             | Request::AnswerPairing { .. }
-            | Request::AddDevice => Err(DaemonError::BadRequest),
+            | Request::AddDevice
+            | Request::JoinGroup(_)
+            | Request::CancelJoin => Err(DaemonError::BadRequest),
         };
 
         // networking follows the state: keys, lock and the Sync switch
@@ -456,12 +530,14 @@ impl Daemon {
             pairings.prune();
             pairings.waiting.len()
         };
+        let joining = self.join_running().await;
 
         Status {
             trusted_peers: u32::try_from(trusted_peers).unwrap_or(u32::MAX),
             network_running,
             adding_device: network_running && self.adding.load(Ordering::SeqCst),
             pending_pairings: u8::try_from(pending_pairings).unwrap_or(u8::MAX),
+            joining,
             ..status
         }
     }
@@ -567,9 +643,9 @@ impl Daemon {
         // running connections use the new key from now on
         self.update_network_keys().await;
 
-        // first time both keys exist: create the vault
+        // first time both keys exist: create the vault (and the group)
         if self.keys.read().await.vault.is_none() {
-            self.create_vault().await;
+            self.create_vault(None, Config::default()).await;
         }
 
         Ok(())
@@ -660,9 +736,15 @@ impl Daemon {
         Ok(())
     }
 
-    /// Creates the vault once both keys are set. On failure the keys stay in
-    /// RAM only (the status says `saved = false`) and nothing is half-written.
-    async fn create_vault(&self) {
+    /// Creates the vault once both keys are set, with this device's
+    /// `identity` (a new one if `None`) and `config`. On failure the keys
+    /// stay in RAM only (the status says `saved = false`) and nothing is
+    /// half-written.
+    async fn create_vault(
+        &self,
+        identity: Option<Zeroizing<[u8; IDENTITY_SEED_LEN]>>,
+        config: Config,
+    ) {
         let Some(storage) = &self.storage else {
             return;
         };
@@ -696,10 +778,12 @@ impl Daemon {
                 let dek = vault::generate_dek()?;
                 let kek = vault::derive_kek(&d_key, &storage_salt)?;
                 let wrapped = vault::wrap_dek(&kek, &dek)?;
-                // every setting starts off (Sync too)
-                let config = Config::default();
-                // the device identity is born with the vault
-                let identity = DeviceKeypairs::new_seed().map_err(|_| VaultErrors::Crypto)?;
+                // the device identity is born with the vault (a joining
+                // device made it for the join already)
+                let identity = match identity {
+                    Some(identity) => identity,
+                    None => DeviceKeypairs::new_seed().map_err(|_| VaultErrors::Crypto)?,
+                };
                 let contents = VaultContents {
                     a_key: a_key.clone(),
                     a_salt: a_salt.clone(),
@@ -1045,8 +1129,10 @@ impl Daemon {
         // copies (zeroizing) under the guard, which is dropped right away
         let keys = {
             let keys = self.keys.read().await;
-            match (&keys.a_key, &keys.d_key) {
-                (Some(a_key), Some(d_key)) => Keys::new(a_key.clone(), d_key.clone()),
+            match (&keys.a_key, &keys.a_salt, &keys.d_key) {
+                (Some(a_key), Some(a_salt), Some(d_key)) => {
+                    Keys::new(a_key.clone(), a_salt, d_key.clone())
+                }
                 _ => return,
             }
         };
@@ -1074,6 +1160,8 @@ impl Daemon {
             trusted_peers: self.trusted_peers.clone(),
             pairing,
             guess_limiter: self.guess_limiter.clone(),
+            // offered only while an invite window is open
+            salt_offer: Arc::default(),
         };
         drop(identity);
 
@@ -1119,8 +1207,10 @@ impl Daemon {
     async fn update_network_keys(&self) {
         let keys = {
             let keys = self.keys.read().await;
-            match (&keys.a_key, &keys.d_key) {
-                (Some(a_key), Some(d_key)) => Keys::new(a_key.clone(), d_key.clone()),
+            match (&keys.a_key, &keys.a_salt, &keys.d_key) {
+                (Some(a_key), Some(a_salt), Some(d_key)) => {
+                    Keys::new(a_key.clone(), a_salt, d_key.clone())
+                }
                 _ => return,
             }
         };
@@ -1164,9 +1254,10 @@ impl Daemon {
     }
 
     /// Keeps `request` for the user, or rejects it: outside the
-    /// "Add device" window nobody asked to pair, and the queue is bounded.
+    /// "Add device" window or a join nobody asked to pair, and the queue is
+    /// bounded.
     async fn queue_pairing(&self, request: PairingRequest) {
-        if !self.adding.load(Ordering::SeqCst) {
+        if !self.adding.load(Ordering::SeqCst) && !self.join_running().await {
             warn!(name = %request.name, "pairing request outside \"Add device\", rejected");
             request.answer(false);
             return;
@@ -1225,12 +1316,54 @@ impl Daemon {
         Ok(())
     }
 
-    /// Opens the "Add device" window: announces this device and searches the
-    /// LAN for [`ADD_DEVICE_SEARCH`] seconds, then connects to what it found.
-    /// The window (and with it the pairing prompts) stays open until those
-    /// connections finished and for [`HANDSHAKE_DEADLINE`] more, so the other
-    /// device's connection to us can still arrive.
+    /// Opens the "Add device" window for [`INVITE_WINDOW`] seconds: this
+    /// device is announced on the LAN, answers salt queries (a new device
+    /// joining, see [`crate::salt_service`]), hands `d_salt` to a device it
+    /// pairs with just now, and asks the user about new devices. For the
+    /// whole window it also searches (in [`ADD_DEVICE_SEARCH`] rounds) for
+    /// other members with a window open and connects to them (re-pairing two
+    /// devices that are both in the group already).
     async fn add_device(self: &Arc<Self>) -> Result<(), DaemonError> {
+        let Some(invite) = self.open_invite().await? else {
+            // already open: one window at a time
+            return Ok(());
+        };
+
+        info!(seconds = INVITE_WINDOW, "add device: invite window open");
+
+        let daemon = self.clone();
+        tokio::spawn(async move {
+            let Invite {
+                context,
+                token,
+                id,
+                window,
+            } = invite;
+            let offer = context.salt_offer.clone();
+
+            select! {
+                () = token.cancelled() => {},
+                () = invite_window(context, id, window.clone()) => {},
+            }
+            // the salt goes away with the window, whatever ended it
+            close_invite(&window, &offer).await;
+
+            // cancelled: stop_network closed it already, and a window of a
+            // restarted network must not be closed by this old one
+            if !token.is_cancelled() {
+                daemon.adding.store(false, Ordering::SeqCst);
+                info!("add device: invite window closed");
+            }
+        });
+
+        Ok(())
+    }
+
+    /// The invite part of [`Daemon::add_device`] without the LAN: marks the
+    /// window open, offers `d_salt` to devices paired just now and starts
+    /// the salt query (closed when `Invite::window` is cancelled, at the
+    /// latest after [`INVITE_WINDOW`]). `None` if a window is open already.
+    async fn open_invite(&self) -> Result<Option<Invite>, DaemonError> {
         let (context, token) = {
             let network = self.network.read().await;
             match network.as_ref() {
@@ -1241,34 +1374,395 @@ impl Daemon {
             }
         };
 
+        // copies (zeroizing) under the guard, which is dropped right away
+        let (a_salt, d_salt) = {
+            let keys = self.keys.read().await;
+            match (&keys.a_salt, &keys.d_salt) {
+                (Some(a_salt), Some(d_salt)) => (a_salt.clone(), d_salt.clone()),
+                _ => return Err(DaemonError::NetworkOff),
+            }
+        };
+
         let id = InstanceId::generate().map_err(|e| {
             error!(error = %e, "failed to generate a discovery id");
             DaemonError::Internal
         })?;
 
-        // already open: one window at a time
         if self.adding.swap(true, Ordering::SeqCst) {
-            return Ok(());
+            return Ok(None);
         }
 
-        info!("add device: searching the network");
+        let window = CancellationToken::new();
+
+        // the salt query exists only during the window: no port outside it
+        match TcpListener::bind(self.salt_addr).await {
+            Ok(listener) => {
+                tokio::spawn(serve_salt(listener, a_salt, window.clone()));
+            }
+            Err(e) => {
+                warn!(error = %e, addr = %self.salt_addr, "salt query unavailable: new devices can't join, members can still pair");
+            }
+        }
+
+        *context.salt_offer.write().await = Some(d_salt);
+
+        // the window's own end, whatever else runs in it
+        let closing = window.clone();
+        tokio::spawn(async move {
+            select! {
+                () = closing.cancelled() => {},
+                () = sleep(Duration::from_secs(INVITE_WINDOW)) => closing.cancel(),
+            }
+        });
+
+        Ok(Some(Invite {
+            context,
+            token,
+            id,
+            window,
+        }))
+    }
+
+    /// Starts joining the group of a device whose user opened "Add
+    /// device": only on a fresh device (no keys, no vault) that can save
+    /// what it gets. The passwords move into the join's task and are wiped
+    /// when it ends: success, [`JOIN_WINDOW`], [`JOIN_MAX_ATTEMPTS`],
+    /// `CancelJoin` or shutdown.
+    async fn join_group(self: &Arc<Self>, passwords: JoinPasswords) -> Result<(), DaemonError> {
+        // a joined device must survive a restart
+        if self.storage.is_none() {
+            return Err(DaemonError::NotSaved);
+        }
+        if !self.is_fresh().await {
+            return Err(DaemonError::AlreadyInGroup);
+        }
+
+        // this device's identity, kept by the vault once the join commits
+        let identity = DeviceKeypairs::new_seed().map_err(|e| {
+            error!(error = %e, "failed to generate the device identity");
+            DaemonError::Internal
+        })?;
+
+        let token = CancellationToken::new();
+        let generation = self.next_join.fetch_add(1, Ordering::SeqCst);
+        {
+            // check-then-set under one write guard; nothing awaited inside
+            let mut join = self.join.write().await;
+            if join.as_ref().is_some_and(|slot| !slot.token.is_cancelled()) {
+                return Err(DaemonError::JoinRunning);
+            }
+            *join = Some(JoinSlot {
+                generation,
+                token: token.clone(),
+            });
+            drop(join);
+        }
+
+        info!("joining a group: looking for a device with \"Add device\" open");
 
         let daemon = self.clone();
         tokio::spawn(async move {
             select! {
-                () = token.cancelled() => {},
-                () = add_device_window(context, id) => {},
+                () = token.cancelled() => info!("join cancelled"),
+                result = timeout(
+                    Duration::from_secs(JOIN_WINDOW),
+                    daemon.run_join(passwords, identity),
+                ) => match result {
+                    Ok(Ok(())) => info!("joined the group"),
+                    Ok(Err(e)) => warn!(error = %e, "join failed"),
+                    Err(_) => warn!("join timed out"),
+                },
             }
-            // cancelled: stop_network closed it already, and a window of a
-            // restarted network must not be closed by this old one
-            if !token.is_cancelled() {
-                daemon.adding.store(false, Ordering::SeqCst);
-                info!("add device: window closed");
-            }
+            // (the passwords were dropped with the join future: wiped)
+            daemon.end_join(generation).await;
         });
 
         Ok(())
     }
+
+    /// No keys, no vault, nothing locked: a device that may join.
+    async fn is_fresh(&self) -> bool {
+        let keys = self.keys.read().await;
+        !keys.locked
+            && keys.vault.is_none()
+            && keys.a_key.is_none()
+            && keys.d_key.is_none()
+            && keys.a_salt.is_none()
+            && keys.d_salt.is_none()
+    }
+
+    /// Ends the running join (its passwords are wiped with its task).
+    async fn cancel_join(&self) {
+        let slot = self.join.write().await.take();
+        if let Some(slot) = slot {
+            slot.token.cancel();
+            self.finish_join().await;
+        }
+    }
+
+    /// Clears the join `generation` if it is still the current one.
+    async fn end_join(&self, generation: u64) {
+        {
+            let mut join = self.join.write().await;
+            if join
+                .as_ref()
+                .is_none_or(|slot| slot.generation != generation)
+            {
+                return;
+            }
+            *join = None;
+        }
+        self.finish_join().await;
+    }
+
+    /// A join runs: one whose slot is set and not cancelled. Read from the
+    /// slot itself, so an old join ending can't switch off a newer one.
+    async fn join_running(&self) -> bool {
+        self.join
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|slot| !slot.token.is_cancelled())
+    }
+
+    /// No join any more: its waiting prompts are rejected (unless an
+    /// "Add device" window or a new join still asks about devices).
+    async fn finish_join(&self) {
+        if !self.adding.load(Ordering::SeqCst) && !self.join_running().await {
+            self.pairings.write().await.waiting.clear();
+        }
+    }
+
+    /// The join itself: search for members, try each until one succeeds or
+    /// [`JOIN_MAX_ATTEMPTS`] salt attempts are used up.
+    async fn run_join(
+        self: &Arc<Self>,
+        passwords: JoinPasswords,
+        identity: Zeroizing<[u8; IDENTITY_SEED_LEN]>,
+    ) -> Result<(), DaemonError> {
+        let mut attempts = 0u32;
+
+        while attempts < JOIN_MAX_ATTEMPTS {
+            for member in self.find_members().await {
+                if attempts >= JOIN_MAX_ATTEMPTS {
+                    break;
+                }
+                match self
+                    .join_attempt(&passwords, &identity, member, &mut attempts)
+                    .await
+                {
+                    Ok(joined) => {
+                        // its own task: a timeout or CancelJoin from here on
+                        // can't cut the commit half-way (keychain without vault)
+                        let daemon = self.clone();
+                        return tokio::spawn(
+                            async move { daemon.commit_join(joined, identity).await },
+                        )
+                        .await
+                        .map_err(|_| DaemonError::Internal)?;
+                    }
+                    Err(e) => warn!(addr = %member.tcp, error = %e, "join attempt failed"),
+                }
+            }
+
+            sleep(Duration::from_secs(JOIN_RETRY_PAUSE)).await;
+        }
+
+        warn!(
+            attempts = JOIN_MAX_ATTEMPTS,
+            "join: every salt attempt used up without joining"
+        );
+        Err(DaemonError::NetworkOff)
+    }
+
+    /// Devices announcing an open "Add device" window on the LAN.
+    async fn find_members(&self) -> Vec<MemberAddrs> {
+        #[cfg(test)]
+        {
+            let members = self.test_members.read().await.clone();
+            if !members.is_empty() {
+                return members;
+            }
+        }
+
+        let Ok(own) = InstanceId::generate() else {
+            return Vec::new();
+        };
+
+        match udp_find_broadcasters(ADD_DEVICE_SEARCH, own).await {
+            // only the IP comes from discovery (an unauthenticated hint)
+            Ok(found) => found
+                .into_iter()
+                .map(|(addr, _)| MemberAddrs {
+                    salt: SocketAddr::new(addr.ip(), SALT_PORT),
+                    tcp: SocketAddr::new(addr.ip(), TCP_PORT),
+                })
+                .collect(),
+            Err(e) => {
+                warn!(error = %e, "searching for a device to join failed");
+                Vec::new()
+            }
+        }
+    }
+
+    /// One try with one member:
+    /// 1. the salt query: `a_salt` (unauthenticated, see `salt_service`);
+    /// 2. a candidate `a_key` from pw1 and that salt (counts as an attempt);
+    /// 3. the handshake, the user pairs the devices, `d_salt` comes over
+    ///    that same connection ([`tcp_networker::join_handler`]);
+    /// 4. `d_key` from pw2 and `d_salt`.
+    ///
+    /// A fake salt fails in step 3: it is bound into SPAKE2.
+    async fn join_attempt(
+        self: &Arc<Self>,
+        passwords: &JoinPasswords,
+        identity: &Zeroizing<[u8; IDENTITY_SEED_LEN]>,
+        member: MemberAddrs,
+        attempts: &mut u32,
+    ) -> Result<Joined, DaemonError> {
+        // 1. the salt
+        let a_salt = query_salt(member.salt).await.map_err(|e| {
+            debug!(addr = %member.salt, error = %e, "no salt from the device");
+            DaemonError::NetworkOff
+        })?;
+
+        // 2. the candidate auth key
+        *attempts = attempts.saturating_add(1);
+        let a_key = AuthKey::new(
+            self.derive(
+                PasswordUpdate {
+                    password: passwords.auth.password.clone(),
+                },
+                a_salt.clone(),
+            )
+            .await?,
+        );
+
+        // 3. handshake, pairing, d_salt; d_key isn't known yet and the
+        // GroupSalt exchange doesn't use it: a random one that opens nothing
+        let unused_d_key = random_array::<32>().map_err(|_| DaemonError::Internal)?;
+        let (pairing, inbox) = Pairing::channel();
+        let context = NetworkerContext {
+            keys: Arc::new(RwLock::new(Keys::new(
+                a_key.clone(),
+                &a_salt,
+                DataKey::new(unused_d_key),
+            ))),
+            device_keypairs: Arc::new(DeviceKeypairs::from_seed(identity)),
+            // nobody is trusted yet: the member must be paired just now
+            trusted_peers: Arc::default(),
+            pairing,
+            guess_limiter: self.guess_limiter.clone(),
+            salt_offer: Arc::default(),
+        };
+        // ends when the context (and with it the pairing sender) is dropped
+        tokio::spawn(self.clone().join_bridge(inbox));
+
+        let stream = timeout(Duration::from_secs(TIMEOUT), TcpStream::connect(member.tcp))
+            .await
+            .map_err(|_| DaemonError::NetworkOff)?
+            .map_err(|_| DaemonError::NetworkOff)?;
+
+        // a full handshake: boxed, so the future isn't kept on the stack
+        let (peer, d_salt) = Box::pin(tcp_networker::join_handler(context, member.tcp, stream))
+            .await
+            .map_err(|e| {
+                debug!(addr = %member.tcp, error = %e, "joining through the device failed");
+                DaemonError::NetworkOff
+            })?;
+
+        // 4. the data key
+        let d_key = DataKey::new(
+            self.derive(
+                PasswordUpdate {
+                    password: passwords.data.password.clone(),
+                },
+                d_salt.clone(),
+            )
+            .await?,
+        );
+
+        Ok(Joined {
+            a_key,
+            a_salt,
+            d_key,
+            d_salt,
+            peer,
+        })
+    }
+
+    /// Hands the join's pairing requests to the user (no saving: the commit
+    /// saves everything at once).
+    async fn join_bridge(self: Arc<Self>, mut inbox: PairingInbox) {
+        // ends when the join attempt drops its context (the sender): the
+        // attempt itself is bounded by the handshake deadline, the pairing
+        // timeout and JOIN_WINDOW; an in-process channel, not the network
+        // nosemgrep: cesa.net.read-without-timeout
+        while let Some(request) = inbox.requests.recv().await {
+            self.queue_pairing(request).await;
+        }
+    }
+
+    /// Keeps what the join brought: keys, salts, the member as a trusted
+    /// peer, a new vault with Sync on (joining means syncing), networking.
+    async fn commit_join(
+        self: &Arc<Self>,
+        joined: Joined,
+        identity: Zeroizing<[u8; IDENTITY_SEED_LEN]>,
+    ) -> Result<(), DaemonError> {
+        let turn = self
+            .change_slot
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| DaemonError::Internal)?;
+
+        // the state may have changed while the user was pairing
+        if !self.is_fresh().await {
+            return Err(DaemonError::AlreadyInGroup);
+        }
+
+        {
+            let mut keys = self.keys.write().await;
+            keys.a_key = Some(joined.a_key);
+            keys.a_salt = Some(joined.a_salt);
+            keys.d_key = Some(joined.d_key);
+            keys.d_salt = Some(joined.d_salt);
+        }
+        self.trusted_peers.write().await.push(joined.peer);
+
+        self.create_vault(Some(identity), Config { sync: true })
+            .await;
+        let saved = self.keys.read().await.vault.is_some();
+
+        drop(turn);
+        self.apply_network().await;
+
+        if saved {
+            Ok(())
+        } else {
+            // the keys stay in RAM, like a first device whose save failed
+            Err(DaemonError::StorageFailed)
+        }
+    }
+}
+
+/// Ends an invite window: the salt query stops and `d_salt` is no longer
+/// offered to anyone.
+async fn close_invite(window: &CancellationToken, offer: &SaltOffer) {
+    window.cancel();
+    *offer.write().await = None;
+}
+
+/// An open invite window ([`Daemon::open_invite`]).
+struct Invite {
+    context: NetworkerContext,
+    /// The network's token: the window ends with networking.
+    token: CancellationToken,
+    /// This window's discovery id.
+    id: InstanceId,
+    /// Cancelled when the window ends; stops the salt query.
+    window: CancellationToken,
 }
 
 /// Runs the accept loop in its own task until the token is cancelled. If
@@ -1287,42 +1781,85 @@ fn listen(listener: TcpListener, context: NetworkerContext, token: CancellationT
     });
 }
 
-/// The "Add device" window ([`Daemon::add_device`]): announce and search at
-/// the same time, connect to every device found, wait for the stragglers.
-async fn add_device_window(context: NetworkerContext, id: InstanceId) {
-    let (announced, found) = tokio::join!(
-        udp_broadcast_presence(ADD_DEVICE_SEARCH, id),
-        udp_find_broadcasters(ADD_DEVICE_SEARCH, id),
+/// The LAN part of the invite window ([`Daemon::add_device`]): announce
+/// this device until `window` ends, and meanwhile search for other members
+/// and connect to every one found; waits for those connections.
+async fn invite_window(context: NetworkerContext, id: InstanceId, window: CancellationToken) {
+    tokio::join!(
+        announce_until(id, window.clone()),
+        search_and_connect(context, id, window.clone()),
     );
+}
 
-    if let Err(e) = announced {
-        warn!(error = %e, "announcing this device failed");
+/// Announces this device in [`MAX_BROADCAST_DURATION`] rounds until `window`
+/// is cancelled.
+async fn announce_until(id: InstanceId, window: CancellationToken) {
+    while !window.is_cancelled() {
+        select! {
+            () = window.cancelled() => break,
+            announced = udp_broadcast_presence(MAX_BROADCAST_DURATION, id) => {
+                if let Err(e) = announced {
+                    warn!(error = %e, "announcing this device failed");
+                    // no busy loop on a failing socket
+                    select! {
+                        () = window.cancelled() => break,
+                        () = sleep(Duration::from_secs(JOIN_RETRY_PAUSE)) => {},
+                    }
+                }
+            },
+        }
     }
-    let found = found.unwrap_or_else(|e| {
-        warn!(error = %e, "searching for devices failed");
-        Vec::new()
-    });
+}
 
+/// Searches in [`ADD_DEVICE_SEARCH`] rounds until `window` ends for other
+/// members with the window open, connects once to every new one this side
+/// should connect to, then waits for those connections. Searching the whole
+/// window (not only its start) matters: the two users rarely press "Add
+/// device" at the same moment, and only the lower id connects.
+async fn search_and_connect(context: NetworkerContext, id: InstanceId, window: CancellationToken) {
     let mut connects = JoinSet::new();
+    // one connection per address and window (bounded by the search caps)
+    let mut tried: Vec<std::net::IpAddr> = Vec::new();
 
-    for (addr, their_id) in found {
-        // both devices hear each other: only the lower id connects, so a
-        // pair makes one connection (and one prompt each), not two
-        if id < their_id {
-            // only the IP comes from discovery (an unauthenticated hint)
-            connects.spawn(connect_to(
-                context.clone(),
-                SocketAddr::new(addr.ip(), TCP_PORT),
-            ));
-        } else {
-            debug!(%addr, "found device connects to us");
+    while !window.is_cancelled() {
+        let found = select! {
+            () = window.cancelled() => break,
+            found = udp_find_broadcasters(ADD_DEVICE_SEARCH, id) => found,
+        };
+        let found = match found {
+            Ok(found) => found,
+            Err(e) => {
+                warn!(error = %e, "searching for devices failed");
+                // no busy loop on a failing socket
+                select! {
+                    () = window.cancelled() => break,
+                    () = sleep(Duration::from_secs(JOIN_RETRY_PAUSE)) => {},
+                }
+                continue;
+            }
+        };
+
+        for (addr, their_id) in found {
+            if tried.contains(&addr.ip()) || tried.len() >= MAX_TRIED_PER_WINDOW {
+                continue;
+            }
+            tried.push(addr.ip());
+
+            // both devices hear each other: only the lower id connects, so a
+            // pair makes one connection (and one prompt each), not two
+            if id < their_id {
+                // only the IP comes from discovery (an unauthenticated hint)
+                connects.spawn(connect_to(
+                    context.clone(),
+                    SocketAddr::new(addr.ip(), TCP_PORT),
+                ));
+            } else {
+                debug!(%addr, "found device connects to us");
+            }
         }
     }
 
-    tokio::join!(
-        async { while connects.join_next().await.is_some() {} },
-        sleep(Duration::from_secs(HANDSHAKE_DEADLINE)),
-    );
+    while connects.join_next().await.is_some() {}
 }
 
 /// One outgoing `ConnectNewDevice` connection: authenticates, and pairs if
@@ -1441,6 +1978,7 @@ pub async fn run() {
 #[allow(clippy::large_futures)] // full handshakes in tests, stack size doesn't matter
 mod tests {
     use super::*;
+    use crate::auth_snow::HANDSHAKE_DEADLINE;
     use cesa_conn_system::ipc::{IpcErrors, prepare_socket_dir, request_at};
     use cesa_conn_system::keychain::KeychainErrors;
     use std::collections::HashMap;
@@ -1558,6 +2096,8 @@ mod tests {
                     0x09 => DaemonError::UnlockDelayed,
                     0x0A => DaemonError::NetworkOff,
                     0x0B => DaemonError::PairingExpired,
+                    0x0C => DaemonError::AlreadyInGroup,
+                    0x0D => DaemonError::JoinRunning,
                     _ => DaemonError::Internal,
                 }),
                 _ => panic!("unexpected response"),
@@ -2185,22 +2725,27 @@ mod tests {
     impl TestStorage {
         /// A (re)started daemon whose listener binds a free localhost port.
         async fn daemon_on_localhost(&self) -> Arc<Daemon> {
-            // a free port: bound, read, released (the daemon binds it again)
-            let port = std::net::TcpListener::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap()
-                .port();
-            let daemon = Arc::new(Daemon::with_listen_addr(
+            let daemon = Arc::new(Daemon::with_addrs(
                 Some(Storage {
                     store: self.store.clone(),
                     path: self.path(),
                 }),
-                SocketAddr::from(([127, 0, 0, 1], port)),
+                free_local_addr(),
+                free_local_addr(),
             ));
             daemon.start().await;
             daemon
         }
+    }
+
+    /// A free localhost port: bound, read, released (the daemon binds it again).
+    fn free_local_addr() -> SocketAddr {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        SocketAddr::from(([127, 0, 0, 1], port))
     }
 
     /// The shared context of a running network.
@@ -2746,5 +3291,320 @@ mod tests {
         );
 
         token.cancel();
+    }
+
+    // ── joining a group (salt sync) ──────────────────────────────────────
+
+    fn join_request(auth: &[u8], data: &[u8]) -> Request {
+        Request::JoinGroup(JoinPasswords {
+            auth: update(auth),
+            data: update(data),
+        })
+    }
+
+    /// Where a join should find `member` (instead of searching the LAN).
+    async fn join_through(joiner: &Daemon, member: &Daemon) {
+        *joiner.test_members.write().await = vec![MemberAddrs {
+            salt: member.salt_addr,
+            tcp: member.listen_addr,
+        }];
+    }
+
+    /// A member with networking on and an open invite window.
+    async fn member_with_invite(storage: &TestStorage) -> (Arc<Daemon>, Invite) {
+        let member = storage.daemon_on_localhost().await;
+        setup(&member).await;
+        ask(&member, Request::SetSync(true)).await.unwrap();
+        let invite = member.open_invite().await.unwrap().unwrap();
+        (member, invite)
+    }
+
+    /// Waits (bounded) until `check` holds for `daemon`'s status.
+    async fn wait_for_status(daemon: &Daemon, check: impl Fn(&Status) -> bool) -> Status {
+        for _ in 0..3000 {
+            let status = daemon.status().await;
+            if check(&status) {
+                return status;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        panic!("status never got there: {:?}", daemon.status().await);
+    }
+
+    /// Test the whole join: a fresh device with the group's two passwords
+    /// gets the salts from a member with "Add device" open, both users see
+    /// the same code and accept, the joiner ends up with the member's keys,
+    /// a saved vault and Sync on, and after a restart they reconnect
+    /// without being asked again
+    #[tokio::test]
+    async fn test_join_group_end_to_end() {
+        let (storage_a, storage_b) = (TestStorage::new("join-a"), TestStorage::new("join-b"));
+        let (member, invite) = member_with_invite(&storage_a).await;
+
+        let joiner = storage_b.daemon_on_localhost().await;
+        join_through(&joiner, &member).await;
+        ask(&joiner, join_request(AUTH_PW, DATA_PW)).await.unwrap();
+        assert!(joiner.status().await.joining);
+
+        let prompt_member = wait_for_prompt(&member).await;
+        let prompt_joiner = wait_for_prompt(&joiner).await;
+        assert_eq!(prompt_member.code, prompt_joiner.code);
+
+        for (daemon, prompt) in [(&member, &prompt_member), (&joiner, &prompt_joiner)] {
+            ask(
+                daemon,
+                Request::AnswerPairing {
+                    id: prompt.id,
+                    code: prompt.code,
+                    accept: true,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let status = wait_for_status(&joiner, |s| s.saved && s.network_running).await;
+        assert!(status.sync_enabled && !status.joining && !status.locked);
+        assert_eq!(status.trusted_peers, 1);
+        assert_eq!(key_bytes(&member).await, key_bytes(&joiner).await);
+        let salts =
+            |keys: &KeySlots| (*keys.a_salt.clone().unwrap(), *keys.d_salt.clone().unwrap());
+        let member_salts = salts(&*member.keys.read().await);
+        let joiner_salts = salts(&*joiner.keys.read().await);
+        assert_eq!(member_salts, joiner_salts);
+        assert_eq!(member.status().await.trusted_peers, 1);
+        wait_for_saved_peers(&storage_a, 1).await;
+
+        // the window closes; the joined device restarts and reconnects
+        invite.window.cancel();
+        member.adding.store(false, Ordering::SeqCst);
+        drop(joiner.stop_network().await);
+        drop(joiner);
+
+        let joiner = storage_b.daemon_on_localhost().await;
+        ask(&joiner, Request::Unlock(update(DATA_PW)))
+            .await
+            .unwrap();
+        assert!(joiner.status().await.network_running);
+        assert_eq!(
+            connect_to(context(&member).await, joiner.listen_addr).await,
+            Ok(())
+        );
+        assert!(member.pending_pairing().await.is_none());
+        assert!(joiner.pending_pairing().await.is_none());
+    }
+
+    /// Test that a joiner with a wrong auth password fails SPAKE2 at once:
+    /// nobody is asked, the joiner stays fresh, and CancelJoin ends it
+    #[tokio::test]
+    async fn test_join_wrong_password_never_prompts() {
+        let (storage_a, storage_b) = (TestStorage::new("joinpw-a"), TestStorage::new("joinpw-b"));
+        let (member, _invite) = member_with_invite(&storage_a).await;
+
+        let joiner = storage_b.daemon_on_localhost().await;
+        join_through(&joiner, &member).await;
+        ask(&joiner, join_request(b"wrong auth password", DATA_PW))
+            .await
+            .unwrap();
+
+        // the attempt runs and fails (Argon2, then SPAKE2 confirmation)
+        for _ in 0..500 {
+            if member
+                .guess_limiter
+                .is_locked(joiner.listen_addr.ip())
+                .await
+                || !member.pairings.read().await.waiting.is_empty()
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        sleep(Duration::from_secs(2)).await;
+
+        assert!(member.pending_pairing().await.is_none());
+        assert!(joiner.pending_pairing().await.is_none());
+        assert!(joiner.is_fresh().await);
+        assert_eq!(member.status().await.trusted_peers, 0);
+
+        ask(&joiner, Request::CancelJoin).await.unwrap();
+        assert!(!joiner.status().await.joining);
+        assert!(joiner.join.read().await.is_none());
+    }
+
+    /// Test that a fake salt (a rogue salt service in front of a real
+    /// member) only makes the join fail: the salt is bound into SPAKE2, so
+    /// nobody is asked and nothing is kept
+    #[tokio::test]
+    async fn test_join_fake_salt_fails() {
+        let (storage_a, storage_b) = (
+            TestStorage::new("joinfake-a"),
+            TestStorage::new("joinfake-b"),
+        );
+        let (member, invite) = member_with_invite(&storage_a).await;
+        // the real salt service is gone, a rogue one answers instead
+        invite.window.cancel();
+        let rogue = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rogue_addr = rogue.local_addr().unwrap();
+        let rogue_token = CancellationToken::new();
+        tokio::spawn(serve_salt(
+            rogue,
+            Zeroizing::new([0x66; 32]),
+            rogue_token.clone(),
+        ));
+
+        let joiner = storage_b.daemon_on_localhost().await;
+        let mut attempts = 0;
+        let passwords = JoinPasswords {
+            auth: update(AUTH_PW),
+            data: update(DATA_PW),
+        };
+        // a join is running, so the joiner would show a prompt
+        *joiner.join.write().await = Some(JoinSlot {
+            generation: 0,
+            token: CancellationToken::new(),
+        });
+        let result = joiner
+            .join_attempt(
+                &passwords,
+                &DeviceKeypairs::new_seed().unwrap(),
+                MemberAddrs {
+                    salt: rogue_addr,
+                    tcp: member.listen_addr,
+                },
+                &mut attempts,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(attempts, 1);
+        assert!(member.pending_pairing().await.is_none());
+        assert!(joiner.pending_pairing().await.is_none());
+        assert_eq!(member.status().await.trusted_peers, 0);
+        rogue_token.cancel();
+    }
+
+    /// Test that the salt query exists only during the invite window, and
+    /// the d_salt offer goes away with it
+    #[tokio::test]
+    async fn test_salt_only_during_invite() {
+        let storage = TestStorage::new("invite");
+        let member = storage.daemon_on_localhost().await;
+        setup(&member).await;
+        ask(&member, Request::SetSync(true)).await.unwrap();
+
+        assert!(query_salt(member.salt_addr).await.is_err());
+
+        let invite = member.open_invite().await.unwrap().unwrap();
+        let a_salt = member.keys.read().await.a_salt.clone().unwrap();
+        assert_eq!(*query_salt(member.salt_addr).await.unwrap(), *a_salt);
+        assert!(context(&member).await.salt_offer.read().await.is_some());
+        // one window at a time
+        assert!(member.open_invite().await.unwrap().is_none());
+
+        // the end of the window, as add_device's task ends it
+        close_invite(&invite.window, &invite.context.salt_offer).await;
+        sleep(Duration::from_millis(50)).await;
+        assert!(query_salt(member.salt_addr).await.is_err());
+        assert!(context(&member).await.salt_offer.read().await.is_none());
+    }
+
+    /// Test that only a fresh device with storage may join, and one join
+    /// runs at a time
+    #[tokio::test]
+    async fn test_join_refused_unless_fresh() {
+        // RAM only: a joined device wouldn't survive a restart
+        let ram = Arc::new(Daemon::default());
+        assert_eq!(
+            ask(&ram, join_request(AUTH_PW, DATA_PW)).await,
+            Err(DaemonError::NotSaved)
+        );
+
+        // a device with keys is in a group already
+        let storage = TestStorage::new("join-member");
+        let member = storage.daemon().await;
+        setup(&member).await;
+        assert_eq!(
+            ask(&member, join_request(AUTH_PW, DATA_PW)).await,
+            Err(DaemonError::AlreadyInGroup)
+        );
+        // a locked one too
+        drop(member);
+        let locked = storage.daemon().await;
+        assert_eq!(
+            ask(&locked, join_request(AUTH_PW, DATA_PW)).await,
+            Err(DaemonError::AlreadyInGroup)
+        );
+
+        // one join at a time; nobody to join here (no member answers)
+        let fresh_storage = TestStorage::new("join-fresh");
+        let fresh = fresh_storage.daemon_on_localhost().await;
+        *fresh.test_members.write().await = vec![MemberAddrs {
+            salt: free_local_addr(),
+            tcp: free_local_addr(),
+        }];
+        ask(&fresh, join_request(AUTH_PW, DATA_PW)).await.unwrap();
+        assert_eq!(
+            ask(&fresh, join_request(AUTH_PW, DATA_PW)).await,
+            Err(DaemonError::JoinRunning)
+        );
+        ask(&fresh, Request::CancelJoin).await.unwrap();
+        assert!(!fresh.status().await.joining);
+        // cancelled: a new one may start
+        ask(&fresh, join_request(AUTH_PW, DATA_PW)).await.unwrap();
+        ask(&fresh, Request::CancelJoin).await.unwrap();
+    }
+
+    /// Test that a join's commit refuses a device that got keys while the
+    /// user was pairing, and changes nothing
+    #[tokio::test]
+    async fn test_commit_join_rechecks_fresh() {
+        let storage = TestStorage::new("join-commit");
+        let daemon = storage.daemon_on_localhost().await;
+        setup(&daemon).await;
+        let before = key_bytes(&daemon).await;
+
+        let joined = Joined {
+            a_key: AuthKey::from_bytes(&[1; 32]),
+            a_salt: Zeroizing::new([2; 32]),
+            d_key: DataKey::from_bytes(&[3; 32]),
+            d_salt: Zeroizing::new([4; 32]),
+            peer: TrustedPeer::for_test(9, "member"),
+        };
+        let result = daemon
+            .commit_join(joined, DeviceKeypairs::new_seed().unwrap())
+            .await;
+
+        assert_eq!(result, Err(DaemonError::AlreadyInGroup));
+        assert_eq!(key_bytes(&daemon).await, before);
+        assert!(daemon.peers().await.is_empty());
+    }
+
+    /// Test that a join's pairing prompts go away when the join is
+    /// cancelled, and a stale join task can't end a newer join
+    #[tokio::test]
+    async fn test_cancel_join_clears_prompts_and_generation() {
+        let daemon = TestStorage::new("join-gen").daemon_on_localhost().await;
+        *daemon.join.write().await = Some(JoinSlot {
+            generation: 7,
+            token: CancellationToken::new(),
+        });
+        let (request, _answer) = fake_request();
+        daemon.queue_pairing(request).await;
+        assert!(daemon.pending_pairing().await.is_some());
+
+        // an older join ending doesn't touch the current one
+        daemon.end_join(6).await;
+        assert!(daemon.status().await.joining);
+        assert!(daemon.pending_pairing().await.is_some());
+
+        ask(&daemon, Request::CancelJoin).await.unwrap();
+        assert!(!daemon.status().await.joining);
+        assert!(daemon.pending_pairing().await.is_none());
+
+        // outside a join (and outside "Add device") nobody is asked
+        let (request, answer) = fake_request();
+        daemon.queue_pairing(request).await;
+        assert!(daemon.pending_pairing().await.is_none());
+        assert_eq!(answer.await, Ok(false));
     }
 }

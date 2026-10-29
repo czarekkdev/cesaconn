@@ -29,10 +29,11 @@ const FORGET_AFTER: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// Who a failure is counted against: an IPv4 address or an IPv6 /64.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-struct Source(IpAddr);
+pub(crate) struct Source(IpAddr);
 
 impl Source {
-    fn of(ip: IpAddr) -> Self {
+    /// The source an address is counted as (also used by `salt_service`).
+    pub(crate) fn of(ip: IpAddr) -> Self {
         match ip.to_canonical() {
             IpAddr::V4(v4) => Self(IpAddr::V4(v4)),
             IpAddr::V6(v6) => {
