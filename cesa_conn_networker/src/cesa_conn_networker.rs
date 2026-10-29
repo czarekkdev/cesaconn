@@ -4,10 +4,6 @@
 
 /* TODO NOW:
 
-
----------------
-
-ADD SALT SYNCING
 CLIPBOARD SYNC
 FOLDER SYNC
 

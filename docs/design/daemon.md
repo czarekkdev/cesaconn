@@ -495,6 +495,11 @@ the request they answer.
 - Keep nothing key-related: no keys, no salts, no handshake hashes.
 - Show the daemon's warnings (unsigned daemon, invalid requirement) instead of
   hiding them.
+- Show only what the daemon really has: no setting, list or counter without a
+  daemon value behind it. (The early TUI placeholders, Auto-connect, UDP
+  discovery, listen address and port, broadcast duration, a "connected"
+  counter and a device list nothing filled, were removed; the Devices tab
+  shows the paired devices from `ListPeers` and what the daemon is doing.)
 
 ### 7.6 Command set policy
 
@@ -621,11 +626,11 @@ to `StorageFailed`, with details only in the daemon log.
 - Each connection runs `recv_handler` in its own task, cancelled with the
   daemon's token.
 
-### 9.3 Bluetooth **[open]**
+### 9.3 Bluetooth **[open, no code]**
 
-`btleplug` is a dependency of the networker, but no code uses it and there is
-no design yet. Until there is, it is attack surface without a feature: either
-design it or drop the dependency.
+No Bluetooth transport and no design yet. The unused `btleplug` dependency
+was dropped (it was attack surface without a feature, and ~500 lines of
+`Cargo.lock`); a Bluetooth design starts from scratch if it is ever wanted.
 
 ### 9.4 Online guess limiter **[built]**
 
@@ -1378,8 +1383,11 @@ Stated plainly so nobody relies on a property that isn't there.
 8. **Display names** are socket addresses for now, so the pairing prompt can
    only show where the request comes from, not which device it claims to be.
    The code comparison is what proves it is the right device.
-9. **The transcript after Noise** (signatures) is appended but no longer used;
-   harmless, noted so nobody assumes it binds anything.
+9. **The pre-Noise transcript binds only the PSK.** It collects every
+   plaintext message before Noise and is wiped right after the PSK is
+   derived; the signatures and the pairing code bind to the Noise handshake
+   hash instead, which covers the PSK. (Earlier builds also appended the
+   signatures to it after Noise, where nothing read them; that was removed.)
 10. **Unsigned builds and pairing**: like every other command (4.), any
     process of the same user can answer a pairing prompt over IPC, and so
     pair a device that knows pw1 during an "Add device" window. Closed only
@@ -1451,7 +1459,7 @@ Open:
 - group rotation, trusted-peer sync and revocation protocol;
 - device names exchanged during pairing;
 - a post-quantum PAKE (18.1);
-- the Bluetooth dependency: design it or drop it (9.3).
+- a Bluetooth transport (9.3; the unused dependency was dropped).
 
 ---
 

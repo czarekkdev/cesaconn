@@ -81,8 +81,9 @@ fn terminal_pairing() -> Pairing {
     pairing
 }
 
-/// Shared networker state for the test subcommands.
-/// TODO: load the device identity from storage instead of generating it per run.
+/// Shared networker state for the test subcommands. A fresh identity per
+/// run on purpose: the manual test always pairs (the daemon keeps its
+/// identity in the vault).
 fn make_context(keys: Arc<RwLock<Keys>>) -> Option<NetworkerContext> {
     let device_keypairs = match DeviceKeypairs::generate() {
         Ok(device_keypairs) => device_keypairs,
