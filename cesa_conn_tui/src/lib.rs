@@ -121,6 +121,9 @@ enum ActivePopup {
     ConfirmForget(PeerInfo),
     /// "Reset this device?": the user types [`RESET_WORD`].
     ConfirmReset,
+    /// The daemon (re)started locked: the data password, asked for
+    /// without a trip to Settings.
+    Unlock,
 }
 
 /// Which password the join popup asks for.
@@ -162,6 +165,9 @@ pub struct App {
     outbox: Vec<Command>,
     /// A refresh is queued or running; don't stack more.
     refresh_in_flight: bool,
+    /// The unlock prompt was shown for this locked spell (Esc keeps it
+    /// closed; a wrong password or a new lock asks again).
+    unlock_asked: bool,
 }
 
 impl Default for App {
@@ -220,6 +226,7 @@ impl App {
             peers: Vec::new(),
             outbox: Vec::new(),
             refresh_in_flight: false,
+            unlock_asked: false,
         }
     }
 
@@ -357,6 +364,10 @@ fn handle_input(app: &mut App) -> io::Result<()> {
             handle_confirm_reset_input(app, key.code);
             return Ok(());
         }
+        ActivePopup::Unlock => {
+            handle_unlock_input(app, key.code);
+            return Ok(());
+        }
         ActivePopup::None => {}
     }
 
@@ -480,6 +491,53 @@ fn handle_confirm_change_input(app: &mut App, code: KeyCode) {
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
             app.active_popup = ActivePopup::None;
         }
+        _ => {}
+    }
+}
+
+/// Opens the unlock prompt when the daemon is locked and would take a
+/// password now, once per locked spell and never over another popup (it
+/// waits for the next refresh); closes it when the vault got unlocked some
+/// other way (automatic login, another UI).
+fn ask_unlock(app: &mut App, status: &Status) {
+    if !status.locked {
+        app.unlock_asked = false;
+        if app.active_popup == ActivePopup::Unlock {
+            clear_input(app);
+            app.active_popup = ActivePopup::None;
+        }
+        return;
+    }
+
+    if status.unlock_wait_secs == 0 && !app.unlock_asked && app.active_popup == ActivePopup::None {
+        clear_input(app);
+        app.active_popup = ActivePopup::Unlock;
+        app.unlock_asked = true;
+    }
+}
+
+/// The unlock prompt: Enter sends the data password exactly as typed, Esc
+/// leaves it for later (Settings > Data key). The input is wiped either way.
+fn handle_unlock_input(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Esc => {
+            clear_input(app);
+            app.active_popup = ActivePopup::None;
+            app.push_log("[ INFO] Unlock later: Settings > Data key");
+        }
+        KeyCode::Enter if app.input_buf.is_empty() => {}
+        KeyCode::Enter => {
+            app.outbox.push(Command::Unlock(PasswordUpdate {
+                password: Zeroizing::new(app.input_buf.as_bytes().to_vec()),
+            }));
+            clear_input(app);
+            app.active_popup = ActivePopup::None;
+            app.push_log("[ INFO] Unlocking the saved keys (takes a moment)");
+        }
+        KeyCode::Backspace => {
+            app.input_buf.pop();
+        }
+        KeyCode::Char(c) => push_input(app, c),
         _ => {}
     }
 }
@@ -773,7 +831,7 @@ fn handle_link_event(app: &mut App, event: LinkEvent) {
             }
             if status.locked && !was_locked {
                 app.push_log(
-                    "[ WARN] Saved keys are locked: enter the data password (Settings > Data key)",
+                    "[ WARN] Saved keys are locked: enter the data password (Esc: later, Settings > Data key)",
                 );
             }
 
@@ -793,8 +851,9 @@ fn handle_link_event(app: &mut App, event: LinkEvent) {
             }
             app.peers = peers;
             app.clamp_peer_selection();
-            app.daemon = DaemonState::Up(status);
             show_pairing(app, pairing);
+            ask_unlock(app, &status);
+            app.daemon = DaemonState::Up(status);
         }
         LinkEvent::Refreshed(Err(e)) => {
             app.refresh_in_flight = false;
@@ -804,7 +863,9 @@ fn handle_link_event(app: &mut App, event: LinkEvent) {
                 app.push_log(format!("[ WARN] Daemon not reachable: {e}"));
             }
 
-            // nothing is known about keys or peers without the daemon
+            // nothing is known about keys or peers without the daemon; a
+            // daemon that comes back locked is a new locked spell: ask again
+            app.unlock_asked = false;
             set_key_flags(app, false, false);
             app.peers.clear();
             app.clamp_peer_selection();
@@ -828,7 +889,9 @@ fn handle_link_event(app: &mut App, event: LinkEvent) {
             match result {
                 Ok(()) => app.push_log("[ INFO] Saved keys unlocked"),
                 Err(IpcErrors::Daemon(DaemonError::WrongPassword)) => {
-                    app.push_log("[ERROR] Wrong data password")
+                    app.push_log("[ERROR] Wrong data password");
+                    // ask again (the next refresh, unless a wait starts)
+                    app.unlock_asked = false;
                 }
                 Err(IpcErrors::Daemon(DaemonError::UnlockDelayed)) => app.push_log(
                     "[ WARN] Too many wrong data passwords: wait (see the status bar), then try again",
@@ -1040,6 +1103,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
         ActivePopup::JoinGroup(step) => render_join_popup(frame, area, step, app),
         ActivePopup::ConfirmForget(peer) => render_confirm_forget_popup(frame, area, &peer),
         ActivePopup::ConfirmReset => render_confirm_reset_popup(frame, area, app),
+        ActivePopup::Unlock => render_unlock_popup(frame, area, app),
         ActivePopup::None => {}
     }
 }
@@ -1549,6 +1613,53 @@ fn render_confirm_change_popup(frame: &mut Frame, area: Rect, kind: KeyKind) {
         ),
         popup,
     );
+}
+
+fn render_unlock_popup(frame: &mut Frame, area: Rect, app: &App) {
+    // one star per character, the byte length would leak more than the length
+    let stars = "*".repeat(app.input_buf.chars().count());
+
+    let w = 60u16.min(area.width);
+    let h = 8u16.min(area.height);
+    let popup = centered_rect(area, w, h);
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "  The saved keys are locked (the daemon restarted).",
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(Span::styled(
+            "  Data password:",
+            Style::default().fg(Color::Reset),
+        )),
+        Line::from(""),
+        Line::from(format!("  {stars}")),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Enter: unlock    Esc: later (Settings > Data key)",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" Unlock ")
+                .title_alignment(Alignment::Center)
+                .border_type(BorderType::Double)
+                .style(Style::default().fg(Color::Cyan)),
+        ),
+        popup,
+    );
+
+    frame.set_cursor_position((
+        popup
+            .x
+            .saturating_add(3)
+            .saturating_add(to_u16(stars.len())),
+        popup.y.saturating_add(4),
+    ));
 }
 
 fn render_confirm_forget_popup(frame: &mut Frame, area: Rect, peer: &PeerInfo) {
@@ -2099,6 +2210,116 @@ mod tests {
             app.outbox.as_slice(),
             [Command::SetAutoLogin(false)]
         ));
+    }
+
+    /// Locked, as after a daemon restart, with `wait` seconds until the
+    /// daemon takes an unlock again.
+    fn locked_with_wait(wait: u16) -> LinkEvent {
+        LinkEvent::Refreshed(Ok((
+            Status {
+                locked: true,
+                saved: true,
+                unlock_wait_secs: wait,
+                ..Status::default()
+            },
+            Vec::new(),
+            None,
+        )))
+    }
+
+    /// The passwords of the queued unlocks, borrowed (no copies).
+    fn unlocks(app: &App) -> Vec<&[u8]> {
+        app.outbox
+            .iter()
+            .filter_map(|c| match c {
+                Command::Unlock(update) => Some(update.password.as_slice()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Test that a locked daemon asks for the data password right away (on
+    /// any tab), sends it exactly as typed, masks it and wipes the input
+    #[test]
+    fn test_unlock_prompt_on_start() {
+        let mut app = App::new();
+        app.active_tab = Tab::Logs;
+        handle_link_event(&mut app, up_locked(true, false));
+        assert_eq!(app.active_popup, ActivePopup::Unlock);
+
+        for c in " data pw ".chars() {
+            handle_unlock_input(&mut app, KeyCode::Char(c));
+        }
+        let shown = screen(&mut app);
+        assert!(shown.contains("Data password") && shown.contains("*********"));
+        assert!(!shown.contains("data pw"));
+
+        handle_unlock_input(&mut app, KeyCode::Enter);
+        assert_eq!(unlocks(&app), [b" data pw ".as_slice()]);
+        assert!(app.input_buf.is_empty());
+        assert_eq!(app.active_popup, ActivePopup::None);
+        assert!(!app.logs.iter().any(|l| l.contains("data pw")));
+    }
+
+    /// Test that Esc keeps the prompt closed for this locked spell, a wrong
+    /// password asks again, and a daemon that comes back locked asks again
+    #[test]
+    fn test_unlock_prompt_esc_and_retry() {
+        let mut app = App::new();
+        handle_link_event(&mut app, up_locked(true, false));
+        handle_unlock_input(&mut app, KeyCode::Char('x'));
+        handle_unlock_input(&mut app, KeyCode::Esc);
+        assert_eq!(app.active_popup, ActivePopup::None);
+        assert!(app.input_buf.is_empty());
+
+        handle_link_event(&mut app, up_locked(true, false));
+        assert_eq!(app.active_popup, ActivePopup::None);
+
+        handle_link_event(
+            &mut app,
+            LinkEvent::Unlocked(Err(IpcErrors::Daemon(DaemonError::WrongPassword))),
+        );
+        handle_link_event(&mut app, up_locked(true, false));
+        assert_eq!(app.active_popup, ActivePopup::Unlock);
+        handle_unlock_input(&mut app, KeyCode::Esc);
+
+        // the daemon went away and came back locked: a new spell
+        handle_link_event(
+            &mut app,
+            LinkEvent::Refreshed(Err(IpcErrors::FailedToConnect)),
+        );
+        handle_link_event(&mut app, up_locked(true, false));
+        assert_eq!(app.active_popup, ActivePopup::Unlock);
+    }
+
+    /// Test that the prompt waits while the daemon refuses unlocks, never
+    /// covers another popup, and closes (wiped) once unlocked elsewhere
+    #[test]
+    fn test_unlock_prompt_waits_and_closes() {
+        let mut app = App::new();
+        handle_link_event(&mut app, locked_with_wait(30));
+        assert_eq!(app.active_popup, ActivePopup::None);
+        handle_link_event(&mut app, locked_with_wait(0));
+        assert_eq!(app.active_popup, ActivePopup::Unlock);
+
+        // another popup first: the prompt waits for it
+        let mut app = App::new();
+        app.active_popup = ActivePopup::ConfirmReset;
+        handle_link_event(&mut app, locked_with_wait(0));
+        assert_eq!(app.active_popup, ActivePopup::ConfirmReset);
+        app.active_popup = ActivePopup::None;
+        handle_link_event(&mut app, locked_with_wait(0));
+        assert_eq!(app.active_popup, ActivePopup::Unlock);
+
+        // unlocked by automatic login or another UI: closed, input wiped
+        handle_unlock_input(&mut app, KeyCode::Char('p'));
+        handle_link_event(&mut app, up_locked(false, true));
+        assert_eq!(app.active_popup, ActivePopup::None);
+        assert!(app.input_buf.is_empty());
+        // Enter on an empty prompt sends nothing
+        handle_link_event(&mut app, locked_with_wait(0));
+        handle_unlock_input(&mut app, KeyCode::Enter);
+        assert!(unlocks(&app).is_empty());
     }
 
     /// Test that a wrong data password on unlock is reported clearly

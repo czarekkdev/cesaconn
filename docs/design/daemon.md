@@ -335,7 +335,15 @@ The delay is a "not before" time, not a sleep: a sleep held the change slot
 and outlasted the 10 s IPC deadline from the 10th attempt on, so the UI got a
 timeout even for the right password. `Status` reports the seconds left
 (`unlock_wait_secs`); the TUI shows them in the status bar and doesn't open
-the password field until the wait is over. The guessing rate is the same as
+the password field until the wait is over.
+
+The TUI asks for the data password by itself as soon as it sees a locked
+daemon (a restart without automatic login), on any tab: an "Unlock" prompt,
+masked, sent exactly as typed. Once per locked spell: Esc leaves it to
+Settings > Data key, a wrong password or a daemon that comes back locked
+asks again. It waits while the daemon refuses unlocks, never covers another
+popup (it opens on the next refresh), and closes, wiped, when the vault was
+unlocked some other way. The guessing rate is the same as
 with the sleep: one Argon2 attempt per delay.
 
 The failure counter is in RAM, so a daemon restart resets it. That is
@@ -510,6 +518,8 @@ the request they answer.
   discovery, listen address and port, broadcast duration, a "connected"
   counter and a device list nothing filled, were removed; the Devices tab
   shows the paired devices from `ListPeers` and what the daemon is doing.)
+- Ask for what the daemon needs instead of sending the user looking for it:
+  a locked daemon gets the unlock prompt at once (6.4).
 
 ### 7.6 Command set policy
 
