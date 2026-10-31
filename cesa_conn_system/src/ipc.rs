@@ -13,7 +13,7 @@
 //!   a daemon of the same user, and on macOS only to one whose signature
 //!   satisfies [`DAEMON_CODE_REQUIREMENT`].
 //!
-//! Wire format (version 7), one request and one response per connection:
+//! Wire format (version 8), one request and one response per connection:
 //! `frame = length (u32 LE, 1..=MAX_FRAME_LEN) || body`
 //!
 //! Request body: `kind (1) || payload`
@@ -43,6 +43,8 @@
 //! * `0x11` ResetDevice: `"CN-RESET" (8)`; wipes this device back to fresh
 //!   (vault file, keychain items, keys, paired devices). The fixed bytes make
 //!   sure a reset is never decoded from anything sent by mistake
+//! * `0x12` SetClipboard: `on (1)`, exactly `0x00` or `0x01`; clipboard sync
+//!   on/off, saved in the vault
 //! * `0x02` / `0x03` are retired (version 1 sent `salt || password` there).
 //!   They are refused, so a mismatched UI and daemon fail loudly instead of
 //!   deriving a key from the wrong bytes.
@@ -54,14 +56,17 @@
 //!   bit 4 = keys saved (encrypted vault), bit 5 = automatic login on,
 //!   bit 6 = Sync switched on, bit 7 = "Add device" window open; flags2 bit 0
 //!   = joining a group, bit 1 = the open "Add device" window found a device
-//!   of another group, other bits must be 0; unlock wait = seconds until
+//!   of another group, bit 2 = clipboard sync switched on, bit 3 = this
+//!   platform has no clipboard support, other bits must be 0; unlock wait = seconds until
 //!   `Unlock` is accepted again after too many wrong data passwords (0 = now).
 //!   Versions 2 to 4 were shorter, so a mismatched UI and daemon fail with
-//!   `Malformed`; version 5 refuses flags2 bit 1, so it fails loudly too.
+//!   `Malformed`; versions 5 to 7 refuse the newer flags2 bits, so they fail
+//!   loudly too.
 //! * SetAuthPassword / SetDataPassword / Unlock / SetAutoLogin / SetSync /
 //!   AddDevice / AnswerPairing / JoinGroup / CancelJoin / StopAddDevice /
-//!   ForgetPeer / ResetDevice: empty
-//! * ListPeers: `count (u16 LE) || count * (fingerprint (8) || name len (1) || name)`
+//!   ForgetPeer / ResetDevice / SetClipboard: empty
+//! * ListPeers: `count (u16 LE) || count * (fingerprint (8) || state (1) ||
+//!   name len (1) || name)`; state is a [`PeerState`] byte, others are refused
 //! * PendingPairing: `0x00` (none) or `0x01 || id (u32 LE) || code (8) ||
 //!   name len (1) || name`; every code byte is below
 //!   [`crate::pairing_code::PAIRING_SYMBOLS`], the name has no control characters
@@ -89,8 +94,9 @@ pub const IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bytes of a peer's key shown as its fingerprint.
 pub const FINGERPRINT_LEN: usize = 8;
 
-/// longest `ListPeers` body: status + count + every peer at full name length
-const MAX_PEERS_BODY: usize = 1 + 2 + MAX_LISTED_PEERS * (FINGERPRINT_LEN + 1 + 255);
+/// longest `ListPeers` body: status + count + every peer (fingerprint, state,
+/// name length) at full name length
+const MAX_PEERS_BODY: usize = 1 + 2 + MAX_LISTED_PEERS * (FINGERPRINT_LEN + 1 + 1 + 255);
 /// longest request body: kind + auth length + both passwords (JoinGroup)
 const MAX_REQUEST_BODY: usize = 1 + 2 + 2 * MAX_PASSWORD_LEN;
 
@@ -138,6 +144,7 @@ const REQ_CANCEL_JOIN: u8 = 0x0E;
 const REQ_STOP_ADD_DEVICE: u8 = 0x0F;
 const REQ_FORGET_PEER: u8 = 0x10;
 const REQ_RESET_DEVICE: u8 = 0x11;
+const REQ_SET_CLIPBOARD: u8 = 0x12;
 
 /// The payload of `ResetDevice`: nothing sent by mistake decodes as a reset.
 pub const RESET_CONFIRM: [u8; 8] = *b"CN-RESET";
@@ -147,8 +154,13 @@ pub const RESET_CONFIRM: [u8; 8] = *b"CN-RESET";
 const STATUS2_JOINING: u8 = 0b01;
 /// flags2: the open "Add device" window found a device of another group
 const STATUS2_OTHER_GROUP: u8 = 0b10;
+/// flags2: the clipboard sync switch is on
+const STATUS2_CLIPBOARD: u8 = 0b100;
+/// flags2: this platform has no clipboard support
+const STATUS2_NO_CLIPBOARD: u8 = 0b1000;
 /// every flags2 bit this version knows
-const STATUS2_KNOWN: u8 = STATUS2_JOINING | STATUS2_OTHER_GROUP;
+const STATUS2_KNOWN: u8 =
+    STATUS2_JOINING | STATUS2_OTHER_GROUP | STATUS2_CLIPBOARD | STATUS2_NO_CLIPBOARD;
 
 /// Shortest new password the daemon accepts (characters; bytes if not UTF-8). Anyone holding the vault
 /// file and the keychain salts can guess the data password offline, so short
@@ -246,6 +258,8 @@ pub enum DaemonError {
     JoinRunning = 0x0D,
     /// ForgetPeer: no paired device has this fingerprint.
     UnknownPeer = 0x0E,
+    /// SetClipboard: this platform has no clipboard support yet.
+    ClipboardUnavailable = 0x0F,
 }
 
 impl DaemonError {
@@ -265,6 +279,7 @@ impl DaemonError {
             0x0C => Some(Self::AlreadyInGroup),
             0x0D => Some(Self::JoinRunning),
             0x0E => Some(Self::UnknownPeer),
+            0x0F => Some(Self::ClipboardUnavailable),
             _ => None,
         }
     }
@@ -300,6 +315,9 @@ impl fmt::Display for DaemonError {
             ),
             DaemonError::JoinRunning => write!(f, "a join is running already"),
             DaemonError::UnknownPeer => write!(f, "no paired device has that fingerprint"),
+            DaemonError::ClipboardUnavailable => {
+                write!(f, "clipboard sync isn't supported on this platform yet")
+            }
         }
     }
 }
@@ -349,6 +367,8 @@ pub enum Request {
     ForgetPeer([u8; FINGERPRINT_LEN]),
     /// Wipe this device back to fresh (it leaves its group).
     ResetDevice,
+    /// Turn clipboard sync on (`true`) or off; saved.
+    SetClipboard(bool),
 }
 
 /// The two group passwords for `JoinGroup`, each in its own exact-size
@@ -386,6 +406,10 @@ pub struct Status {
     /// The open "Add device" window found a device of another group (other
     /// salts): pairing with it can't work, it has to be reset and join.
     pub other_group_nearby: bool,
+    /// The clipboard sync switch is on (works while networking runs).
+    pub clipboard_enabled: bool,
+    /// This platform has no clipboard support yet.
+    pub clipboard_unavailable: bool,
 }
 
 /// A pairing waiting for the user (public data only: the handshake hash
@@ -400,6 +424,39 @@ pub struct PairingPrompt {
     pub code: PairingCode,
 }
 
+/// What the last connection with a paired device showed (one byte on the
+/// wire). Only a hint for the user: the handshake still decides trust.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
+#[repr(u8)]
+pub enum PeerState {
+    /// Not contacted since the daemon started or this device's keys changed.
+    #[default]
+    Unknown = 0x00,
+    /// The last connection authenticated.
+    Ok = 0x01,
+    /// The auth password differs: the password check failed on a
+    /// connection from or to the device's last address.
+    AuthPasswordDiffers = 0x02,
+    /// The data password differs: data from or to it failed the `d_key` layer.
+    DataPasswordDiffers = 0x03,
+    /// Its last address didn't answer.
+    Unreachable = 0x04,
+}
+
+impl PeerState {
+    /// The state byte; unknown values are `None`.
+    pub fn from_u8(byte: u8) -> Option<Self> {
+        match byte {
+            0x00 => Some(Self::Unknown),
+            0x01 => Some(Self::Ok),
+            0x02 => Some(Self::AuthPasswordDiffers),
+            0x03 => Some(Self::DataPasswordDiffers),
+            0x04 => Some(Self::Unreachable),
+            _ => None,
+        }
+    }
+}
+
 /// A paired device as shown to the user (public data only).
 #[derive(Debug, PartialEq, Clone)]
 pub struct PeerInfo {
@@ -407,6 +464,8 @@ pub struct PeerInfo {
     pub fingerprint: [u8; FINGERPRINT_LEN],
     /// Display name (at most 255 bytes of UTF-8).
     pub name: String,
+    /// What the last connection with it showed.
+    pub state: PeerState,
 }
 
 /// A successful answer from the daemon.
@@ -464,6 +523,9 @@ impl Request {
                 return Zeroizing::new(vec![REQ_SET_AUTO_LOGIN, u8::from(*on)]);
             }
             Request::SetSync(on) => return Zeroizing::new(vec![REQ_SET_SYNC, u8::from(*on)]),
+            Request::SetClipboard(on) => {
+                return Zeroizing::new(vec![REQ_SET_CLIPBOARD, u8::from(*on)]);
+            }
             Request::AddDevice => (REQ_ADD_DEVICE, None),
             Request::PendingPairing => (REQ_PENDING_PAIRING, None),
             Request::CancelJoin => (REQ_CANCEL_JOIN, None),
@@ -524,6 +586,7 @@ impl Request {
             REQ_UNLOCK => parse_password_update(payload).map(Request::Unlock),
             REQ_SET_AUTO_LOGIN => parse_flag(payload).map(Request::SetAutoLogin),
             REQ_SET_SYNC => parse_flag(payload).map(Request::SetSync),
+            REQ_SET_CLIPBOARD => parse_flag(payload).map(Request::SetClipboard),
             REQ_ADD_DEVICE if payload.is_empty() => Some(Request::AddDevice),
             REQ_PENDING_PAIRING if payload.is_empty() => Some(Request::PendingPairing),
             REQ_CANCEL_JOIN if payload.is_empty() => Some(Request::CancelJoin),
@@ -578,14 +641,16 @@ impl Response {
                     | u8::from(s.adding_device) << 7;
 
                 body.push(flags);
-                body.push(
-                    if s.joining { STATUS2_JOINING } else { 0 }
-                        | if s.other_group_nearby {
-                            STATUS2_OTHER_GROUP
-                        } else {
-                            0
-                        },
-                );
+                let flags2 = [
+                    (s.joining, STATUS2_JOINING),
+                    (s.other_group_nearby, STATUS2_OTHER_GROUP),
+                    (s.clipboard_enabled, STATUS2_CLIPBOARD),
+                    (s.clipboard_unavailable, STATUS2_NO_CLIPBOARD),
+                ]
+                .iter()
+                .filter(|(on, _)| *on)
+                .fold(0u8, |flags2, (_, bit)| flags2 | bit);
+                body.push(flags2);
                 body.extend_from_slice(&s.trusted_peers.to_le_bytes());
                 body.extend_from_slice(&s.unlock_wait_secs.to_le_bytes());
                 body.push(s.pending_pairings);
@@ -611,6 +676,7 @@ impl Response {
                     let name = short_name(&peer.name);
 
                     body.extend_from_slice(&peer.fingerprint);
+                    body.push(peer.state as u8);
                     body.push(u8::try_from(name.len()).unwrap_or(0));
                     body.extend_from_slice(name);
                 }
@@ -674,6 +740,8 @@ impl Response {
                     pending_pairings,
                     joining: flags2 & STATUS2_JOINING != 0,
                     other_group_nearby: flags2 & STATUS2_OTHER_GROUP != 0,
+                    clipboard_enabled: flags2 & STATUS2_CLIPBOARD != 0,
+                    clipboard_unavailable: flags2 & STATUS2_NO_CLIPBOARD != 0,
                 }))
             }
             Request::SetAuthPassword(_)
@@ -688,6 +756,7 @@ impl Response {
             | Request::StopAddDevice
             | Request::ForgetPeer(_)
             | Request::ResetDevice
+            | Request::SetClipboard(_)
                 if payload.is_empty() =>
             {
                 Ok(Response::Done)
@@ -703,7 +772,8 @@ impl Response {
             | Request::CancelJoin
             | Request::StopAddDevice
             | Request::ForgetPeer(_)
-            | Request::ResetDevice => Err(IpcErrors::Malformed),
+            | Request::ResetDevice
+            | Request::SetClipboard(_) => Err(IpcErrors::Malformed),
             Request::ListPeers => decode_peers(payload).ok_or(IpcErrors::Malformed),
             Request::PendingPairing => decode_pairing(payload).ok_or(IpcErrors::Malformed),
         }
@@ -723,12 +793,14 @@ fn decode_peers(payload: &[u8]) -> Option<Response> {
 
     for _ in 0..count {
         let (fingerprint, after) = rest.split_first_chunk::<FINGERPRINT_LEN>()?;
+        let (&state, after) = after.split_first()?;
         let (&name_len, after) = after.split_first()?;
         let name = after.get(..usize::from(name_len))?;
 
         peers.push(PeerInfo {
             fingerprint: *fingerprint,
             name: String::from_utf8(name.to_vec()).ok()?,
+            state: PeerState::from_u8(state)?,
         });
 
         rest = after.get(usize::from(name_len)..)?;
@@ -967,6 +1039,8 @@ mod tests {
             Request::SetAutoLogin(false),
             Request::SetSync(true),
             Request::SetSync(false),
+            Request::SetClipboard(true),
+            Request::SetClipboard(false),
             Request::AddDevice,
             Request::PendingPairing,
             Request::AnswerPairing {
@@ -1027,6 +1101,10 @@ mod tests {
         assert!(Request::decode(&[REQ_SET_SYNC]).is_none());
         assert!(Request::decode(&[REQ_SET_SYNC, 2]).is_none());
         assert!(Request::decode(&[REQ_SET_SYNC, 0, 0]).is_none());
+        // clipboard flag: exactly one byte, 0 or 1
+        assert!(Request::decode(&[REQ_SET_CLIPBOARD]).is_none());
+        assert!(Request::decode(&[REQ_SET_CLIPBOARD, 2]).is_none());
+        assert!(Request::decode(&[REQ_SET_CLIPBOARD, 1, 0]).is_none());
         // payload-less requests take no payload
         assert!(Request::decode(&[REQ_ADD_DEVICE, 0]).is_none());
         assert!(Request::decode(&[REQ_PENDING_PAIRING, 0]).is_none());
@@ -1102,6 +1180,7 @@ mod tests {
             DaemonError::AlreadyInGroup,
             DaemonError::JoinRunning,
             DaemonError::UnknownPeer,
+            DaemonError::ClipboardUnavailable,
         ] {
             assert_eq!(
                 Response::decode(&Request::Status, &Response::encode_error(e)),
@@ -1111,7 +1190,7 @@ mod tests {
 
         // unknown error codes are refused
         assert_eq!(
-            Response::decode(&Request::Status, &[RESP_ERR, 0x0F]),
+            Response::decode(&Request::Status, &[RESP_ERR, 0x10]),
             Err(IpcErrors::Malformed)
         );
 
@@ -1130,7 +1209,7 @@ mod tests {
             Response::decode(&Request::Status, &[RESP_OK, 0, 0, 0, 0, 0, 0, 0, 0]),
             Err(IpcErrors::Malformed)
         );
-        for flags2 in [0b100u8, 0x80] {
+        for flags2 in [0b1_0000u8, 0x80] {
             assert_eq!(
                 Response::decode(&Request::Status, &[RESP_OK, 0, flags2, 0, 0, 0, 0, 0, 0, 0]),
                 Err(IpcErrors::Malformed)
@@ -1140,6 +1219,14 @@ mod tests {
         assert!(matches!(joining, Ok(Response::Status(s)) if s.joining && !s.other_group_nearby));
         let other = Response::decode(&Request::Status, &[RESP_OK, 0, 2, 0, 0, 0, 0, 0, 0, 0]);
         assert!(matches!(other, Ok(Response::Status(s)) if s.other_group_nearby && !s.joining));
+        let clipboard = Response::decode(&Request::Status, &[RESP_OK, 0, 4, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(
+            matches!(clipboard, Ok(Response::Status(s)) if s.clipboard_enabled && !s.clipboard_unavailable)
+        );
+        let missing = Response::decode(&Request::Status, &[RESP_OK, 0, 8, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(
+            matches!(missing, Ok(Response::Status(s)) if s.clipboard_unavailable && !s.clipboard_enabled)
+        );
     }
 
     /// Test that the pairing answer round-trips and its decoding is strict
@@ -1233,6 +1320,8 @@ mod tests {
             pending_pairings: 3,
             joining: true,
             other_group_nearby: true,
+            clipboard_enabled: true,
+            clipboard_unavailable: true,
         });
         assert_eq!(
             Response::decode(&Request::Status, &status.encode()),
@@ -1251,15 +1340,40 @@ mod tests {
             PeerInfo {
                 fingerprint: [1; 8],
                 name: "laptop".into(),
+                state: PeerState::AuthPasswordDiffers,
             },
             PeerInfo {
                 fingerprint: [2; 8],
                 name: String::new(),
+                state: PeerState::Unknown,
             },
         ]);
         assert_eq!(
             Response::decode(&Request::ListPeers, &peers.encode()),
             Ok(peers)
+        );
+
+        // every state byte round-trips, an unknown one is refused
+        for state in [
+            PeerState::Unknown,
+            PeerState::Ok,
+            PeerState::AuthPasswordDiffers,
+            PeerState::DataPasswordDiffers,
+            PeerState::Unreachable,
+        ] {
+            assert_eq!(PeerState::from_u8(state as u8), Some(state));
+        }
+        let one = Response::Peers(vec![PeerInfo {
+            fingerprint: [3; 8],
+            name: "a".into(),
+            state: PeerState::Ok,
+        }]);
+        let mut unknown = one.encode();
+        // ok byte, count (2), fingerprint (8), then the state
+        unknown[1 + 2 + 8] = 0x05;
+        assert_eq!(
+            Response::decode(&Request::ListPeers, &unknown),
+            Err(IpcErrors::Malformed)
         );
     }
 
@@ -1269,6 +1383,7 @@ mod tests {
         let peers = Response::Peers(vec![PeerInfo {
             fingerprint: [0; 8],
             name: "ą".repeat(200),
+            state: PeerState::Ok,
         }]);
 
         let Ok(Response::Peers(decoded)) = Response::decode(&Request::ListPeers, &peers.encode())
@@ -1284,7 +1399,8 @@ mod tests {
         let peers = Response::Peers(vec![
             PeerInfo {
                 fingerprint: [9; 8],
-                name: "x".repeat(255)
+                name: "x".repeat(255),
+                state: PeerState::DataPasswordDiffers,
             };
             MAX_LISTED_PEERS
         ]);

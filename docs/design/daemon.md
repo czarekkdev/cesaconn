@@ -3,7 +3,7 @@
 This is the one design document for the daemon (`cesa_conn_networker`) and
 for everything security-related that it owns: keys, storage, the UI IPC,
 discovery, the `auth_snow` handshake, the transport, pairing, salt sync and
-the planned sync features. If code and this file disagree, one of them has a
+the sync features (clipboard sync today). If code and this file disagree, one of them has a
 bug: fix the code or fix this file in the same PR.
 
 It replaces `docs/design/salt-sync-and-clipboard.md`; all of that content
@@ -57,7 +57,9 @@ The daemon **does**:
 - run discovery, accept and open connections, authenticate peers with
   `auth_snow`, ask the user to confirm new devices, and hand a joining
   device the group's salts (sections 11, 13);
-- (planned) move sync data (section 12).
+- sync the clipboard between paired devices (section 12) and tell the UI
+  what connecting to each paired device showed, an incorrect password
+  above all (section 13.1).
 
 The daemon **never**:
 - sends a key, a salt or any key-derived secret to a UI;
@@ -153,6 +155,7 @@ Every secret, how it is made, where it lives and for how long.
 | Secret | Made from | Lives in | Lifetime |
 |---|---|---|---|
 | `pw1`, `pw2` | the user | UI input buffer, then the IPC frame buffers and `PasswordUpdate` on both ends (all `Zeroizing`) | UI: until sent; daemon: until Argon2 finishes; then wiped |
+| clipboard text (not a key, but often a password) | the user / a paired device | the OS clipboard; daemon RAM (`Zeroizing`) while it is read, sent or applied | daemon: one send or apply, then wiped |
 | `a_salt` (32 B) | OS RNG, daemon, first `SetAuthPassword` | daemon RAM; vault | for good |
 | `d_salt` (32 B) | OS RNG, daemon, first `SetDataPassword` | daemon RAM; keychain item `salts` | for good |
 | storage salt (32 B) | OS RNG, at vault creation | keychain item `salts` | for good |
@@ -196,7 +199,11 @@ Tasks while networking runs **[built]** (section 13):
   rounds with one task per outgoing connection, the salt query listener
   (section 11.4) and the window timer;
 - during a join (section 11): one task that searches, queries the salt,
-  derives and connects; the commit runs as its own task.
+  derives and connects; the commit runs as its own task;
+- the clipboard task (section 12, only where there is a clipboard): it
+  polls the clipboard, applies updates from paired devices, and starts one
+  send round at a time (one task per paired device);
+- a hello round (13.1) when networking starts and after a key change.
 
 Shutdown: Ctrl-C cancels a `CancellationToken`; the IPC server stops
 accepting, the daemon waits for it, stops networking (the bridge saves the
@@ -217,6 +224,8 @@ pub struct Daemon {
     adding: AtomicBool,                          // "Add device" window open
     join: RwLock<Option<JoinSlot>>,              // the running join (generation, token)
     guess_limiter: Arc<GuessLimiter>,            // one for the daemon's lifetime
+    peer_book: Arc<PeerBook>,                    // last address + state per paired device (13.1)
+    clipboard: Option<Arc<dyn Clipboard>>,       // the OS clipboard (12.7), None where unsupported
 }
 
 struct KeySlots {
@@ -275,7 +284,8 @@ stateDiagram-v2
 
 `Status` shows it: `auth_key_set`, `data_key_set`, `locked`, `saved`,
 `auto_login`, `sync_enabled`, `network_running`, `adding_device`,
-`joining`, `trusted_peers`, `unlock_wait_secs`, `pending_pairings`.
+`joining`, `trusted_peers`, `unlock_wait_secs`, `pending_pairings`,
+`clipboard_enabled`, `clipboard_unavailable`.
 
 Setting both passwords on a fresh device creates a new group (the daemon
 makes both salts); `JoinGroup` joins an existing one (section 11).
@@ -361,7 +371,15 @@ already set. The old password is **not** required (his decision).
   (a stale key must not stay behind).
 
 Until group rotation exists (section 14), a local password change once peers
-exist breaks the group. **[planned]**: refuse or warn in that case (18.13).
+exist breaks pairing with the devices that still have the old password.
+His decision: the change is allowed, and the mismatch is **shown as
+"incorrect password"** when the devices connect (section 13.1) **[built]**:
+- right after the change the daemon sends a hello to every paired device,
+  so both sides show it at once, not only at the next clipboard copy;
+- the TUI also says, when the change succeeds and devices are paired, that
+  they still have the old password and must get the same new one;
+- setting the same password on the other device (or back on this one)
+  makes both show the device as fine again with the next hello.
 
 ### 6.6 Automatic login **[built]**
 
@@ -431,7 +449,7 @@ Frames that carry a request are read into `Zeroizing` buffers (a request may
 hold a password). Compile-time asserts keep the largest request and the
 largest `ListPeers` answer under `MAX_FRAME_LEN`.
 
-### 7.4 Wire format, version 7 **[built]**
+### 7.4 Wire format, version 8 **[built]**
 
 ```
 frame    = length (u32 LE, 1..=MAX_FRAME_LEN) || body
@@ -443,7 +461,7 @@ response = 0x00 || payload        (success)
 | Kind | Request | Payload | Success payload |
 |---|---|---|---|
 | `0x01` | Status | none | `flags (1) \|\| flags2 (1) \|\| trusted peers (u32 LE) \|\| unlock wait (u16 LE, seconds) \|\| pending pairings (u8)` |
-| `0x04` | ListPeers | none | `count (u16 LE) \|\| count * (fingerprint (8) \|\| name len (1) \|\| name)` |
+| `0x04` | ListPeers | none | `count (u16 LE) \|\| count * (fingerprint (8) \|\| state (1) \|\| name len (1) \|\| name)` |
 | `0x05` | SetAuthPassword | `password` | empty |
 | `0x06` | SetDataPassword | `password` | empty |
 | `0x07` | Unlock | `password` (the data password) | empty |
@@ -457,13 +475,15 @@ response = 0x00 || payload        (success)
 | `0x0F` | StopAddDevice | none | empty (also when no window is open) |
 | `0x10` | ForgetPeer | `fingerprint (8)`, exactly | empty (14.1) |
 | `0x11` | ResetDevice | exactly the 8 bytes `CN-RESET` | empty (14.2) |
+| `0x12` | SetClipboard | exactly `0x00` or `0x01` | empty (12.1) |
 | `0x02`, `0x03` | retired (v1 sent `salt \|\| password`) | refused, so a mismatched UI and daemon fail loudly | |
 
 Status flags: bit 0 auth key set, 1 data key set, 2 network running, 3 vault
 locked, 4 keys saved, 5 automatic login, 6 Sync switched on, 7 "Add device"
 window open. Flags2: bit 0 joining a group, bit 1 the open "Add device" window found a
-device of another group (13), every other bit must be 0 (so a version 5
-UI refuses a version 6 status loudly).
+device of another group (13), bit 2 clipboard sync switched on, bit 3 this
+platform has no clipboard support (12.7), every other bit must be 0 (so an
+older UI refuses a newer status loudly).
 Unlock wait: seconds until `Unlock` is accepted again (0 = now). Pending
 pairings: how many wait for the user; the UI asks `PendingPairing` only
 then. Versions 2 to 4 had shorter status answers; they are `Malformed`, so a
@@ -480,7 +500,10 @@ a terminal).
 
 A fingerprint is the first 8 bytes of the peer's X25519 static public key,
 for telling devices apart in the UI; it is not a security check. Names are cut
-to 255 bytes on a char boundary.
+to 255 bytes on a char boundary. The state byte is what the last connection
+with the device showed (13.1): `0x00` not contacted yet, `0x01` fine,
+`0x02` the auth password differs, `0x03` the data password differs, `0x04`
+not reachable at its last address; the decoder refuses anything else.
 
 Error codes: `0x01` BadRequest, `0x02` KeyDerivationFailed, `0x03` Internal,
 `0x04` WrongPassword, `0x05` Locked, `0x06` StorageFailed, `0x07` NotSaved,
@@ -489,12 +512,16 @@ while networking doesn't run), `0x0B` PairingExpired (no waiting pairing has
 that id and code: answered already, timed out, or a different pairing),
 `0x0C` AlreadyInGroup (JoinGroup on a device with keys, a vault or a lock),
 `0x0D` JoinRunning (JoinGroup while a join runs), `0x0E` UnknownPeer
-(ForgetPeer: no paired device has that fingerprint).
+(ForgetPeer: no paired device has that fingerprint), `0x0F`
+ClipboardUnavailable (SetClipboard on on a platform without clipboard
+support).
 
 `ResetDevice` carries fixed confirm bytes so that nothing sent by mistake
 (a wrong kind byte, a UI bug) decodes as a reset; the user's confirmation
-itself is in the UI (typing `RESET`, 7.5). Version 7 only adds requests and
-an error code: a version 6 daemon answers the new requests with `BadRequest`.
+itself is in the UI (typing `RESET`, 7.5). Version 7 only added requests and
+an error code. Version 8 adds `SetClipboard`, two status bits, an error
+code and the state byte in `ListPeers`: a version 7 UI fails on the peer
+list loudly (`Malformed`), as intended.
 
 An answer names the id **and the code** the user saw. Ids start at 0 again
 when the daemon restarts, so an id alone could land on a newer pairing that
@@ -525,7 +552,8 @@ the request they answer.
 
 The command set grows with the UI; it is not designed up front (his
 decision). Planned additions are listed where they are designed: section 11.7
-(groups). The sync switch and the pairing prompt (section 13) are built.
+(groups). The sync switch and the pairing prompt (section 13) and the
+clipboard switch (12) are built.
 
 ---
 
@@ -571,9 +599,15 @@ data nonce (12) || AES-256-GCM(DEK, plaintext) (n*4096 + 16)  AAD = header || "c
   once and in this order, nothing after:
   `0x01 a_key (32)`, `0x02 a_salt (32)`, `0x03 config (<= 64 KiB)`,
   `0x04 identity seed (64)`, `0x05 peers (<= 1 MiB)`.
-- config: `version 0x01 (1) || flags (1)`, flag bit 0 = Sync; every other
-  bit must be 0. Empty = all defaults (vaults written before there were
-  settings). Anything else is damaged (`StorageFailed` on unlock).
+- config, version 2: `version 0x02 (1) || flags (1) || addresses`, flag
+  bit 0 = Sync, bit 1 = clipboard sync; every other bit must be 0.
+  `addresses` are the paired devices' last addresses (13.1):
+  `count (u16 LE, <= 256) || count * (x25519 key (32) || family (1: 4 or 6)
+  || ip (4 or 16) || port (u16 LE))`, exact length, no duplicate keys, only
+  devices in the peer list are written. Version 1 (`0x01 || flags`, Sync
+  only) is still read and written back as version 2 with the next save.
+  Empty = all defaults (vaults written before there were settings).
+  Anything else is damaged (`StorageFailed` on unlock).
 - peers: `count (u16 LE) || count * (x25519 pub (32) || ML-DSA-87 vk (2592) ||
   name len (u8) || name)`, at most 256 peers, names at most 255 bytes with no
   control characters (no terminal escapes in the TUI), no duplicate keys,
@@ -928,11 +962,24 @@ authenticating, so it doesn't pair just to fail afterwards.
 | Default | `0x00` | unknown values fall back to it, so newer peers stay compatible |
 | Debug | `0x01` | test only |
 | ConnectNewDevice | `0x02` | none: pairing happens in auth, the header has length 0 |
-| ClipboardSync | `0x03` | section 12 **[planned]** |
+| ClipboardSync | `0x03` | section 12 **[built]**: the update through the `d_key` layer, answered |
 | GroupSalt | `0x04` | section 11.5 **[built]**: header length 0; the member answers `d_salt (32)` through Noise |
+| Hello | `0x05` | 13.1 **[built]**: `"CESAHELO"` (8) through the `d_key` layer, answered |
 
-Today a received packet is logged and dropped; handing it to an action handler
-comes with the first sync feature.
+**Answered data** (`Hello`, `ClipboardSync`): the sender authenticates with
+a pairing channel that refuses everything (a sync connection never pairs and
+never prompts; a device that forgot us gets nothing), sends the header and
+the payload, and then reads **one answer byte through Noise only** (not the
+`d_key` layer, so a wrong `d_key` can still be answered): `0x00` applied,
+`0x01` ignored (switch off, older update, no clipboard there), `0x02` the
+payload failed the `d_key` layer, i.e. the data passwords differ. The
+receiver checks the declared length before allocating: a hello exactly
+`8 + 28`, a clipboard update `22 + 1 + 28 ..= 22 + CLIP_MAX_LEN + 28`.
+A clipboard update goes to the daemon's inbox (8 waiting at most, more are
+`ignored` at once), which answers within 2 s or it counts as `ignored`.
+An older build sends no answer: the sender's read fails, nothing else.
+
+Other received packets (`Debug`, `Default`) are logged and dropped.
 
 ### 10.11 Wire tags (last plaintext byte) **[built]**
 
@@ -1123,18 +1170,29 @@ manual test (17).
 
 ---
 
-## 12. Clipboard sync (v1) **[planned; access and delivery deferred]**
+## 12. Clipboard sync (v1) **[built on macOS]**
 
-### 12.1 Scope
+His decision (2026-10-31): clipboard sync is the first sync feature. The
+access and delivery choices that were open are made below and listed as
+proposals for his review in 19.
 
-Text only (UTF-8), up to `CLIP_MAX_LEN` (proposal 1 MiB). Images and files come
-with folder sync. Off by default; when on, per peer, two flags: *send to* and
-*accept from*.
+### 12.1 Scope and switch
+
+Text only (UTF-8), 1 ..= `CLIP_MAX_LEN` = 1 MiB. Images and files come
+with folder sync. **Off by default**: one switch, Settings > "Clipboard
+sync" (`SetClipboard`, saved in the vault config, flag bit 1; `Locked` /
+`NotSaved` without an open vault, `ClipboardUnavailable` on a platform
+without clipboard support). It works while networking runs (Sync on). On:
+this device sends its new clipboard text to every paired device and applies
+updates from paired devices. Off: nothing is read, nothing is applied
+(updates are answered `ignored`). A joined device starts with it off.
+Per-device "send to" / "accept from" flags (the earlier plan) are not
+built: every paired device takes part (proposal, 19).
 
 ### 12.2 Message
 
-Over the normal path (section 10.10) with `ActionType::ClipboardSync = 0x03`.
-Payload, inside the `d_key` layer:
+Over the answered-data path (10.10) with `ActionType::ClipboardSync = 0x03`.
+Payload, inside the `d_key` layer (`clip_sync`):
 
 ```
 version     (1)  = 0x01
@@ -1147,56 +1205,91 @@ content     (content_len)
 
 The origin device is not in the payload: the receiver knows the authenticated peer.
 
-Receiver checks, in order, each failure dropping the message with one uniform error:
-1. the peer may send ("accept from");
-2. header length <= `22 + CLIP_MAX_LEN + DATA_LAYER_OVERHEAD`, before allocating;
-3. known version and kind;
-4. `content_len` matches exactly;
-5. valid UTF-8;
+Receiver checks, in order; a failure means the update is `ignored`
+(or the connection is closed, for the first two):
+1. it is a paired device (the handshake; the sender's connection never
+   pairs);
+2. the declared length is within `22 + 1 + 28 ..= 22 + CLIP_MAX_LEN + 28`,
+   before allocating;
+3. the `d_key` layer opens it (otherwise: answer `0x02`, the data
+   passwords differ, 13.1);
+4. the switch is on here;
+5. known version and kind, `content_len` matches exactly, valid UTF-8;
 6. ordering per peer: a new `epoch` resets that peer's counter and is
-   accepted; in the same epoch `origin_seq` must grow. (A plain counter would
-   restart at 0 after a sender restart and be dropped forever.) Replay across
-   connections is already impossible: keys are per connection, Noise has nonces.
+   accepted; in the same epoch `origin_seq` must grow (a plain counter would
+   restart at 0 after a sender restart and be dropped forever). The memory
+   is bounded (256 peers). Replay across connections is already impossible:
+   keys are per connection, Noise has nonces.
 
-Ack (proposal): one encrypted byte back, `0x00` applied, `0x01` ignored.
+Then the text is written to the OS clipboard and the answer is `0x00`.
 
 ### 12.3 Loops, ordering, concurrency
 
-- Echo loop: applying a remote clipboard fires the local listener. The daemon
-  keeps `last_applied = keyed BLAKE2s(local_secret, content)` with a per-run
-  key in `Zeroizing` memory and doesn't send a matching local change. Keyed, so
-  a leaked hash can't be brute-forced back into clipboard contents (passwords
-  end up there).
+- The clipboard's change counter (`NSPasteboard.changeCount`, which reads
+  no content) is polled every 300 ms (`CLIP_POLL_MS`). A change is sent once
+  the counter held still for one more poll, so fast repeated copies send
+  only the last one (300 to 600 ms after the copy).
+- **Echo loop**: writing an update moves the counter too. The counter of
+  our own write (returned by `clearContents`) is taken as seen, so an
+  applied update is never sent back. This replaces the planned keyed
+  BLAKE2s of the last applied content: no hash of clipboard content exists
+  at all (proposal, 19).
+- One send round at a time: a copy made while a round runs is sent when
+  it ends (only the newest). A round sends to every paired device with a
+  known address that isn't paused (13.1), all at once, each bounded by
+  `SEND_DEADLINE` = 20 + 3 * 5 s; it ends with networking.
 - Across senders, latest arrival wins; no vector clocks in v1.
-- Debounce ~300 ms; send only the latest value.
+- Turning the switch on doesn't send what is on the clipboard already;
+  only the next copy goes.
 
 ### 12.4 Never synced
 
 Content with password-manager markers is never read into memory and never
-sent: macOS `org.nspasteboard.ConcealedType` / `TransientType`; Windows (later)
-`ExcludeClipboardContentFromMonitorProcessing`; KDE/Wayland
-`x-kde-passwordManagerHint`.
+sent: the pasteboard's types are checked first (types only, no content),
+and `org.nspasteboard.ConcealedType` or `org.nspasteboard.TransientType`
+(nspasteboard.org) means nothing is read. Windows (later):
+`ExcludeClipboardContentFromMonitorProcessing`; KDE/Wayland (later):
+`x-kde-passwordManagerHint`. Text over 1 MiB isn't read either.
 
 ### 12.5 Memory and logging
 
-Content only in `Zeroizing<Vec<u8>>`, pre-sized from `content_len`, wiped
-right after sending or applying. Logs show lengths, peers and seq numbers,
-never content or its hash.
+Content only in `Zeroizing` buffers (`String` / `Vec<u8>`), pre-sized,
+wiped right after sending or applying; one encoded copy is shared by the
+sends of a round (`Arc`) and wiped when the last one ends. The OS keeps
+its own copy (that is what a clipboard is), and the `NSString` objects are
+released by the OS, not wiped. Logs show lengths, peers and sequence
+numbers, never content or anything derived from it.
 
-### 12.6 Delivery **[open: deferred]**
+### 12.6 Delivery **[built: one connection per update]**
 
-v1: one connection per update to each reachable trusted peer allowed to
-receive, full handshake each time (hence the debounce); peers found through
-discovery. Later: one persistent session per peer, to avoid a full
-ML-KEM/ML-DSA handshake per copy.
+One connection per update to each paired device, full handshake each time
+(hence the debounce), never pairing. **Where to connect**: each paired
+device's last address (13.1), learned only from authenticated connections
+and saved (encrypted) in the vault, so it survives restarts. Discovery is
+not used for sync (it runs only during "Add device", his decision, and
+connecting to every announcer would burn guess-limiter slots of strangers'
+devices). A device paired before addresses existed is reached after one
+"Add device" re-pairing search (open on both devices at the same time), or
+once it connects to us. Later: one persistent session per peer, to avoid
+a full ML-KEM/ML-DSA handshake per copy.
 
-### 12.7 Clipboard access **[open: deferred]**
+### 12.7 Clipboard access **[built: own module, macOS]**
 
-(a) the `arboard` crate: one dependency for all platforms, needs an audit and
-doesn't expose the concealed markers everywhere; (b) own platform modules: no
-dependency, more code, and on macOS likely `unsafe` (`objc2-app-kit`), which
-clashes with `forbid(unsafe_code)`. Proposal: (a) plus our own marker check,
-decided after an audit.
+`cesa_conn_system::clipboard`: a `Clipboard` trait (change counter, read
+text up to a limit unless concealed, write text) so tests use memory, and
+a macOS implementation on the general `NSPasteboard` through `objc2` /
+`objc2-app-kit` / `objc2-foundation` (only the `NSPasteboard`, `NSString`,
+`NSArray`, `NSEnumerator` features). Every call it makes is a safe binding,
+so the crate keeps `forbid(unsafe_code)`; the one framework constant that
+would need `unsafe` (`NSPasteboardTypeString`, an extern static) is spelled
+out as its UTI `public.utf8-plain-text`. Every call takes the pasteboard
+fresh inside its own autorelease pool and runs in `spawn_blocking`.
+
+Why not `arboard` (the other option): it can't read the pasteboard types,
+so it can't skip concealed content (12.4), and it brings its own `unsafe`
+Objective-C calls and more dependencies. Linux and Windows: no clipboard
+module yet; `Status.clipboard_unavailable` says so and the TUI shows the
+switch as "not supported on this platform yet".
 
 ---
 
@@ -1292,13 +1385,68 @@ prompt), Sync off with a pairing waiting, the prompt cap, the key update
 reaching the network, the Sync switch surviving restarts and automatic
 login.
 
+### 13.1 Connection state and "incorrect password" **[built]**
+
+His request (2026-10-31): after a password change on one device, the
+devices must say **"incorrect password"** when they connect, instead of
+failing silently. The daemon keeps a small book per paired device
+(`peer_book`): its last address, what the last connection showed, and a
+pause.
+
+**Addresses** are learned only from authenticated connections: the address
+we connected to when the device there authenticated, or the source IP of a
+paired device that authenticated to us, with the fixed port 3232 (its own
+port is random). They are saved in the vault config (8.3) when they change,
+so sync and the hello reach the devices after a restart.
+
+**States** (`ListPeers` state byte, 7.4):
+
+| State | Set when |
+|---|---|
+| not contacted yet | daemon start, or this device's keys changed |
+| fine | a connection authenticated (and, after a data mismatch, data went through again) |
+| incorrect password (auth) | the password check (SPAKE2 confirmation) failed on a connection to or from the device's last address |
+| incorrect password (data) | data from it failed our `d_key` layer, or it answered that ours failed its |
+| not reachable | its last address didn't accept the connection |
+
+The auth case can't be tied to a device by the handshake: SPAKE2 fails
+before anyone is identified. So it is tied by **address**: a failed
+confirmation from or to the address a paired device was last seen at marks
+that device. On the client side it is the confirmation step failing
+(`FailedToConfirmMutualAuthSpake2`: an honest server hangs up right there
+when our value is wrong) or the server's wrong value; the error is
+`WrongPassword`. On the server side it is the client's wrong value. Both
+also count as guesses (9.4), as before.
+
+**The hello** (`ActionType::Hello`, 10.10): when networking starts and right
+after every key change, the daemon sends `"CESAHELO"` through the `d_key`
+layer to every paired device at its last address. The answer shows both
+passwords at once: a failed password check is the auth case on both sides,
+answer `0x02` the data case on both sides, `0x00` fine. It also tells the
+other side where we are now.
+
+**Pause**: after a password mismatch found by connecting *to* the device,
+sync leaves it alone for `PASSWORD_RETRY` = 5 min (every try costs both
+sides a guess-limiter slot). A connection that authenticates ends an auth
+pause, data that goes through ends a data pause, and a key change here
+ends both (the next hello asks again at once). A failure *from* someone connecting to us only marks the state,
+never pauses: anyone can connect from some address and fail on purpose.
+"Not reachable" doesn't pause either.
+
+**In the TUI**: the Devices list colours each device by its state, the
+details show it in words ("incorrect password (auth password differs)"),
+and the log says it once when a device starts showing it: "*name*:
+incorrect password. The auth password differs between this device and it:
+set the same one on both".
+
 ---
 
 ## 14. Rotation, revocation, reset
 
 - **Group password rotation** **[open]**: a password change means new salts
-  and keys, re-distributed to the remaining devices. Until it exists, refuse
-  or warn on a local change once peers exist.
+  and keys, re-distributed to the remaining devices. Until it exists, a local
+  change is allowed and the devices show "incorrect password" for each
+  other until they have the same password again (6.5, 13.1, his decision).
 - **Trusted-peer sync and revocation** **[open]**: needs a protocol design he
   reviews first. A revocation is a new group without the revoked device.
 
@@ -1352,8 +1500,8 @@ it started with and refuses after a reset.
 
 | Platform | IPC | Storage | Notes |
 |---|---|---|---|
-| macOS | Unix socket, uid + code-signature gates | login keychain + vault | data-protection keychain and signature gates need release signing |
-| Linux | Unix socket in `$XDG_RUNTIME_DIR`, uid gate (no OS code signing) | RAM only | Secret Service backend needs a dependency decision **[open]** |
+| macOS | Unix socket, uid + code-signature gates | login keychain + vault | data-protection keychain and signature gates need release signing; clipboard sync through `NSPasteboard` (12.7) |
+| Linux | Unix socket in `$XDG_RUNTIME_DIR`, uid gate (no OS code signing) | RAM only | Secret Service backend needs a dependency decision **[open]**; no clipboard module yet (and no networking without storage) |
 | Windows | not supported: the daemon logs an error and exits | none | named pipe with a user-only DACL is possible, but the peer and owner checks need unsafe Win32 calls; options: an audited unsafe module, a wrapper crate, or defer **[open]** |
 
 ---
@@ -1362,7 +1510,7 @@ it started with and refuses after a reset.
 
 - Never logged: passwords, keys, salts, seeds, handshake hashes, clipboard or
   file content or its hash. Lengths, peer addresses, peer names, sequence
-  numbers and error kinds are fine.
+  numbers, answer bytes and error kinds are fine.
 - The UI gets one error byte (7.4); details stay in the daemon log
   (`storage_error` logs the vault error and answers `StorageFailed`).
 - A wrong password and a damaged vault are different errors on purpose, so a
@@ -1392,7 +1540,20 @@ Tests (`cargo test --workspace --all-features`):
   (everything wiped while running and while locked, a restart finds nothing,
   a failed vault delete changes nothing, a failed keychain delete and the
   second reset, a late handshake into the old list, a join from before the
-  reset never committing) (14.1, 14.2);
+  reset never committing) (14.1, 14.2); paired devices knowing each
+  other's address, which survives a restart; an auth or data password
+  changed on one device shown as "incorrect password" on **both** right
+  after the change, and fine again once it matches; a device that went away
+  shown as not reachable; clipboard sync end to end between two daemons
+  (off by default, both directions, no echo back, concealed content never
+  sent, switched off = not applied, the switch saved); the switch's
+  refusals (no clipboard, no vault, locked); applying only well-formed,
+  newer updates with the switch on (12, 13.1);
+- clipboard: the message format strict both ways and on random input, the
+  ordering per peer and its memory bound; the peer book (addresses only from
+  authenticated connections, the pause only for connections we made, the
+  saved form strict, bounded); the real macOS clipboard round trip (an
+  ignored test, run by hand: it replaces the clipboard);
 - salt query: exact answer, junk refused, per-source rate limit and its
   memory bound, nothing after the window;
 - `auth_snow` / networker: end-to-end localhost handshakes, first pairing,
@@ -1400,7 +1561,11 @@ Tests (`cargo test --workspace --all-features`):
   forget, swapped ML-DSA key, wrong `a_key`, a different `a_salt`, rejected
   pairing, `GroupSalt` only on a pairing connection during a window, handshake deadline and silent peers, chunking,
   the data layer (wrong `d_key`, keys bound to direction and connection),
-  size limits, the connection cap, lockouts on both sides;
+  size limits, the connection cap, lockouts on both sides; hellos and
+  clipboard updates answered (addresses learned on both sides, a different
+  `d_key` or `a_key` marked on both sides, a sync connection never pairing,
+  the update reaching the daemon's inbox, `ignored` without one, sizes
+  bounded on both ends);
 - IPC: framing bounds, strict decoding, decoders on random input, peer gates
   and code requirements over real sockets, socket permissions, stale and
   foreign socket files;
@@ -1416,7 +1581,14 @@ broadcast; allow incoming connections, or open UDP 3636 and TCP 3232 / 3233):
 2. device B (fresh): daemon + TUI, Devices > `n`, the same two passwords;
 3. both show the same 8 emoji with names: `y` on both. B ends up with saved
    keys, Sync on and A as a paired device;
-4. restart B's daemon and unlock: A and B reconnect without a prompt.
+4. restart B's daemon and unlock: A and B reconnect without a prompt;
+5. Settings > Clipboard sync on both. Copy text on A: it is on B's
+   clipboard within a second, and the other way round. Copy a password from
+   a password manager (concealed): it stays on A;
+6. on B only, change the auth password: both Devices tabs show the other as
+   "incorrect password (auth password differs)" within seconds. Set the
+   same password on A: both show it as fine again. Same with the data
+   password.
 
 Low-level test (`--features test-commands`, never in release builds):
 `servertest <pw>` prints fresh random salts and listens on 3232;
@@ -1497,11 +1669,42 @@ Stated plainly so nobody relies on a property that isn't there.
     gives no offline test of pw1, but it is a stable group identifier.
 13. **No password rotation yet** (14): changing a password on one member
     changes its key but not the others', so that device stops pairing with
-    the group until the others change too.
+    the group until the others change too. Both sides show it as
+    "incorrect password" (13.1), so it is no longer silent.
 14. **Forgetting is not revoking** (14.1): a forgotten device still knows the
     group passwords and can ask to pair again in any "Add device" window; only
     the user's `n` keeps it out. A reset (14.2) only wipes this device: the
     others keep trusting it until they forget it.
+15. **"Incorrect password" is tied to a device by address** (13.1), because
+    SPAKE2 fails before anyone is identified. So it is a hint, not a proof:
+    someone on the LAN who connects from a paired device's last address
+    (that device is off, or shares the address) can make it show
+    "incorrect password (auth)"; that never pauses sync. A paired device's
+    old address now used by a device of *another* group shows the same
+    after we connect there, and pauses sync to it for 5 min; "Add device"
+    or the device connecting to us puts the right address back.
+16. **Addresses are hints and can go stale**: if both devices get new
+    addresses while one is off, neither finds the other until "Add device"
+    runs on both (or one connects to the other's new address). Devices
+    paired before this version start without addresses (the same applies).
+    IPv6 link-local addresses lose their scope id and don't work as saved
+    addresses.
+17. **Every paired device gets the clipboard** (12.1): no per-device choice
+    yet. A device paired by mistake (the user accepted the code) gets every
+    copied text while the switch is on.
+18. **The hello sends `d_key`-layer data to every paired device** at start
+    and after every key change, and its answer says whether a `d_key` layer
+    opened. Both only matter for a paired device that also has `d_salt`
+    (18.3): it could test `pw2` guesses offline against the hello, or one
+    per connection online through the answer. That is the same exposure as
+    18.3 (any `d_key` data it receives allows the offline test), now without
+    the user sending anything.
+19. **The OS clipboard isn't private**: other apps of the user can read what
+    is synced to it (3.3), and the OS keeps copies we can't wipe (12.5).
+    Apple announced alerts for apps that read the pasteboard without a
+    paste action (macOS pasteboard privacy, preview since 15.4): if it
+    becomes the default, the daemon will need the user's "always allow",
+    or sending stops working. Receiving (writing) is not affected.
 
 ---
 
@@ -1533,6 +1736,28 @@ Decided:
 - Argon2id pinned (v0x13, 64 MiB, t = 3, p = 1).
 - Minimum new password length 12 characters.
 - Forget and reset are local (14.1, 14.2); revocation waits for rotation.
+- (2026-10-31) A password changed on one device is shown as "incorrect
+  password" when the devices connect (6.5, 13.1), instead of a warning or
+  refusal before the change.
+- (2026-10-31) Clipboard sync is the first sync feature (12).
+
+Proposed in the clipboard PR, for his review:
+- clipboard access with our own macOS module on `objc2` safe bindings, not
+  `arboard` (12.7);
+- delivery: one connection per update, to each paired device at its last
+  address; addresses learned from authenticated connections and saved in the
+  vault config (version 2) (12.6, 13.1);
+- one clipboard switch for all paired devices, off by default, also after
+  a join; no per-device flags yet (12.1);
+- echo suppression by the clipboard's change counter instead of a keyed
+  hash of the content (12.3); polling every 300 ms, sent once it held
+  still for one more poll;
+- 1 MiB of text at most (12.1);
+- the one-byte answer through Noise (`applied` / `ignored` / data
+  passwords differ) (10.10);
+- the hello at start and after every key change (13.1);
+- the 5 min pause after a mismatch found by connecting, none for one found
+  by being connected to (13.1).
 
 Proposed in the forget/reset PR, for his review:
 - a reset needs no password, works while locked and is confirmed by typing
@@ -1551,7 +1776,8 @@ Proposed in the salt-sync PR, for his review:
 - the member searches for the whole window, not only its first 20 s (13).
 
 Open:
-- clipboard access (`arboard` vs own code) and delivery model: deferred;
+- clipboard on Linux / Windows; per-device clipboard flags; a persistent
+  session per peer instead of one handshake per copy;
 - Linux keychain backend;
 - release signing (Developer ID) for the signature gates and the
   data-protection keychain;
@@ -1578,9 +1804,10 @@ Built in the salt-sync PR (stacked on the networking PR): groups and joining
 
 Next, one stacked PR each, every failure path tested:
 1. group rotation, trusted-peer sync and revocation (section 14, after his
-   protocol review); until then a local password change once peers exist
-   should warn or be refused;
-2. clipboard v1 (section 12, after the access and delivery decisions).
+   protocol review);
+2. clipboard on Linux / Windows, per-device flags, persistent sessions.
 
 Built since: forgetting a device and resetting this device (14.1, 14.2,
-IPC version 7).
+IPC version 7); clipboard sync v1 on macOS and the "incorrect password"
+state per paired device with the hello (12, 13.1, IPC version 8, vault
+config version 2).

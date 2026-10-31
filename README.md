@@ -71,8 +71,8 @@ CesaConn is designed with privacy as a core principle, not an afterthought:
 
 ## Status / try it
 
-CesaConn is in development; nothing syncs data yet. What works today
-(macOS; Linux and Windows don't keep keys yet, see `docs/design/daemon.md`):
+CesaConn is in development. What works today (macOS; Linux and Windows
+don't keep keys or read the clipboard yet, see `docs/design/daemon.md`):
 
 - the daemon keeps both keys in an encrypted vault: after a restart the UI
   asks for the data password right away (or turn on the optional automatic
@@ -81,7 +81,12 @@ CesaConn is in development; nothing syncs data yet. What works today
   (SPAKE2 + post-quantum hybrid key exchange + Noise) and pair once after
   you compare an 8-emoji code on both screens;
 - a new device joins your group with the two passwords and gets the group's
-  salts from a device that has "Add device" open.
+  salts from a device that has "Add device" open;
+- **clipboard sync** (text, off by default): copy on one device, paste on
+  the others. Text a password manager marks as concealed is never synced;
+- if two paired devices have different passwords (you changed one on one
+  device only), both show **incorrect password** for each other on the
+  Devices tab and in the log.
 
 Run it (one terminal for the daemon, one for the UI):
 
@@ -101,6 +106,16 @@ Set the passwords on the **first device only**. A device where you set them
 yourself starts its own group and can't pair with the others; Add device
 then says "a device nearby is in a different group". Reset that device
 (Settings > **Reset this device**, type `RESET`) and press `n` there to join.
+
+Clipboard sync: Settings > **Clipboard sync** on, on every device that
+should take part (Sync must be on too). Copied text then goes to every
+paired device within a second. A device paired before this version doesn't
+know the others' addresses yet: open Add device (`n`) on both at the same
+time once. From then on they find each other by themselves, as long as one
+of the two keeps its network address between restarts.
+
+Changing a password: set the same new password on every device. Until you
+have, the devices that still use the old one show "incorrect password".
 
 Managing devices:
 

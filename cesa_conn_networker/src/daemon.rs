@@ -22,16 +22,22 @@ data-protection keychain (WhenUnlockedThisDeviceOnly) together with release sign
 //! the daemon listens for paired devices. New devices are only paired from
 //! the "Add device" window, and only after the user compared the pairing
 //! code (`PendingPairing` / `AnswerPairing` over IPC).
+//!
+//! Clipboard sync (off by default, its own switch): while networking runs,
+//! a new clipboard text goes to every paired device at its last address,
+//! and updates from paired devices are applied (daemon.md 12). What the
+//! connections show (an incorrect password, unreachable) is kept per device
+//! for the UI (`peer_book`).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{RwLock, Semaphore, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, sleep, timeout};
 use tokio_util::sync::CancellationToken;
@@ -40,9 +46,10 @@ use zeroize::Zeroizing;
 
 use cesa_conn_crypto::{crand::random_array, pswd_manager::derive_key};
 use cesa_conn_system::{
+    clipboard::{ClipRead, Clipboard},
     ipc::{
         DaemonError, FINGERPRINT_LEN, JoinPasswords, MAX_LISTED_PEERS, MIN_NEW_PASSWORD_LEN,
-        PairingPrompt, PasswordUpdate, PeerInfo, Request, Response, Status, socket_path,
+        PairingPrompt, PasswordUpdate, PeerInfo, PeerState, Request, Response, Status, socket_path,
     },
     keychain::{Item, OsKeychain, SecretStore},
     pairing_code::PairingCode,
@@ -50,13 +57,19 @@ use cesa_conn_system::{
 
 use crate::{
     auth_snow::{
-        AuthKey, DataKey, DeviceKeypairs, IDENTITY_SEED_LEN, Keys, MAX_PENDING_PAIRINGS, Pairing,
-        PairingInbox, PairingRequest, TIMEOUT, TrustedPeer, decode_peers, encode_peers,
+        AuthKey, DataKey, DeviceKeypairs, HANDSHAKE_DEADLINE, IDENTITY_SEED_LEN, Keys,
+        MAX_PENDING_PAIRINGS, Pairing, PairingInbox, PairingRequest, TIMEOUT, TrustedPeer,
+        decode_peers, encode_peers,
     },
+    clip_sync::{self, CLIP_MAX_LEN, DataAck},
     guess_limiter::GuessLimiter,
     ipc_server::{self, ClientPolicy},
+    peer_book::PeerBook,
     salt_service::{SALT_PORT, query_salt, serve_salt},
-    tcp_networker::{self, ActionType, NetworkerContext, SaltOffer, TCP_PORT, TcpNetworkerErrors},
+    tcp_networker::{
+        self, ActionType, ClipDelivery, HELLO_PAYLOAD, NetworkerContext, SaltOffer, TCP_PORT,
+        TcpNetworkerErrors,
+    },
     udp_networker::{
         InstanceId, MAX_BROADCAST_DURATION, udp_broadcast_presence, udp_find_broadcasters,
     },
@@ -75,33 +88,61 @@ pub struct Storage {
 }
 
 /* settings: the vault's config entry */
-/// config format version
-const CONFIG_VERSION: u8 = 0x01;
+/// config format version 1: `flags` only (read, never written any more)
+const CONFIG_VERSION_1: u8 = 0x01;
+/// config format version 2: `flags || peer addresses`
+const CONFIG_VERSION: u8 = 0x02;
 /// config flag: the Sync switch
 const CONFIG_SYNC: u8 = 0b1;
+/// config flag: the clipboard sync switch
+const CONFIG_CLIPBOARD: u8 = 0b10;
+/// every config flag this version knows
+const CONFIG_FLAGS: u8 = CONFIG_SYNC | CONFIG_CLIPBOARD;
+
+/// The paired devices' last addresses as saved (see [`PeerBook::decode`]).
+type SavedAddrs = Vec<([u8; 32], SocketAddr)>;
 
 /// The daemon's settings, saved in the vault. Every one is off by default.
 #[derive(Clone, Copy, Default, PartialEq, Debug)]
 struct Config {
     /// Networking on: listen for paired devices, allow "Add device".
     sync: bool,
+    /// Clipboard sync on (works while networking runs).
+    clipboard: bool,
 }
 
 impl Config {
-    /// `version (1) || flags (1)`.
-    fn encode(self) -> Zeroizing<Vec<u8>> {
-        let flags = if self.sync { CONFIG_SYNC } else { 0 };
-        Zeroizing::new(vec![CONFIG_VERSION, flags])
+    /// `version (1) || flags (1) || addresses` (the peer book's saved form).
+    fn encode(self, addresses: &[u8]) -> Zeroizing<Vec<u8>> {
+        let flags = if self.sync { CONFIG_SYNC } else { 0 }
+            | if self.clipboard { CONFIG_CLIPBOARD } else { 0 };
+        let mut out = Zeroizing::new(Vec::with_capacity(addresses.len().saturating_add(2)));
+        out.push(CONFIG_VERSION);
+        out.push(flags);
+        out.extend_from_slice(addresses);
+        out
     }
 
     /// Strict: an empty entry (vaults from before there were settings) is
-    /// the defaults, anything but `version || known flags` is `None`.
-    fn decode(bytes: &[u8]) -> Option<Self> {
+    /// the defaults, version 1 is `version || Sync flag`, version 2 is
+    /// `version || known flags || valid addresses`; anything else is `None`.
+    fn decode(bytes: &[u8]) -> Option<(Self, SavedAddrs)> {
         match bytes {
-            [] => Some(Self::default()),
-            [CONFIG_VERSION, flags] if flags & !CONFIG_SYNC == 0 => Some(Self {
-                sync: flags & CONFIG_SYNC != 0,
-            }),
+            [] => Some((Self::default(), Vec::new())),
+            [CONFIG_VERSION_1, flags] if flags & !CONFIG_SYNC == 0 => Some((
+                Self {
+                    sync: flags & CONFIG_SYNC != 0,
+                    clipboard: false,
+                },
+                Vec::new(),
+            )),
+            [CONFIG_VERSION, flags, addresses @ ..] if flags & !CONFIG_FLAGS == 0 => Some((
+                Self {
+                    sync: flags & CONFIG_SYNC != 0,
+                    clipboard: flags & CONFIG_CLIPBOARD != 0,
+                },
+                PeerBook::decode(addresses)?,
+            )),
             _ => None,
         }
     }
@@ -127,6 +168,18 @@ const MAX_TRIED_PER_WINDOW: usize = 16;
 const JOIN_RETRY_PAUSE: u64 = 5;
 /// How long the bridge may take to save the peers at shutdown (seconds).
 const SHUTDOWN_SAVE_TIMEOUT: u64 = 5;
+
+/* clipboard sync */
+/// How often the clipboard's change counter is read (milliseconds). A
+/// change is sent once the counter stayed the same for one more poll, so
+/// fast repeated copies send only the last one.
+const CLIP_POLL_MS: u64 = 300;
+/// Most received clipboard updates waiting for the daemon; more are
+/// answered `Ignored` at once.
+const CLIP_INBOX: usize = 8;
+/// Longest one send to one device may take: the handshake, the data and
+/// the answer (seconds).
+const SEND_DEADLINE: u64 = HANDSHAKE_DEADLINE + 3 * TIMEOUT;
 
 /// Networking while it runs; cancelling the token stops all of it.
 struct Network {
@@ -190,6 +243,8 @@ struct Joined {
     d_key: DataKey,
     d_salt: Salt,
     peer: TrustedPeer,
+    /// Where the member listens (its first saved address).
+    addr: SocketAddr,
 }
 
 /// The open vault, kept so changes can be re-sealed without the password.
@@ -297,6 +352,15 @@ pub struct Daemon {
     /// Where the salt query binds during an invite window: every interface
     /// on [`SALT_PORT`] (tests: localhost).
     salt_addr: SocketAddr,
+    /// Where the paired devices were last seen and what connecting showed.
+    /// Cleared by a reset; entries of devices that aren't trusted any more
+    /// are never listed, saved or connected to.
+    peer_book: Arc<PeerBook>,
+    /// The port paired devices listen on: [`TCP_PORT`] (tests: theirs).
+    peer_port: AtomicU16,
+    /// The OS clipboard, `None` where it isn't supported (and in tests
+    /// that don't give one).
+    clipboard: Option<Arc<dyn Clipboard>>,
     /// Tests only: the members a join tries instead of searching the LAN.
     #[cfg(test)]
     test_members: RwLock<Vec<MemberAddrs>>,
@@ -378,9 +442,18 @@ impl Daemon {
             guess_limiter: Arc::new(GuessLimiter::new()),
             listen_addr,
             salt_addr,
+            peer_book: Arc::default(),
+            peer_port: AtomicU16::new(TCP_PORT),
+            clipboard: None,
             #[cfg(test)]
             test_members: RwLock::default(),
         }
+    }
+
+    /// This daemon with the OS clipboard `clipboard` (clipboard sync).
+    pub fn with_clipboard(mut self, clipboard: Option<Arc<dyn Clipboard>>) -> Self {
+        self.clipboard = clipboard;
+        self
     }
 
     /// Answers one request with an encoded response body.
@@ -449,6 +522,7 @@ impl Daemon {
             Request::Unlock(update) => self.unlock(update).await,
             Request::SetAutoLogin(on) => self.set_auto_login(on).await,
             Request::SetSync(on) => self.set_sync(on).await,
+            Request::SetClipboard(on) => self.set_clipboard(on).await,
             Request::ForgetPeer(fingerprint) => self.forget_peer(&fingerprint).await,
             Request::ResetDevice => self.reset_device().await,
             Request::Status
@@ -547,6 +621,11 @@ impl Daemon {
                 auto_login: keys.auto_login,
                 unlock_wait_secs: wait_secs(keys.unlock_not_before, Instant::now()),
                 sync_enabled: keys.vault.as_ref().is_some_and(|open| open.config.sync),
+                clipboard_enabled: keys
+                    .vault
+                    .as_ref()
+                    .is_some_and(|open| open.config.clipboard),
+                clipboard_unavailable: self.clipboard.is_none(),
                 ..Status::default()
             }
         };
@@ -583,17 +662,39 @@ impl Daemon {
     }
 
     async fn peers(&self) -> Vec<PeerInfo> {
-        self.peer_list()
-            .await
-            .read()
-            .await
-            .iter()
-            .take(MAX_LISTED_PEERS)
-            .map(|peer| PeerInfo {
+        // copied first: the list and the book are never locked together
+        let peers = self.trusted_copy().await;
+        let mut listed = Vec::with_capacity(peers.len().min(MAX_LISTED_PEERS));
+        for peer in peers.iter().take(MAX_LISTED_PEERS) {
+            listed.push(PeerInfo {
                 fingerprint: peer.fingerprint(),
                 name: peer.name().to_owned(),
-            })
-            .collect()
+                state: self.peer_book.state(peer).await,
+            });
+        }
+        listed
+    }
+
+    /// A copy of the paired devices (public keys and names only), so the
+    /// list's lock isn't held while another one is taken.
+    async fn trusted_copy(&self) -> Vec<TrustedPeer> {
+        self.peer_list().await.read().await.clone()
+    }
+
+    /// The saved form of the paired devices' last addresses.
+    async fn encoded_addresses(&self) -> Vec<u8> {
+        let peers = self.trusted_copy().await;
+        self.peer_book.encode(&peers).await
+    }
+
+    /// The clipboard sync switch is on (and the vault open).
+    async fn clipboard_on(&self) -> bool {
+        self.keys
+            .read()
+            .await
+            .vault
+            .as_ref()
+            .is_some_and(|open| open.config.clipboard)
     }
 
     /// The salt for `kind`, made (and kept) on first use.
@@ -652,7 +753,11 @@ impl Daemon {
     }
 
     /// Sets a new password: derive, save (if the vault is open), then keep.
-    async fn set_password(&self, kind: KeyKind, update: PasswordUpdate) -> Result<(), DaemonError> {
+    async fn set_password(
+        self: &Arc<Self>,
+        kind: KeyKind,
+        update: PasswordUpdate,
+    ) -> Result<(), DaemonError> {
         if password_chars(&update.password) < MIN_NEW_PASSWORD_LEN {
             return Err(DaemonError::WeakPassword);
         }
@@ -714,6 +819,7 @@ impl Daemon {
         };
 
         let peers = self.encoded_peers().await?;
+        let addresses = self.encoded_addresses().await;
 
         let (file, new_wrap, auto_login) = {
             let keys = self.keys.read().await;
@@ -737,7 +843,7 @@ impl Daemon {
             let contents = VaultContents {
                 a_key,
                 a_salt: a_salt.clone(),
-                config: open.config.encode(),
+                config: open.config.encode(&addresses),
                 identity: open.identity.clone(),
                 peers,
             };
@@ -809,6 +915,7 @@ impl Daemon {
         let Ok(peers) = self.encoded_peers().await else {
             return;
         };
+        let addresses = self.encoded_addresses().await;
 
         let prepared = {
             (|| {
@@ -829,7 +936,7 @@ impl Daemon {
                 let contents = VaultContents {
                     a_key: a_key.clone(),
                     a_salt: a_salt.clone(),
-                    config: config.encode(),
+                    config: config.encode(&addresses),
                     identity: identity.clone(),
                     peers,
                 };
@@ -975,12 +1082,13 @@ impl Daemon {
             error!("saved trusted peers are damaged");
             DaemonError::StorageFailed
         })?;
-        let config = Config::decode(&opened.contents.config).ok_or_else(|| {
+        let (config, addresses) = Config::decode(&opened.contents.config).ok_or_else(|| {
             error!("saved settings are damaged");
             DaemonError::StorageFailed
         })?;
 
         *self.peer_list().await.write().await = peers;
+        self.peer_book.load(addresses).await;
 
         let mut keys = self.keys.write().await;
         keys.a_key = Some(opened.contents.a_key);
@@ -1048,27 +1156,11 @@ impl Daemon {
     /// Turns the Sync switch on or off: saved in the vault first, then
     /// networking follows ([`Daemon::apply_network`], run by `change`).
     async fn set_sync(&self, on: bool) -> Result<(), DaemonError> {
-        {
-            let keys = self.keys.read().await;
-            if keys.locked {
-                return Err(DaemonError::Locked);
-            }
-            // a paired device must survive a restart: no networking without a vault
-            if keys.vault.is_none() {
-                return Err(DaemonError::NotSaved);
-            }
-        }
-
-        let config = Config { sync: on };
-
-        // saved first, kept second: a failed save changes nothing
-        self.reseal(Some(config)).await?;
-
-        let mut keys = self.keys.write().await;
-        if let Some(open) = keys.vault.as_mut() {
-            open.config = config;
-        }
-        drop(keys);
+        let config = Config {
+            sync: on,
+            ..self.saved_config().await?
+        };
+        self.save_config(config).await?;
 
         if on {
             info!("sync on");
@@ -1076,6 +1168,54 @@ impl Daemon {
             info!("sync off");
         }
 
+        Ok(())
+    }
+
+    /// Turns clipboard sync on or off: saved in the vault first. It works
+    /// while networking runs (Sync on); off, nothing is read or applied.
+    async fn set_clipboard(&self, on: bool) -> Result<(), DaemonError> {
+        if on && self.clipboard.is_none() {
+            return Err(DaemonError::ClipboardUnavailable);
+        }
+
+        let config = Config {
+            clipboard: on,
+            ..self.saved_config().await?
+        };
+        self.save_config(config).await?;
+
+        if on {
+            info!("clipboard sync on");
+        } else {
+            info!("clipboard sync off");
+        }
+
+        Ok(())
+    }
+
+    /// The settings of the open vault: `Locked` / `NotSaved` without one (a
+    /// setting must survive a restart: none without a vault).
+    async fn saved_config(&self) -> Result<Config, DaemonError> {
+        let keys = self.keys.read().await;
+        if keys.locked {
+            return Err(DaemonError::Locked);
+        }
+        keys.vault
+            .as_ref()
+            .map(|open| open.config)
+            .ok_or(DaemonError::NotSaved)
+    }
+
+    /// Saves `config` (saved first, kept second: a failed save changes
+    /// nothing). The caller holds the change slot.
+    async fn save_config(&self, config: Config) -> Result<(), DaemonError> {
+        self.reseal(Some(config)).await?;
+
+        let mut keys = self.keys.write().await;
+        if let Some(open) = keys.vault.as_mut() {
+            open.config = config;
+        }
+        drop(keys);
         Ok(())
     }
 
@@ -1129,6 +1269,10 @@ impl Daemon {
             return Err(e);
         }
 
+        for (_, peer) in &removed {
+            self.peer_book.remove(peer).await;
+        }
+
         info!(count = removed.len(), "forgot a paired device");
         Ok(())
     }
@@ -1162,6 +1306,7 @@ impl Daemon {
         *self.keys.write().await = KeySlots::default();
         // a new list: a late handshake of the old network can't add to it
         *self.trusted_peers.write().await = Arc::default();
+        self.peer_book.clear().await;
         self.pairings.write().await.waiting.clear();
         self.other_group.store(false, Ordering::SeqCst);
         warn!("this device was reset: keys, vault and paired devices are gone");
@@ -1193,6 +1338,7 @@ impl Daemon {
         };
 
         let peers = self.encoded_peers().await?;
+        let addresses = self.encoded_addresses().await;
 
         let file = {
             let keys = self.keys.read().await;
@@ -1204,7 +1350,7 @@ impl Daemon {
             let contents = VaultContents {
                 a_key: a_key.clone(),
                 a_salt: a_salt.clone(),
-                config: config.unwrap_or(open.config).encode(),
+                config: config.unwrap_or(open.config).encode(&addresses),
                 identity: open.identity.clone(),
                 peers,
             };
@@ -1302,6 +1448,7 @@ impl Daemon {
 
         let (pairing, inbox) = Pairing::channel();
         let token = CancellationToken::new();
+        let (clip_sender, clip_inbox) = mpsc::channel(CLIP_INBOX);
         let context = NetworkerContext {
             keys: Arc::new(RwLock::new(keys)),
             device_keypairs: Arc::new(DeviceKeypairs::from_seed(&identity)),
@@ -1310,11 +1457,25 @@ impl Daemon {
             guess_limiter: self.guess_limiter.clone(),
             // offered only while an invite window is open
             salt_offer: Arc::default(),
+            peer_book: self.peer_book.clone(),
+            peer_port: self.peer_port.load(Ordering::SeqCst),
+            clipboard: Some(clip_sender),
         };
         drop(identity);
 
         listen(listener, context.clone(), token.clone());
         let bridge = tokio::spawn(self.clone().pairing_bridge(inbox, token.clone()));
+        // without an OS clipboard the inbox is dropped: updates are `Ignored`
+        if let Some(clipboard) = self.clipboard.clone() {
+            tokio::spawn(self.clone().clipboard_task(
+                clipboard,
+                clip_inbox,
+                context.clone(),
+                token.clone(),
+            ));
+        }
+        // the paired devices hear from us: a password that differs shows at once
+        tokio::spawn(self.clone().hello_round(context.clone(), token.clone()));
 
         // check-then-act under one write guard; nothing is awaited while held
         let mut network = self.network.write().await;
@@ -1354,7 +1515,7 @@ impl Daemon {
     }
 
     /// Hands changed keys to the running connections.
-    async fn update_network_keys(&self) {
+    async fn update_network_keys(self: &Arc<Self>) {
         let keys = {
             let keys = self.keys.read().await;
             match (&keys.a_key, &keys.a_salt, &keys.d_key) {
@@ -1366,15 +1527,21 @@ impl Daemon {
         };
 
         // the networker's own lock, taken after the daemon's is released
-        let shared = self
+        let running = self
             .network
             .read()
             .await
             .as_ref()
-            .map(|network| network.context.keys.clone());
+            .filter(|network| network.running())
+            .map(|network| (network.context.clone(), network.token.clone()));
 
-        if let Some(shared) = shared {
-            *shared.write().await = keys;
+        // what the old keys showed no longer holds (and pauses end)
+        self.peer_book.keys_changed().await;
+
+        if let Some((context, token)) = running {
+            *context.keys.write().await = keys;
+            // the paired devices are asked again with the new keys at once
+            tokio::spawn(self.clone().hello_round(context, token));
         }
     }
 
@@ -1391,6 +1558,11 @@ impl Daemon {
                 // its own task: the bridge keeps taking requests while the
                 // save waits for the change slot
                 () = inbox.saved.notified() => {
+                    let daemon = self.clone();
+                    tokio::spawn(async move { daemon.save_peers().await });
+                }
+                // a paired device moved: its new address is saved too
+                () = self.peer_book.changed.notified() => {
                     let daemon = self.clone();
                     tokio::spawn(async move { daemon.save_peers().await });
                 }
@@ -1464,6 +1636,183 @@ impl Daemon {
         info!(id, name = %request.name, accept, "pairing answered");
         request.answer(accept);
         Ok(())
+    }
+
+    /// Clipboard sync while networking runs: applies updates from paired
+    /// devices (`inbox`) and sends this device's new clipboard text to them.
+    ///
+    /// The clipboard's change counter is polled every [`CLIP_POLL_MS`]; a
+    /// change is sent once the counter held still for one more poll (fast
+    /// repeated copies send the last one), and only while no earlier send
+    /// round runs (the latest text goes when it ends). An update applied
+    /// here moves the counter too: that counter is taken as seen, so it is
+    /// never sent back. Content marked concealed / transient by a password
+    /// manager is never read. Nothing is read or applied while the switch
+    /// is off.
+    async fn clipboard_task(
+        self: Arc<Self>,
+        clipboard: Arc<dyn Clipboard>,
+        mut inbox: mpsc::Receiver<ClipDelivery>,
+        context: NetworkerContext,
+        token: CancellationToken,
+    ) {
+        // random per run: the receivers' ordering starts over with it
+        let Ok(epoch) = random_array::<8>() else {
+            error!("failed to generate a clipboard epoch: clipboard sync stays off");
+            return;
+        };
+        let mut seq = 0u64;
+        let mut ordering = clip_sync::UpdateOrder::default();
+        // what is on the clipboard now was copied before: never sent
+        let Some(start) = self.clip_count(&clipboard).await else {
+            error!("the clipboard can't be read: clipboard sync stays off");
+            return;
+        };
+        let mut watch = ClipWatch::new(start);
+        let mut round: Option<JoinHandle<()>> = None;
+
+        loop {
+            select! {
+                () = token.cancelled() => break,
+                delivery = inbox.recv() => {
+                    let Some(delivery) = delivery else { break };
+                    let ack = self
+                        .apply_clip(&clipboard, &mut ordering, &delivery, &mut watch)
+                        .await;
+                    // the connection may have given up waiting: nothing to do then
+                    let _ = delivery.answer.send(ack);
+                }
+                () = sleep(Duration::from_millis(CLIP_POLL_MS)) => {
+                    let on = self.clipboard_on().await;
+                    // a failed read is no change (a made-up counter would be one)
+                    let Some(count) = self.clip_count(&clipboard).await else {
+                        continue;
+                    };
+                    let busy = round.as_ref().is_some_and(|round| !round.is_finished());
+                    if watch.tick(on, count, busy) == ClipTick::Wait {
+                        continue;
+                    }
+
+                    let Some(payload) = self.read_clip(&clipboard, &epoch, &mut seq).await else {
+                        continue;
+                    };
+                    round = Some(tokio::spawn(self.clone().send_round(
+                        context.clone(),
+                        token.clone(),
+                        ActionType::ClipboardSync,
+                        payload,
+                    )));
+                }
+            }
+        }
+    }
+
+    /// The clipboard's change counter (read off the async workers); `None`
+    /// if the read failed.
+    async fn clip_count(&self, clipboard: &Arc<dyn Clipboard>) -> Option<i64> {
+        let clipboard = clipboard.clone();
+        blocking(move || clipboard.change_count()).await.ok()
+    }
+
+    /// Reads the clipboard text and encodes the next update; `None` for
+    /// nothing to send (no text, concealed, too long).
+    async fn read_clip(
+        &self,
+        clipboard: &Arc<dyn Clipboard>,
+        epoch: &[u8; 8],
+        seq: &mut u64,
+    ) -> Option<Arc<Zeroizing<Vec<u8>>>> {
+        let clipboard = clipboard.clone();
+        let text = match blocking(move || clipboard.read_text(CLIP_MAX_LEN)).await {
+            Ok(ClipRead::Text(text)) => text,
+            Ok(ClipRead::Concealed) => {
+                debug!("clipboard content marked concealed: not synced");
+                return None;
+            }
+            Ok(ClipRead::TooLarge) => {
+                info!(max = CLIP_MAX_LEN, "clipboard text too long: not synced");
+                return None;
+            }
+            Ok(ClipRead::NoText) | Err(_) => return None,
+        };
+
+        *seq = seq.saturating_add(1);
+        let payload = clip_sync::encode(epoch, *seq, &text)?;
+        debug!(len = text.len(), seq = *seq, "clipboard changed: sending");
+        Some(Arc::new(payload))
+    }
+
+    /// Applies an update from a paired device: only with the switch on,
+    /// only a well-formed one, only newer than the last one from that
+    /// device. The counter of our own write is taken as seen.
+    async fn apply_clip(
+        &self,
+        clipboard: &Arc<dyn Clipboard>,
+        ordering: &mut clip_sync::UpdateOrder,
+        delivery: &ClipDelivery,
+        watch: &mut ClipWatch,
+    ) -> DataAck {
+        if !self.clipboard_on().await {
+            return DataAck::Ignored;
+        }
+        let Some(message) = clip_sync::decode(&delivery.payload) else {
+            warn!(peer = %delivery.peer.name(), "malformed clipboard update, ignored");
+            return DataAck::Ignored;
+        };
+        if !ordering.accept(delivery.peer.static_key(), &message.epoch, message.seq) {
+            debug!(peer = %delivery.peer.name(), seq = message.seq, "older clipboard update, ignored");
+            return DataAck::Ignored;
+        }
+
+        let (clipboard, text) = (clipboard.clone(), message.text);
+        let len = text.len();
+        match blocking(move || clipboard.write_text(&text)).await {
+            Ok(Some(count)) => {
+                watch.written(count);
+                info!(peer = %delivery.peer.name(), len, seq = message.seq, "clipboard updated from a paired device");
+                DataAck::Applied
+            }
+            _ => {
+                warn!(peer = %delivery.peer.name(), "the OS refused the clipboard update");
+                DataAck::Ignored
+            }
+        }
+    }
+
+    /// Sends `Hello` to every paired device at its last address.
+    async fn hello_round(self: Arc<Self>, context: NetworkerContext, token: CancellationToken) {
+        let payload = Arc::new(Zeroizing::new(HELLO_PAYLOAD.to_vec()));
+        self.send_round(context, token, ActionType::Hello, payload)
+            .await;
+    }
+
+    /// Sends `payload` to every paired device at its last address that
+    /// isn't paused, all at once, each bounded by [`SEND_DEADLINE`]; ends
+    /// when every send did, or with networking.
+    async fn send_round(
+        self: Arc<Self>,
+        context: NetworkerContext,
+        token: CancellationToken,
+        action_type: ActionType,
+        payload: Arc<Zeroizing<Vec<u8>>>,
+    ) {
+        let peers = self.trusted_copy().await;
+        let targets = self.peer_book.targets(&peers).await;
+        let mut sends = JoinSet::new();
+        for (peer, addr) in targets {
+            sends.spawn(send_to(
+                context.clone(),
+                peer,
+                addr,
+                action_type,
+                payload.clone(),
+            ));
+        }
+
+        select! {
+            () = token.cancelled() => sends.abort_all(),
+            () = async { while sends.join_next().await.is_some() {} } => {}
+        }
     }
 
     /// Opens the "Add device" window for [`INVITE_WINDOW`] seconds: this
@@ -1845,6 +2194,10 @@ impl Daemon {
             pairing,
             guess_limiter: self.guess_limiter.clone(),
             salt_offer: Arc::default(),
+            // the join's own: the commit keeps the member's address
+            peer_book: Arc::default(),
+            peer_port: self.peer_port.load(Ordering::SeqCst),
+            clipboard: None,
         };
         // ends when the context (and with it the pairing sender) is dropped
         tokio::spawn(self.clone().join_bridge(inbox));
@@ -1879,6 +2232,7 @@ impl Daemon {
             d_key,
             d_salt,
             peer,
+            addr: member.tcp,
         })
     }
 
@@ -1926,10 +2280,18 @@ impl Daemon {
             keys.d_key = Some(joined.d_key);
             keys.d_salt = Some(joined.d_salt);
         }
+        self.peer_book.seen(&joined.peer, joined.addr).await;
         self.peer_list().await.write().await.push(joined.peer);
 
-        self.create_vault(Some(identity), Config { sync: true })
-            .await;
+        // clipboard stays off: every feature is off until the user turns it on
+        self.create_vault(
+            Some(identity),
+            Config {
+                sync: true,
+                clipboard: false,
+            },
+        )
+        .await;
         let saved = self.keys.read().await.vault.is_some();
 
         drop(turn);
@@ -1941,6 +2303,59 @@ impl Daemon {
             // the keys stay in RAM, like a first device whose save failed
             Err(DaemonError::StorageFailed)
         }
+    }
+}
+
+/// What one clipboard poll decided.
+#[derive(Debug, PartialEq)]
+enum ClipTick {
+    /// Nothing to send now.
+    Wait,
+    /// Read the clipboard and send it.
+    Send,
+}
+
+/// The clipboard task's view of the clipboard's change counter (12.3).
+struct ClipWatch {
+    /// The counter last seen (or written by us).
+    last_count: i64,
+    /// A change made while the switch was on waits to be sent.
+    pending: bool,
+}
+
+impl ClipWatch {
+    fn new(count: i64) -> Self {
+        Self {
+            last_count: count,
+            pending: false,
+        }
+    }
+
+    /// One poll: `count` is the counter now, `on` the switch, `busy` a send
+    /// round still running. A change is sent once the counter held still
+    /// for one more poll and no round runs; a change made while the switch
+    /// is off, or the switch going off before it was sent, is never sent.
+    fn tick(&mut self, on: bool, count: i64, busy: bool) -> ClipTick {
+        if count != self.last_count {
+            self.last_count = count;
+            self.pending = on;
+            return ClipTick::Wait;
+        }
+        if !on {
+            self.pending = false;
+            return ClipTick::Wait;
+        }
+        if !self.pending || busy {
+            return ClipTick::Wait;
+        }
+        self.pending = false;
+        ClipTick::Send
+    }
+
+    /// We wrote `count` (an update from a paired device): taken as seen,
+    /// so it is never sent back.
+    fn written(&mut self, count: i64) {
+        self.last_count = count;
     }
 }
 
@@ -2168,6 +2583,53 @@ async fn connect_to(context: NetworkerContext, addr: SocketAddr) -> Result<(), T
     result
 }
 
+/// One `Hello` or clipboard update to one paired device at `addr`: a
+/// device that doesn't answer is shown as unreachable; a password that
+/// differs is marked by the networker (`send_answered`).
+async fn send_to(
+    context: NetworkerContext,
+    peer: TrustedPeer,
+    addr: SocketAddr,
+    action_type: ActionType,
+    payload: Arc<Zeroizing<Vec<u8>>>,
+) {
+    let peer_book = context.peer_book.clone();
+    let stream = match timeout(Duration::from_secs(TIMEOUT), TcpStream::connect(addr)).await {
+        Ok(Ok(stream)) => stream,
+        _ => {
+            debug!(%addr, peer = %peer.name(), "paired device not reachable");
+            peer_book.set_state(&peer, PeerState::Unreachable).await;
+            return;
+        }
+    };
+
+    // a full handshake: boxed, so the future isn't kept on the stack
+    let sent = timeout(
+        Duration::from_secs(SEND_DEADLINE),
+        Box::pin(tcp_networker::send_answered(
+            context,
+            addr,
+            stream,
+            action_type,
+            &payload,
+        )),
+    )
+    .await;
+
+    match sent {
+        Ok(Ok((answered, ack))) => {
+            debug!(%addr, peer = %answered.name(), action_type = ?action_type, ack = ?ack, "sent to a paired device");
+        }
+        Ok(Err(TcpNetworkerErrors::WrongPassword)) => {
+            warn!(%addr, peer = %peer.name(), "the paired device uses a different auth password");
+        }
+        Ok(Err(e)) => {
+            warn!(%addr, peer = %peer.name(), error = %e, "sending to a paired device failed")
+        }
+        Err(_) => warn!(%addr, peer = %peer.name(), "sending to a paired device timed out"),
+    }
+}
+
 /// The storage this platform supports: the vault in the private data
 /// directory plus the OS keychain. `None` (RAM only) where there is no
 /// keychain backend yet.
@@ -2217,7 +2679,11 @@ pub async fn run() {
 
     info!(path = %path.display(), "daemon listening for the UI");
 
-    let daemon = Arc::new(Daemon::new(platform_storage()));
+    let clipboard = cesa_conn_system::clipboard::platform_clipboard();
+    if clipboard.is_none() {
+        warn!("no clipboard support on this platform yet: clipboard sync stays off");
+    }
+    let daemon = Arc::new(Daemon::new(platform_storage()).with_clipboard(clipboard));
     daemon.start().await;
 
     let token = CancellationToken::new();
@@ -2379,6 +2845,7 @@ mod tests {
                     0x0C => DaemonError::AlreadyInGroup,
                     0x0D => DaemonError::JoinRunning,
                     0x0E => DaemonError::UnknownPeer,
+                    0x0F => DaemonError::ClipboardUnavailable,
                     _ => DaemonError::Internal,
                 }),
                 _ => panic!("unexpected response"),
@@ -2406,7 +2873,14 @@ mod tests {
     /// Test that a fresh daemon reports no keys and no peers
     #[tokio::test]
     async fn test_fresh_status() {
-        assert_eq!(Daemon::default().status().await, Status::default());
+        // no clipboard given: the daemon says so, it doesn't pretend
+        assert_eq!(
+            Daemon::default().status().await,
+            Status {
+                clipboard_unavailable: true,
+                ..Status::default()
+            }
+        );
     }
 
     /// Test that setting each password derives exactly that key with Argon2
@@ -2504,7 +2978,13 @@ mod tests {
         ] {
             assert_eq!(ask(&daemon, request).await, Err(DaemonError::WeakPassword));
         }
-        assert_eq!(daemon.status().await, Status::default());
+        assert_eq!(
+            daemon.status().await,
+            Status {
+                clipboard_unavailable: true,
+                ..Status::default()
+            }
+        );
     }
 
     /// Test the full saved lifecycle: setup saves an encrypted vault, a
@@ -3007,14 +3487,29 @@ mod tests {
     impl TestStorage {
         /// A (re)started daemon whose listener binds a free localhost port.
         async fn daemon_on_localhost(&self) -> Arc<Daemon> {
-            let daemon = Arc::new(Daemon::with_addrs(
-                Some(Storage {
-                    store: self.store.clone(),
-                    path: self.path(),
-                }),
-                free_local_addr(),
-                free_local_addr(),
-            ));
+            self.daemon_with_clipboard(None).await
+        }
+
+        /// Like [`TestStorage::daemon_on_localhost`], with a clipboard.
+        async fn daemon_with_clipboard(
+            &self,
+            clipboard: Option<Arc<dyn Clipboard>>,
+        ) -> Arc<Daemon> {
+            let daemon = Arc::new(
+                Daemon::with_addrs(
+                    Some(Storage {
+                        store: self.store.clone(),
+                        path: self.path(),
+                    }),
+                    free_local_addr(),
+                    free_local_addr(),
+                )
+                .with_clipboard(clipboard),
+            );
+            // port 1 on localhost: nothing listens, so hellos to a saved
+            // address fail at once instead of reaching a real daemon on
+            // TCP_PORT (tests that need it set the other daemon's port)
+            daemon.peer_port.store(1, Ordering::SeqCst);
             daemon.start().await;
             daemon
         }
@@ -3046,10 +3541,20 @@ mod tests {
     /// before its passwords are set (test only: real devices will get them
     /// from salt sync), so both derive the same keys.
     async fn group_of_two(a: &TestStorage, b: &TestStorage) -> (Arc<Daemon>, Arc<Daemon>) {
-        let first = a.daemon_on_localhost().await;
+        group_of_two_with(a, b, None, None).await
+    }
+
+    /// [`group_of_two`] with a clipboard for each.
+    async fn group_of_two_with(
+        a: &TestStorage,
+        b: &TestStorage,
+        clipboard_a: Option<Arc<dyn Clipboard>>,
+        clipboard_b: Option<Arc<dyn Clipboard>>,
+    ) -> (Arc<Daemon>, Arc<Daemon>) {
+        let first = a.daemon_with_clipboard(clipboard_a).await;
         setup(&first).await;
 
-        let second = b.daemon_on_localhost().await;
+        let second = b.daemon_with_clipboard(clipboard_b).await;
         let (a_salt, d_salt) = {
             let salts = first.keys.read().await;
             (salts.a_salt.clone(), salts.d_salt.clone())
@@ -3061,6 +3566,13 @@ mod tests {
         }
         setup(&second).await;
         assert_eq!(key_bytes(&first).await, key_bytes(&second).await);
+        // each one finds the other where it really listens
+        first
+            .peer_port
+            .store(second.listen_addr.port(), Ordering::SeqCst);
+        second
+            .peer_port
+            .store(first.listen_addr.port(), Ordering::SeqCst);
 
         for daemon in [&first, &second] {
             ask(daemon, Request::SetSync(true)).await.unwrap();
@@ -3148,16 +3660,38 @@ mod tests {
     /// Test that the settings encoding is strict and empty means defaults
     #[test]
     fn test_config_encoding() {
-        assert_eq!(Config::decode(&[]), Some(Config::default()));
+        assert_eq!(Config::decode(&[]), Some((Config::default(), Vec::new())));
         assert!(!Config::default().sync);
-        for config in [Config { sync: false }, Config { sync: true }] {
-            assert_eq!(Config::decode(&config.encode()), Some(config));
+        assert!(!Config::default().clipboard);
+        let no_addresses = [0u8, 0];
+        for (sync, clipboard) in [(false, false), (true, false), (false, true), (true, true)] {
+            let config = Config { sync, clipboard };
+            assert_eq!(
+                Config::decode(&config.encode(&no_addresses)),
+                Some((config, Vec::new()))
+            );
         }
-        // unknown version, unknown flag, wrong length
-        assert_eq!(Config::decode(&[0x02, 0x01]), None);
-        assert_eq!(Config::decode(&[CONFIG_VERSION, 0b10]), None);
+        // version 1 (Sync only) is still read
+        assert_eq!(
+            Config::decode(&[CONFIG_VERSION_1, 0x01]),
+            Some((
+                Config {
+                    sync: true,
+                    clipboard: false
+                },
+                Vec::new()
+            ))
+        );
+        // version 1 never had the clipboard flag; unknown version and flags,
+        // wrong lengths, damaged addresses
+        assert_eq!(Config::decode(&[CONFIG_VERSION_1, 0b10]), None);
+        assert_eq!(Config::decode(&[CONFIG_VERSION_1, 0x01, 0x00]), None);
+        assert_eq!(Config::decode(&[0x03, 0x01, 0, 0]), None);
+        assert_eq!(Config::decode(&[CONFIG_VERSION, 0b100, 0, 0]), None);
         assert_eq!(Config::decode(&[CONFIG_VERSION]), None);
-        assert_eq!(Config::decode(&[CONFIG_VERSION, 0x01, 0x00]), None);
+        assert_eq!(Config::decode(&[CONFIG_VERSION, 0x01]), None);
+        assert_eq!(Config::decode(&[CONFIG_VERSION, 0x01, 0, 0, 0]), None);
+        assert_eq!(Config::decode(&[CONFIG_VERSION, 0x01, 1, 0]), None);
     }
 
     /// Test that Sync is off by default, starts networking when switched on,
@@ -3496,7 +4030,7 @@ mod tests {
         let started = Instant::now();
         assert_eq!(
             connect_to(context(&a).await, b.listen_addr).await,
-            Err(TcpNetworkerErrors::FailedToAuthenticate)
+            Err(TcpNetworkerErrors::WrongPassword)
         );
         assert!(started.elapsed() < Duration::from_secs(HANDSHAKE_DEADLINE));
         assert!(a.pending_pairing().await.is_none());
@@ -4141,6 +4675,7 @@ mod tests {
             d_key: DataKey::from_bytes(&[3; 32]),
             d_salt: Zeroizing::new([4; 32]),
             peer: TrustedPeer::for_test(9, "member"),
+            addr: SocketAddr::from(([127, 0, 0, 1], TCP_PORT)),
         };
         assert!(
             daemon
@@ -4167,6 +4702,7 @@ mod tests {
             d_key: DataKey::from_bytes(&[3; 32]),
             d_salt: Zeroizing::new([4; 32]),
             peer: TrustedPeer::for_test(9, "member"),
+            addr: SocketAddr::from(([127, 0, 0, 1], TCP_PORT)),
         };
         let result = daemon
             .commit_join(joined, DeviceKeypairs::new_seed().unwrap(), 0)
@@ -4204,5 +4740,446 @@ mod tests {
         daemon.queue_pairing(request).await;
         assert!(daemon.pending_pairing().await.is_none());
         assert_eq!(answer.await, Ok(false));
+    }
+
+    /// The clipboard in memory: a counter, a text, and whether it is marked
+    /// concealed (as a password manager would). No lock of its own: the
+    /// counter is atomic, the content a `watch` value replaced as a whole.
+    struct MemClipboard {
+        count: std::sync::atomic::AtomicI64,
+        content: tokio::sync::watch::Sender<(Option<String>, bool)>,
+    }
+
+    impl Default for MemClipboard {
+        fn default() -> Self {
+            Self {
+                count: std::sync::atomic::AtomicI64::new(0),
+                content: tokio::sync::watch::Sender::new((None, false)),
+            }
+        }
+    }
+
+    impl MemClipboard {
+        /// What a user copying `text` does (`concealed`: a password manager).
+        fn copy(&self, text: &str, concealed: bool) {
+            self.content
+                .send_replace((Some(text.to_owned()), concealed));
+            self.count.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn text(&self) -> Option<String> {
+            self.content.borrow().0.clone()
+        }
+    }
+
+    impl Clipboard for MemClipboard {
+        fn change_count(&self) -> i64 {
+            self.count.load(Ordering::SeqCst)
+        }
+
+        fn read_text(&self, max_len: usize) -> ClipRead {
+            let (text, concealed) = self.content.borrow().clone();
+            match text {
+                _ if concealed => ClipRead::Concealed,
+                Some(text) if text.len() > max_len => ClipRead::TooLarge,
+                Some(text) => ClipRead::Text(Zeroizing::new(text)),
+                None => ClipRead::NoText,
+            }
+        }
+
+        fn write_text(&self, text: &str) -> Option<i64> {
+            self.content.send_replace((Some(text.to_owned()), false));
+            Some(self.count.fetch_add(1, Ordering::SeqCst).saturating_add(1))
+        }
+    }
+
+    /// Two paired devices (the user compared the code on both), each with
+    /// its own clipboard; both have the other's address.
+    async fn paired_two(
+        a: &TestStorage,
+        b: &TestStorage,
+        clipboard_a: Option<Arc<dyn Clipboard>>,
+        clipboard_b: Option<Arc<dyn Clipboard>>,
+    ) -> (Arc<Daemon>, Arc<Daemon>) {
+        let (first, second) = group_of_two_with(a, b, clipboard_a, clipboard_b).await;
+        first.adding.store(true, Ordering::SeqCst);
+        second.adding.store(true, Ordering::SeqCst);
+
+        let connect = tokio::spawn(connect_to(context(&first).await, second.listen_addr));
+        let (prompt_a, prompt_b) = (
+            wait_for_prompt(&first).await,
+            wait_for_prompt(&second).await,
+        );
+        for (daemon, prompt) in [(&first, &prompt_a), (&second, &prompt_b)] {
+            ask(
+                daemon,
+                Request::AnswerPairing {
+                    id: prompt.id,
+                    code: prompt.code,
+                    accept: true,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(connect.await.unwrap(), Ok(()));
+        first.adding.store(false, Ordering::SeqCst);
+        second.adding.store(false, Ordering::SeqCst);
+
+        (first, second)
+    }
+
+    /// The state `daemon` shows for its only paired device.
+    async fn only_peer_state(daemon: &Daemon) -> PeerState {
+        let peers = daemon.peers().await;
+        assert_eq!(peers.len(), 1);
+        peers.first().map_or(PeerState::Unknown, |peer| peer.state)
+    }
+
+    /// Waits (bounded) until `daemon` shows `state` for its paired device.
+    async fn wait_for_peer_state(daemon: &Daemon, state: PeerState) {
+        for _ in 0..1500 {
+            if only_peer_state(daemon).await == state {
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "the paired device never showed {state:?} (it shows {:?})",
+            only_peer_state(daemon).await
+        );
+    }
+
+    /// Test that after pairing both devices show the other as fine and know
+    /// where it listens
+    #[tokio::test]
+    async fn test_paired_devices_know_each_other() {
+        let (storage_a, storage_b) = (TestStorage::new("book-a"), TestStorage::new("book-b"));
+        let (a, b) = paired_two(&storage_a, &storage_b, None, None).await;
+
+        assert_eq!(only_peer_state(&a).await, PeerState::Ok);
+        assert_eq!(only_peer_state(&b).await, PeerState::Ok);
+        let peers = b.trusted_copy().await;
+        let targets = b.peer_book.targets(&peers).await;
+        assert_eq!(targets.first().map(|(_, addr)| *addr), Some(a.listen_addr));
+
+        // the addresses survive a restart (saved in the vault)
+        drop(b.stop_network().await);
+        let mut saved = None;
+        for _ in 0..500 {
+            let restarted = storage_b.daemon_on_localhost().await;
+            restarted.unlock(update(DATA_PW)).await.unwrap();
+            let peers = restarted.trusted_copy().await;
+            saved = restarted
+                .peer_book
+                .targets(&peers)
+                .await
+                .first()
+                .map(|(_, addr)| *addr);
+            if saved.is_some() {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(saved, Some(a.listen_addr));
+    }
+
+    /// Test that changing the auth password on one device makes BOTH show
+    /// "incorrect password" for the other at once (the hello after the
+    /// change), nobody is asked to pair, and setting the same password
+    /// again makes both fine
+    #[tokio::test]
+    async fn test_auth_password_change_shows_incorrect_password() {
+        let (storage_a, storage_b) = (TestStorage::new("pw1-a"), TestStorage::new("pw1-b"));
+        let (a, b) = paired_two(&storage_a, &storage_b, None, None).await;
+
+        ask(
+            &b,
+            Request::SetAuthPassword(update(b"another auth password")),
+        )
+        .await
+        .unwrap();
+        wait_for_peer_state(&b, PeerState::AuthPasswordDiffers).await;
+        wait_for_peer_state(&a, PeerState::AuthPasswordDiffers).await;
+        assert!(a.pending_pairing().await.is_none());
+        assert!(b.pending_pairing().await.is_none());
+
+        // the same password as the other device again
+        ask(&b, Request::SetAuthPassword(update(AUTH_PW)))
+            .await
+            .unwrap();
+        wait_for_peer_state(&b, PeerState::Ok).await;
+        wait_for_peer_state(&a, PeerState::Ok).await;
+    }
+
+    /// Test that changing the data password on one device makes both show
+    /// "incorrect password" (data) for the other, through the hello's
+    /// answer, and the same password again makes both fine
+    #[tokio::test]
+    async fn test_data_password_change_shows_incorrect_password() {
+        let (storage_a, storage_b) = (TestStorage::new("pw2-a"), TestStorage::new("pw2-b"));
+        let (a, b) = paired_two(&storage_a, &storage_b, None, None).await;
+
+        ask(
+            &b,
+            Request::SetDataPassword(update(b"another data password")),
+        )
+        .await
+        .unwrap();
+        wait_for_peer_state(&a, PeerState::DataPasswordDiffers).await;
+        wait_for_peer_state(&b, PeerState::DataPasswordDiffers).await;
+
+        ask(&b, Request::SetDataPassword(update(DATA_PW)))
+            .await
+            .unwrap();
+        wait_for_peer_state(&b, PeerState::Ok).await;
+        wait_for_peer_state(&a, PeerState::Ok).await;
+    }
+
+    /// Test that a device whose last address doesn't answer is shown as
+    /// unreachable
+    #[tokio::test]
+    async fn test_unreachable_peer_shown() {
+        let (storage_a, storage_b) = (TestStorage::new("gone-a"), TestStorage::new("gone-b"));
+        let (a, b) = paired_two(&storage_a, &storage_b, None, None).await;
+
+        // A goes away; B's next hello (after a key change) finds nobody
+        drop(a.stop_network().await);
+        ask(&b, Request::SetAuthPassword(update(AUTH_PW)))
+            .await
+            .unwrap();
+        wait_for_peer_state(&b, PeerState::Unreachable).await;
+    }
+
+    /// Waits (bounded) until `clipboard` holds `text`.
+    async fn wait_for_clip(clipboard: &MemClipboard, text: &str) {
+        for _ in 0..1500 {
+            if clipboard.text().as_deref() == Some(text) {
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "the clipboard never got {text:?} (it has {:?})",
+            clipboard.text()
+        );
+    }
+
+    /// Test clipboard sync end to end between two paired daemons: a copy on
+    /// one appears on the other, both ways, without being sent back; text
+    /// a password manager marked concealed is never sent; the switch is
+    /// off by default and off means nothing is sent or applied
+    #[tokio::test]
+    async fn test_clipboard_sync_end_to_end() {
+        let (storage_a, storage_b) = (TestStorage::new("clip-a"), TestStorage::new("clip-b"));
+        let (clip_a, clip_b) = (
+            Arc::new(MemClipboard::default()),
+            Arc::new(MemClipboard::default()),
+        );
+        let (a, b) = paired_two(
+            &storage_a,
+            &storage_b,
+            Some(clip_a.clone()),
+            Some(clip_b.clone()),
+        )
+        .await;
+
+        // off by default: nothing goes anywhere
+        assert!(!a.status().await.clipboard_enabled);
+        clip_a.copy("before the switch", false);
+        sleep(Duration::from_millis(5 * CLIP_POLL_MS)).await;
+        assert_eq!(clip_b.text(), None);
+
+        for daemon in [&a, &b] {
+            ask(daemon, Request::SetClipboard(true)).await.unwrap();
+            let status = daemon.status().await;
+            assert!(status.clipboard_enabled && !status.clipboard_unavailable);
+        }
+        // turning it on doesn't send what was copied before
+        sleep(Duration::from_millis(5 * CLIP_POLL_MS)).await;
+        assert_eq!(clip_b.text(), None);
+
+        clip_a.copy("zażółć gęślą jaźń", false);
+        wait_for_clip(&clip_b, "zażółć gęślą jaźń").await;
+
+        // applied on B: B doesn't send it back (A's clipboard stays as it was)
+        let count_a = clip_a.change_count();
+        sleep(Duration::from_millis(10 * CLIP_POLL_MS)).await;
+        assert_eq!(clip_a.change_count(), count_a);
+
+        // and the other way round
+        clip_b.copy("from b", false);
+        wait_for_clip(&clip_a, "from b").await;
+
+        // concealed (a password manager): never read, never sent
+        clip_a.copy("hunter2 password", true);
+        sleep(Duration::from_millis(10 * CLIP_POLL_MS)).await;
+        assert_eq!(clip_b.text().as_deref(), Some("from b"));
+
+        // B switched off: A's copy isn't applied there
+        ask(&b, Request::SetClipboard(false)).await.unwrap();
+        clip_a.copy("after b switched off", false);
+        sleep(Duration::from_millis(10 * CLIP_POLL_MS)).await;
+        assert_eq!(clip_b.text().as_deref(), Some("from b"));
+
+        // the switch is saved
+        assert!(!b.status().await.clipboard_enabled);
+        assert!(a.status().await.clipboard_enabled);
+    }
+
+    /// Test that clipboard sync needs a saved vault, and a platform without
+    /// a clipboard refuses to turn it on
+    #[tokio::test]
+    async fn test_clipboard_switch_refusals() {
+        let storage = TestStorage::new("clip-switch");
+        let daemon = storage.daemon_on_localhost().await;
+        assert_eq!(
+            ask(&daemon, Request::SetClipboard(true)).await,
+            Err(DaemonError::ClipboardUnavailable)
+        );
+        // off is always fine to ask, but needs a vault to save it in
+        assert_eq!(
+            ask(&daemon, Request::SetClipboard(false)).await,
+            Err(DaemonError::NotSaved)
+        );
+
+        let storage = TestStorage::new("clip-switch-2");
+        let daemon = storage
+            .daemon_with_clipboard(Some(Arc::new(MemClipboard::default())))
+            .await;
+        assert_eq!(
+            ask(&daemon, Request::SetClipboard(true)).await,
+            Err(DaemonError::NotSaved)
+        );
+        setup(&daemon).await;
+        ask(&daemon, Request::SetClipboard(true)).await.unwrap();
+        assert!(daemon.status().await.clipboard_enabled);
+
+        // locked after a restart: refused until unlocked, then still on
+        let restarted = storage
+            .daemon_with_clipboard(Some(Arc::new(MemClipboard::default())))
+            .await;
+        assert_eq!(
+            ask(&restarted, Request::SetClipboard(false)).await,
+            Err(DaemonError::Locked)
+        );
+        ask(&restarted, Request::Unlock(update(DATA_PW)))
+            .await
+            .unwrap();
+        assert!(restarted.status().await.clipboard_enabled);
+    }
+
+    /// Test that an update from a paired device is applied only when it is
+    /// well formed and newer, and only with the switch on
+    #[tokio::test]
+    async fn test_apply_clip_checks() {
+        let storage = TestStorage::new("clip-apply");
+        let clip = Arc::new(MemClipboard::default());
+        let daemon = storage.daemon_with_clipboard(Some(clip.clone())).await;
+        setup(&daemon).await;
+        let clipboard: Arc<dyn Clipboard> = clip.clone();
+        let mut ordering = clip_sync::UpdateOrder::default();
+        let mut watch = ClipWatch::new(0);
+        let peer = TrustedPeer::for_test(3, "peer");
+
+        let deliver = |payload: Zeroizing<Vec<u8>>| {
+            let (answer, _reply) = tokio::sync::oneshot::channel();
+            ClipDelivery {
+                peer: peer.clone(),
+                payload,
+                answer,
+            }
+        };
+        let message = |seq: u64, text: &str| clip_sync::encode(&[1; 8], seq, text).unwrap();
+
+        // switch off: ignored
+        let off = deliver(message(1, "off"));
+        assert_eq!(
+            daemon
+                .apply_clip(&clipboard, &mut ordering, &off, &mut watch)
+                .await,
+            DataAck::Ignored
+        );
+        assert_eq!(clip.text(), None);
+
+        ask(&daemon, Request::SetClipboard(true)).await.unwrap();
+
+        let first = deliver(message(5, "first"));
+        assert_eq!(
+            daemon
+                .apply_clip(&clipboard, &mut ordering, &first, &mut watch)
+                .await,
+            DataAck::Applied
+        );
+        assert_eq!(clip.text().as_deref(), Some("first"));
+        // our own write is taken as seen, so it is never sent back
+        assert_eq!(watch.tick(true, clip.change_count(), false), ClipTick::Wait);
+        assert_eq!(watch.tick(true, clip.change_count(), false), ClipTick::Wait);
+
+        // older or the same again: ignored
+        for seq in [5, 4] {
+            let old = deliver(message(seq, "old"));
+            assert_eq!(
+                daemon
+                    .apply_clip(&clipboard, &mut ordering, &old, &mut watch)
+                    .await,
+                DataAck::Ignored
+            );
+        }
+        // malformed: ignored
+        let bad = deliver(Zeroizing::new(vec![0x01, 0x01, 0x00]));
+        assert_eq!(
+            daemon
+                .apply_clip(&clipboard, &mut ordering, &bad, &mut watch)
+                .await,
+            DataAck::Ignored
+        );
+        assert_eq!(clip.text().as_deref(), Some("first"));
+    }
+
+    /// Test the clipboard poll decision: a change goes once it held still,
+    /// not while a round runs, never when made with the switch off or when
+    /// the switch went off before it was sent, never our own write
+    #[test]
+    fn test_clip_watch() {
+        use ClipTick::{Send, Wait};
+        let mut watch = ClipWatch::new(10);
+
+        // nothing changed
+        assert_eq!(watch.tick(true, 10, false), Wait);
+        // a copy: sent at the next poll if it held still
+        assert_eq!(watch.tick(true, 11, false), Wait);
+        assert_eq!(watch.tick(true, 11, false), Send);
+        assert_eq!(watch.tick(true, 11, false), Wait);
+
+        // fast copies: only the last one, once it held still
+        assert_eq!(watch.tick(true, 12, false), Wait);
+        assert_eq!(watch.tick(true, 13, false), Wait);
+        assert_eq!(watch.tick(true, 13, false), Send);
+
+        // a round still runs: it waits, then goes
+        assert_eq!(watch.tick(true, 14, true), Wait);
+        assert_eq!(watch.tick(true, 14, true), Wait);
+        assert_eq!(watch.tick(true, 14, false), Send);
+
+        // copied while off: never sent, also not after turning on
+        assert_eq!(watch.tick(false, 15, false), Wait);
+        assert_eq!(watch.tick(false, 15, false), Wait);
+        assert_eq!(watch.tick(true, 15, false), Wait);
+
+        // copied while off, switched on right at the next poll: still never sent
+        assert_eq!(watch.tick(false, 18, false), Wait);
+        assert_eq!(watch.tick(true, 18, false), Wait);
+        assert_eq!(watch.tick(true, 18, false), Wait);
+
+        // copied while on, switched off before it went: never sent
+        assert_eq!(watch.tick(true, 19, false), Wait);
+        assert_eq!(watch.tick(false, 19, false), Wait);
+        assert_eq!(watch.tick(true, 19, false), Wait);
+
+        // our own write (an update from a paired device): never sent back
+        watch.written(20);
+        assert_eq!(watch.tick(true, 20, false), Wait);
+        assert_eq!(watch.tick(true, 20, false), Wait);
     }
 }

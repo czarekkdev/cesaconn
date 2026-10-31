@@ -17,6 +17,11 @@ nix = { version = "0.31.3", features = ["socket", "user"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10.1"
 security-framework = "3.7.0"
+# clipboard sync (see clipboard.rs): NSPasteboard through objc2's safe
+# bindings, so this crate keeps forbid(unsafe_code); only the features used
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSArray", "NSEnumerator"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard"] }
 
 [dev-dependencies]
 tokio = { version = "1.50.0", features = ["io-util", "net", "time", "macros", "rt", "test-util"] }
