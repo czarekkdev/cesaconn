@@ -12,7 +12,7 @@ mod daemon_link;
 
 use cesa_conn_system::ipc::{
     DaemonError, IpcErrors, JoinPasswords, MIN_NEW_PASSWORD_LEN, PairingPrompt, PasswordUpdate,
-    PeerInfo, Status,
+    PeerInfo, PeerState, Status,
 };
 use cesa_conn_system::pairing_code;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -36,6 +36,7 @@ const AUTH_KEY_LABEL: &str = "Auth key";
 const DATA_KEY_LABEL: &str = "Data key";
 const AUTO_LOGIN_LABEL: &str = "Automatic login";
 const SYNC_LABEL: &str = "Sync";
+const CLIPBOARD_LABEL: &str = "Clipboard sync";
 const RESET_LABEL: &str = "Reset this device";
 
 /// What the user types to confirm a reset (a key press alone is too easy).
@@ -58,6 +59,8 @@ pub enum SettingKind {
     /// A secret saved in the locked vault: editing it unlocks instead.
     Locked,
     Bool(bool),
+    /// A switch this platform doesn't support yet.
+    Unavailable,
     /// Not a value: Enter starts something (after asking).
     Action,
 }
@@ -78,6 +81,7 @@ impl Setting {
             SettingKind::Locked => ("[locked: Enter to unlock]", Color::Yellow),
             SettingKind::Bool(true) => ("on", Color::Green),
             SettingKind::Bool(false) => ("off", Color::DarkGray),
+            SettingKind::Unavailable => ("[not supported on this platform yet]", Color::DarkGray),
             SettingKind::Action => ("[Enter: wipe keys, vault, paired devices]", Color::Red),
         }
     }
@@ -205,6 +209,11 @@ impl App {
                 },
                 Setting {
                     label: SYNC_LABEL,
+                    kind: SettingKind::Bool(false),
+                    warn_message: None,
+                },
+                Setting {
+                    label: CLIPBOARD_LABEL,
                     kind: SettingKind::Bool(false),
                     warn_message: None,
                 },
@@ -444,7 +453,20 @@ fn handle_settings_enter(app: &mut App) {
             } else {
                 "[ INFO] Turning sync on"
             });
+        } else if is_clipboard(app, idx) {
+            // the daemon decides and saves it; the switch follows its status
+            app.outbox.push(Command::SetClipboard(!currently_on));
+            app.push_log(if currently_on {
+                "[ INFO] Turning clipboard sync off"
+            } else {
+                "[ INFO] Turning clipboard sync on"
+            });
         }
+    } else if matches!(
+        app.active_settings().get(idx).map(|s| &s.kind),
+        Some(SettingKind::Unavailable)
+    ) {
+        app.push_log("[ WARN] Clipboard sync isn't supported on this platform yet");
     } else if matches!(
         app.active_settings().get(idx).map(|s| &s.kind),
         Some(SettingKind::Locked)
@@ -849,6 +871,14 @@ fn handle_link_event(app: &mut App, event: LinkEvent) {
             if let Some(s) = app.setting_mut(SYNC_LABEL) {
                 s.kind = SettingKind::Bool(status.sync_enabled);
             }
+            if let Some(s) = app.setting_mut(CLIPBOARD_LABEL) {
+                s.kind = if status.clipboard_unavailable {
+                    SettingKind::Unavailable
+                } else {
+                    SettingKind::Bool(status.clipboard_enabled)
+                };
+            }
+            log_peer_changes(app, &peers);
             app.peers = peers;
             app.clamp_peer_selection();
             show_pairing(app, pairing);
@@ -878,8 +908,19 @@ fn handle_link_event(app: &mut App, event: LinkEvent) {
                 KeyKind::Data => "data",
             };
 
+            let paired = matches!(&app.daemon, DaemonState::Up(s) if s.trusted_peers > 0);
             match result {
-                Ok(()) => app.push_log(format!("[ INFO] The daemon set the {name} key")),
+                Ok(()) => {
+                    app.push_log(format!("[ INFO] The daemon set the {name} key"));
+                    if paired {
+                        // no group-wide change yet: the others keep the old one
+                        app.push_log(format!(
+                            "[ WARN] Your paired devices still use the old {name} password: \
+                             set the same new one on each of them. Until then they show \
+                             \"incorrect password\" on Devices"
+                        ));
+                    }
+                }
                 Err(e) => app.push_log(format!("[ERROR] Setting the {name} password failed: {e}")),
             }
 
@@ -924,6 +965,22 @@ fn handle_link_event(app: &mut App, event: LinkEvent) {
                     app.push_log("[ WARN] Sync needs saved keys: set both passwords first")
                 }
                 (_, Err(e)) => app.push_log(format!("[ERROR] Changing sync failed: {e}")),
+            }
+            app.request_refresh();
+        }
+        LinkEvent::ClipboardSet { on, result } => {
+            match (on, result) {
+                (true, Ok(())) => app.push_log(
+                    "[ INFO] Clipboard sync on: copied text goes to your paired devices (while Sync is on)",
+                ),
+                (false, Ok(())) => app.push_log("[ INFO] Clipboard sync off"),
+                (_, Err(IpcErrors::Daemon(DaemonError::NotSaved))) => {
+                    app.push_log("[ WARN] Clipboard sync needs saved keys: set both passwords first")
+                }
+                (_, Err(IpcErrors::Daemon(DaemonError::ClipboardUnavailable))) => {
+                    app.push_log("[ WARN] Clipboard sync isn't supported on this platform yet")
+                }
+                (_, Err(e)) => app.push_log(format!("[ERROR] Changing clipboard sync failed: {e}")),
             }
             app.request_refresh();
         }
@@ -1041,6 +1098,53 @@ fn set_key_flags(app: &mut App, auth: bool, data: bool) {
     }
 }
 
+/// What a paired device's state means, for the Devices tab.
+fn peer_state_text(state: PeerState) -> (&'static str, Color) {
+    match state {
+        PeerState::Unknown => ("not contacted yet", Color::DarkGray),
+        PeerState::Ok => ("connected, passwords match", Color::Green),
+        PeerState::AuthPasswordDiffers => {
+            ("incorrect password (auth password differs)", Color::Red)
+        }
+        PeerState::DataPasswordDiffers => {
+            ("incorrect password (data password differs)", Color::Red)
+        }
+        PeerState::Unreachable => ("not reachable at its last address", Color::Yellow),
+    }
+}
+
+/// Logs once when a paired device starts showing an incorrect password.
+fn log_peer_changes(app: &mut App, peers: &[PeerInfo]) {
+    for peer in peers {
+        let before = app
+            .peers
+            .iter()
+            .find(|old| old.fingerprint == peer.fingerprint)
+            .map(|old| old.state);
+        if before == Some(peer.state) {
+            continue;
+        }
+        let which = match peer.state {
+            PeerState::AuthPasswordDiffers => "auth",
+            PeerState::DataPasswordDiffers => "data",
+            PeerState::Unknown | PeerState::Ok | PeerState::Unreachable => continue,
+        };
+        app.push_log(format!(
+            "[ WARN] {}: incorrect password. The {which} password differs between this device and it: \
+             set the same one on both",
+            peer.name
+        ));
+    }
+}
+
+/// Whether setting `idx` is the clipboard sync switch.
+fn is_clipboard(app: &App, idx: usize) -> bool {
+    matches!(
+        app.settings.get(idx).map(|s| s.label),
+        Some(CLIPBOARD_LABEL)
+    )
+}
+
 /// Whether setting `idx` is the Sync switch.
 fn is_sync(app: &App, idx: usize) -> bool {
     matches!(app.settings.get(idx).map(|s| s.label), Some(SYNC_LABEL))
@@ -1153,8 +1257,10 @@ fn render_devices(frame: &mut Frame, area: Rect, app: &mut App) {
         app.peers
             .iter()
             .map(|p| {
+                // the marker's colour is the connection state
+                let (_, color) = peer_state_text(p.state);
                 ListItem::new(Line::from(vec![
-                    Span::styled("◆ ", Style::default().fg(Color::Green)),
+                    Span::styled("◆ ", Style::default().fg(color)),
                     Span::raw(p.name.as_str()),
                 ]))
             })
@@ -1185,6 +1291,11 @@ fn render_devices(frame: &mut Frame, area: Rect, app: &mut App) {
             lines.push(Line::from(vec![
                 Span::styled("  Fingerprint : ", Style::default().fg(Color::DarkGray)),
                 Span::raw(fingerprint_hex(&peer.fingerprint)),
+            ]));
+            let (state, color) = peer_state_text(peer.state);
+            lines.push(Line::from(vec![
+                Span::styled("  Connection  : ", Style::default().fg(Color::DarkGray)),
+                Span::styled(state, Style::default().fg(color)),
             ]));
         }
         None => lines.push(Line::from(Span::styled(
@@ -1987,6 +2098,7 @@ mod tests {
                 DATA_KEY_LABEL,
                 AUTO_LOGIN_LABEL,
                 SYNC_LABEL,
+                CLIPBOARD_LABEL,
                 RESET_LABEL
             ]
         );
@@ -2054,6 +2166,7 @@ mod tests {
             vec![PeerInfo {
                 fingerprint: [0xab; 8],
                 name: "laptop".into(),
+                state: PeerState::Ok,
             }],
             None,
         )))
@@ -2739,6 +2852,7 @@ mod tests {
                 .map(|(i, name)| PeerInfo {
                     fingerprint: [u8::try_from(i).unwrap(); 8],
                     name: (*name).into(),
+                    state: PeerState::Unknown,
                 })
                 .collect(),
             None,
@@ -3070,5 +3184,155 @@ mod tests {
         app.push_log("static str");
         app.push_log(String::from("owned string"));
         assert_eq!(app.logs.len(), 2);
+    }
+
+    /// Test that the clipboard switch follows the daemon, Enter asks the
+    /// daemon to flip it, and a platform without a clipboard says so
+    /// instead of offering a switch that does nothing
+    #[test]
+    fn test_clipboard_switch_goes_through_daemon() {
+        let mut app = App::new();
+        let status = Status {
+            saved: true,
+            clipboard_enabled: true,
+            ..Status::default()
+        };
+        handle_link_event(&mut app, status_with(&[], status));
+        assert_eq!(
+            app.setting_mut(CLIPBOARD_LABEL).unwrap().kind,
+            SettingKind::Bool(true)
+        );
+
+        app.outbox.clear();
+        select(&mut app, CLIPBOARD_LABEL);
+        handle_settings_enter(&mut app);
+        assert!(matches!(
+            app.outbox.as_slice(),
+            [Command::SetClipboard(false)]
+        ));
+        // still on until the daemon says otherwise
+        assert_eq!(
+            app.setting_mut(CLIPBOARD_LABEL).unwrap().kind,
+            SettingKind::Bool(true)
+        );
+
+        let unavailable = Status {
+            clipboard_unavailable: true,
+            ..Status::default()
+        };
+        handle_link_event(&mut app, status_with(&[], unavailable));
+        assert_eq!(
+            app.setting_mut(CLIPBOARD_LABEL).unwrap().kind,
+            SettingKind::Unavailable
+        );
+        app.outbox.clear();
+        handle_settings_enter(&mut app);
+        assert!(app.outbox.is_empty());
+        assert!(app.logs.last().unwrap().contains("isn't supported"));
+    }
+
+    fn peers_with(states: &[PeerState]) -> Vec<PeerInfo> {
+        states
+            .iter()
+            .enumerate()
+            .map(|(i, state)| PeerInfo {
+                fingerprint: [u8::try_from(i).unwrap(); 8],
+                name: format!("device {i}"),
+                state: *state,
+            })
+            .collect()
+    }
+
+    fn refreshed(peers: Vec<PeerInfo>) -> LinkEvent {
+        let status = Status {
+            saved: true,
+            network_running: true,
+            sync_enabled: true,
+            trusted_peers: u32::try_from(peers.len()).unwrap(),
+            ..Status::default()
+        };
+        LinkEvent::Refreshed(Ok((status, peers, None)))
+    }
+
+    /// Test that a paired device with an incorrect password shows it on the
+    /// Devices tab, and the log says it once (not every refresh)
+    #[test]
+    fn test_incorrect_password_shown_and_logged_once() {
+        let mut app = App::new();
+        handle_link_event(&mut app, refreshed(peers_with(&[PeerState::Ok])));
+        assert!(screen(&mut app).contains("passwords match"));
+
+        handle_link_event(
+            &mut app,
+            refreshed(peers_with(&[PeerState::AuthPasswordDiffers])),
+        );
+        assert!(screen(&mut app).contains("incorrect password (auth password differs)"));
+        let warned = |app: &App| {
+            app.logs
+                .iter()
+                .filter(|line| line.contains("device 0: incorrect password"))
+                .count()
+        };
+        assert_eq!(warned(&app), 1);
+        assert!(app.logs.last().unwrap().contains("auth password differs"));
+
+        // the next refresh with the same state logs nothing new
+        handle_link_event(
+            &mut app,
+            refreshed(peers_with(&[PeerState::AuthPasswordDiffers])),
+        );
+        assert_eq!(warned(&app), 1);
+
+        handle_link_event(
+            &mut app,
+            refreshed(peers_with(&[PeerState::DataPasswordDiffers])),
+        );
+        assert!(screen(&mut app).contains("incorrect password (data password differs)"));
+        assert_eq!(warned(&app), 2);
+        assert!(app.logs.last().unwrap().contains("data password differs"));
+
+        // fine or unreachable: shown, but no warning
+        handle_link_event(&mut app, refreshed(peers_with(&[PeerState::Unreachable])));
+        assert!(screen(&mut app).contains("not reachable"));
+        handle_link_event(&mut app, refreshed(peers_with(&[PeerState::Unknown])));
+        assert!(screen(&mut app).contains("not contacted yet"));
+        assert_eq!(warned(&app), 2);
+    }
+
+    /// Test that changing a password while devices are paired says that
+    /// they still have the old one (until it is changed there too)
+    #[test]
+    fn test_password_change_with_paired_devices_warns() {
+        let mut app = App::new();
+        handle_link_event(&mut app, refreshed(peers_with(&[PeerState::Ok])));
+        handle_link_event(
+            &mut app,
+            LinkEvent::PasswordSet {
+                kind: KeyKind::Auth,
+                result: Ok(()),
+            },
+        );
+        assert!(
+            app.logs
+                .last()
+                .unwrap()
+                .contains("still use the old auth password")
+        );
+
+        // no paired device: nothing to warn about
+        let mut app = App::new();
+        handle_link_event(&mut app, refreshed(Vec::new()));
+        handle_link_event(
+            &mut app,
+            LinkEvent::PasswordSet {
+                kind: KeyKind::Data,
+                result: Ok(()),
+            },
+        );
+        assert!(
+            !app.logs
+                .iter()
+                .any(|line| line.contains("still use the old"))
+        );
     }
 }

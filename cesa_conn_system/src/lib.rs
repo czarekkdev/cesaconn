@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod clipboard;
 pub mod code_signature;
 pub mod controller;
 pub mod ipc;

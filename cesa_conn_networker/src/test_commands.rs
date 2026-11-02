@@ -100,6 +100,9 @@ fn make_context(keys: Arc<RwLock<Keys>>) -> Option<NetworkerContext> {
         pairing: terminal_pairing(),
         guess_limiter: Arc::new(GuessLimiter::new()),
         salt_offer: SaltOffer::default(),
+        peer_book: Arc::default(),
+        peer_port: TCP_PORT,
+        clipboard: None,
     })
 }
 

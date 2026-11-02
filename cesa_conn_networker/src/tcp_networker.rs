@@ -1,20 +1,24 @@
-//TODO: add function arg to handle any further actions determined by ActionType in recv_handler
-
 use core::net::SocketAddr;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{RwLock, Semaphore, mpsc, oneshot};
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
 
+use cesa_conn_system::ipc::PeerState;
+
 use crate::auth_snow::{
-    AuthSnowErrors, Authenticated, DATA_LAYER_OVERHEAD, DeviceKeypairs, Keys, Pairing,
+    AuthSnowErrors, Authenticated, DATA_LAYER_OVERHEAD, DataKey, DeviceKeypairs, Keys, Pairing,
     SecureConnection, Tags, TrustedPeer, TrustedPeers, auth_incoming, auth_outgoing,
 };
+use crate::clip_sync::{CLIP_MAX_WIRE_LEN, CLIP_MIN_WIRE_LEN, DataAck};
 use crate::guess_limiter::GuessLimiter;
+use crate::peer_book::PeerBook;
 
 /// Identifies what kind of action/data is being sent in a packet.
 /// Encoded as a single byte at position [0] of the init header.
@@ -31,12 +35,18 @@ pub enum ActionType {
     /// Pair with the peer (pairing itself happens during authentication).
     /// No data payload is sent for this action.
     ConnectNewDevice = 0x02,
-    /// Synchronizes clipboard content between devices.
+    /// A clipboard update (`clip_sync`) through the `d_key` layer; the
+    /// receiver answers one [`DataAck`] byte.
     ClipboardSync = 0x03,
     /// A joining device asks for the group's `d_salt` on the connection
     /// that just paired it; the member answers `d_salt (32)` through Noise
     /// only (the joiner has no `d_key` yet). Header length must be 0.
     GroupSalt = 0x04,
+    /// "Still the same passwords?": [`HELLO_PAYLOAD`] through the `d_key`
+    /// layer, answered with one [`DataAck`] byte. Sent to the paired devices
+    /// when networking starts and after a key change, so a password that
+    /// differs shows at once and the devices learn each other's addresses.
+    Hello = 0x05,
 }
 
 impl ActionType {
@@ -51,6 +61,7 @@ impl ActionType {
             0x02 => Some(Self::ConnectNewDevice),
             0x03 => Some(Self::ClipboardSync),
             0x04 => Some(Self::GroupSalt),
+            0x05 => Some(Self::Hello),
             _ => None,
         }
     }
@@ -58,6 +69,15 @@ impl ActionType {
 
 /// TCP port devices listen on (and connect to; discovery only gives the IP).
 pub const TCP_PORT: u16 = 3232;
+
+/// The payload of [`ActionType::Hello`]: fixed, public bytes; only the
+/// `d_key` layer around them matters.
+pub const HELLO_PAYLOAD: &[u8; 8] = b"CESAHELO";
+
+/// How long the receiver waits for the daemon to apply a clipboard update
+/// before it answers `Ignored` (seconds); below [`crate::auth_snow::TIMEOUT`],
+/// so the answer reaches a sender that waits that long.
+const APPLY_TIMEOUT: u64 = 2;
 
 /// Init header: action type (1) + payload length as little-endian u64 (8).
 const INIT_HEADER_LEN: usize = 9;
@@ -105,7 +125,28 @@ pub struct NetworkerContext {
     /// The group's `d_salt` while this member's invite window is open,
     /// `None` otherwise (see [`ActionType::GroupSalt`]).
     pub salt_offer: SaltOffer,
+    /// Where the paired devices were last seen and what connecting showed.
+    pub peer_book: Arc<PeerBook>,
+    /// The port paired devices listen on (an incoming connection's own
+    /// port is random): [`TCP_PORT`], other ports in tests.
+    pub peer_port: u16,
+    /// Where received clipboard updates go (`None`: not taken, `Ignored`).
+    pub clipboard: ClipSink,
 }
+
+/// A received clipboard update on its way to the daemon, which answers
+/// whether it was applied.
+pub struct ClipDelivery {
+    /// The device that sent it (authenticated).
+    pub peer: TrustedPeer,
+    /// The decrypted update (`clip_sync` format), wiped on drop.
+    pub payload: Zeroizing<Vec<u8>>,
+    /// The daemon's answer; dropped unanswered = `Ignored`.
+    pub answer: oneshot::Sender<DataAck>,
+}
+
+/// The daemon's inbox for clipboard updates (bounded, never waited on).
+pub type ClipSink = Option<mpsc::Sender<ClipDelivery>>;
 
 /// The `d_salt` a member hands to devices that join during its invite window.
 pub type SaltOffer = Arc<RwLock<Option<Zeroizing<[u8; 32]>>>>;
@@ -148,6 +189,9 @@ pub enum TcpNetworkerErrors {
     /// `GroupSalt` outside an invite window, or not on the connection that
     /// just paired the two devices.
     NotInvited,
+    /// The password check (SPAKE2 confirmation) failed: this device and the
+    /// peer use different auth passwords.
+    WrongPassword,
 }
 
 impl fmt::Display for TcpNetworkerErrors {
@@ -172,6 +216,9 @@ impl fmt::Display for TcpNetworkerErrors {
                 f,
                 "group salt only goes to a device paired just now, in an invite window"
             ),
+            TcpNetworkerErrors::WrongPassword => {
+                write!(f, "the password check failed (different auth passwords)")
+            }
         }
     }
 }
@@ -247,10 +294,20 @@ pub async fn recv_handler(
         // the peer sent a wrong confirmation value: one password guess
         warn!(%peer_addr, "peer failed SPAKE2 confirmation (wrong a_key), closing");
         context.guess_limiter.record_failure(peer_addr.ip()).await;
+        // shown on the paired device last seen there (a hint, see peer_book)
+        context
+            .peer_book
+            .wrong_password_at(peer_addr.ip(), false)
+            .await;
         return Ok(None);
     };
 
     context.guess_limiter.record_success(peer_addr.ip()).await;
+    // it listens on the fixed port, not on the one it connected from
+    context
+        .peer_book
+        .seen(&peer, SocketAddr::new(peer_addr.ip(), context.peer_port))
+        .await;
 
     debug!(%peer_addr, peer = %peer.name(), "peer authenticated, reading init header");
 
@@ -277,6 +334,25 @@ pub async fn recv_handler(
 
     // unknown values fall back to Default, so newer peers stay compatible
     let action_type = ActionType::from_u8(*action_byte).unwrap_or(ActionType::Default);
+
+    // data that is answered: a hello, a clipboard update
+    if matches!(action_type, ActionType::Hello | ActionType::ClipboardSync) {
+        let key = context_keys.read().await.d_key.clone();
+        return receive_answered(
+            &mut secure_connection,
+            DataRequest {
+                peer,
+                action_type,
+                size,
+                peer_addr,
+            },
+            &key,
+            &context.peer_book,
+            &context.clipboard,
+        )
+        .await
+        .map(Some);
+    }
 
     // a joiner asking for d_salt: no payload, the answer goes back instead
     if action_type == ActionType::GroupSalt {
@@ -325,6 +401,140 @@ pub async fn recv_handler(
         action_type,
         data,
     }))
+}
+
+/// What [`receive_answered`] is about.
+struct DataRequest {
+    peer: TrustedPeer,
+    action_type: ActionType,
+    /// Declared length on the wire, `d_key` layer included (not bounded yet).
+    size: usize,
+    peer_addr: SocketAddr,
+}
+
+/// The wire length a data action must have: `Hello` exactly, a clipboard
+/// update within its bounds. Checked before allocating.
+fn answered_len_ok(action_type: ActionType, size: usize) -> bool {
+    match action_type {
+        ActionType::Hello => size == HELLO_PAYLOAD.len().saturating_add(DATA_LAYER_OVERHEAD),
+        ActionType::ClipboardSync => (CLIP_MIN_WIRE_LEN..=CLIP_MAX_WIRE_LEN).contains(&size),
+        ActionType::Default
+        | ActionType::Debug
+        | ActionType::ConnectNewDevice
+        | ActionType::GroupSalt => false,
+    }
+}
+
+/// Receiver side of `Hello` / `ClipboardSync`:
+/// 1. <- the payload through the `d_key` layer (length bounded first)
+/// 2. -> one [`DataAck`] byte through Noise
+///
+/// A payload that fails the `d_key` layer means the data passwords differ:
+/// the peer is marked ([`PeerState::DataPasswordDiffers`]) and told so,
+/// instead of a silent close. A clipboard update goes to the daemon, which
+/// decides whether it is applied.
+async fn receive_answered(
+    secure_connection: &mut SecureConnection,
+    request: DataRequest,
+    d_key: &DataKey,
+    peer_book: &PeerBook,
+    clipboard: &ClipSink,
+) -> Result<ReceivedPacket, TcpNetworkerErrors> {
+    let DataRequest {
+        peer,
+        action_type,
+        size,
+        peer_addr,
+    } = request;
+
+    // 1. the payload, bounded before allocating
+    if !answered_len_ok(action_type, size) {
+        warn!(%peer_addr, size, action_type = ?action_type, "data packet of a wrong size, rejecting");
+        return Err(TcpNetworkerErrors::DataTooLarge);
+    }
+
+    let data = match secure_connection
+        .read_encrypted(size, d_key, Tags::Regular)
+        .await
+    {
+        Ok(data) => data,
+        Err(AuthSnowErrors::FailedToDecryptData) => {
+            warn!(%peer_addr, peer = %peer.name(), "data failed the d_key layer: the data passwords differ");
+            peer_book
+                .set_state(&peer, PeerState::DataPasswordDiffers)
+                .await;
+            send_ack(secure_connection, DataAck::DataKeyDiffers, peer_addr).await?;
+            return Err(TcpNetworkerErrors::FailedToDecryptData);
+        }
+        Err(e) => {
+            warn!(%peer_addr, error = %e, "failed to read data packet from peer");
+            return Err(TcpNetworkerErrors::FailedToReadFromStream);
+        }
+    };
+
+    // it read our d_key layer: the data passwords match
+    peer_book.data_ok(&peer).await;
+
+    // 2. the answer
+    let (ack, data) = if action_type == ActionType::ClipboardSync {
+        // the update moves to the daemon; nothing is kept here
+        let ack = deliver_clip(clipboard, &peer, data).await;
+        (ack, Zeroizing::new(Vec::new()))
+    } else if data.as_slice() == HELLO_PAYLOAD.as_slice() {
+        // public constant bytes: nothing for timing to reveal
+        (DataAck::Applied, data)
+    } else {
+        (DataAck::Ignored, data)
+    };
+    send_ack(secure_connection, ack, peer_addr).await?;
+
+    info!(%peer_addr, peer = %peer.name(), action_type = ?action_type, ack = ?ack, "answered data packet");
+    Ok(ReceivedPacket {
+        peer,
+        action_type,
+        data,
+    })
+}
+
+/// Hands a clipboard update to the daemon and waits (briefly) for its
+/// answer. A full or missing inbox, or no answer in time, is `Ignored`.
+async fn deliver_clip(
+    clipboard: &ClipSink,
+    peer: &TrustedPeer,
+    payload: Zeroizing<Vec<u8>>,
+) -> DataAck {
+    let Some(sink) = clipboard else {
+        return DataAck::Ignored;
+    };
+    let (answer, reply) = oneshot::channel();
+    let delivery = ClipDelivery {
+        peer: peer.clone(),
+        payload,
+        answer,
+    };
+    // full: dropped (and wiped) at once, never queued behind others
+    if sink.try_send(delivery).is_err() {
+        return DataAck::Ignored;
+    }
+    match timeout(Duration::from_secs(APPLY_TIMEOUT), reply).await {
+        Ok(Ok(ack)) => ack,
+        _ => DataAck::Ignored,
+    }
+}
+
+/// Sends the one-byte answer to a data packet.
+async fn send_ack(
+    secure_connection: &mut SecureConnection,
+    ack: DataAck,
+    peer_addr: SocketAddr,
+) -> Result<(), TcpNetworkerErrors> {
+    secure_connection
+        .write_timeout(&[ack as u8], Tags::Regular)
+        .await
+        .map_err(|e| {
+            warn!(%peer_addr, error = %e, "failed to answer the data packet");
+            TcpNetworkerErrors::FailedToWriteToStream
+        })
 }
 
 /// Member side of [`ActionType::GroupSalt`]: sends `d_salt` through Noise,
@@ -525,14 +735,16 @@ async fn authenticate_outgoing(
     }
 
     let guess_limiter = context.guess_limiter.clone();
+    let peer_book = context.peer_book.clone();
 
-    let authenticated = auth_outgoing(
+    // a full handshake: boxed, so the future isn't kept on the caller's stack
+    let authenticated = Box::pin(auth_outgoing(
         context.keys,
         &context.device_keypairs,
         context.trusted_peers,
         IncomingConnection::new(outgoing_connection, connect_addr),
         &context.pairing,
-    )
+    ))
     .await;
 
     let authenticated = match authenticated {
@@ -547,6 +759,12 @@ async fn authenticate_outgoing(
                 guess_limiter.record_failure(connect_addr.ip()).await;
             }
             warn!(%connect_addr, error = %e, "authentication of outgoing connection failed");
+            // the server hung up on our confirmation value: it didn't
+            // accept our password (an honest server closes right there)
+            if e == AuthSnowErrors::FailedToConfirmMutualAuthSpake2 {
+                peer_book.wrong_password_at(connect_addr.ip(), true).await;
+                return Err(TcpNetworkerErrors::WrongPassword);
+            }
             return Err(TcpNetworkerErrors::FailedToAuthenticate);
         }
     };
@@ -554,12 +772,103 @@ async fn authenticate_outgoing(
     let Some(authenticated) = authenticated else {
         warn!(%connect_addr, "server failed SPAKE2 confirmation (wrong a_key), closing");
         guess_limiter.record_failure(connect_addr.ip()).await;
-        return Err(TcpNetworkerErrors::FailedToAuthenticate);
+        peer_book.wrong_password_at(connect_addr.ip(), true).await;
+        return Err(TcpNetworkerErrors::WrongPassword);
     };
 
     guess_limiter.record_success(connect_addr.ip()).await;
+    peer_book.seen(&authenticated.peer, connect_addr).await;
 
     Ok(authenticated)
+}
+
+/// Sends `Hello` or a clipboard update to a paired device and reads its
+/// answer:
+/// 1. authentication ([`auth_outgoing`]) that never pairs: only a device
+///    both sides know gets data
+/// 2. -> init header: action, length (payload + [`DATA_LAYER_OVERHEAD`])
+/// 3. -> the payload through the `d_key` layer
+/// 4. <- one [`DataAck`] byte through Noise
+///
+/// Who answered and what: `DataKeyDiffers` marks the peer
+/// ([`PeerState::DataPasswordDiffers`]); a failed password check marks the
+/// devices last seen at `connect_addr` ([`TcpNetworkerErrors::WrongPassword`]).
+pub async fn send_answered(
+    context: NetworkerContext,
+    connect_addr: SocketAddr,
+    outgoing_connection: TcpStream,
+    action_type: ActionType,
+    payload: &[u8],
+) -> Result<(TrustedPeer, DataAck), TcpNetworkerErrors> {
+    let size = payload.len().saturating_add(DATA_LAYER_OVERHEAD);
+    if !answered_len_ok(action_type, size) {
+        warn!(%connect_addr, size, action_type = ?action_type, "data packet of a wrong size, not sending");
+        return Err(TcpNetworkerErrors::DataTooLarge);
+    }
+
+    let d_key = context.keys.read().await.d_key.clone();
+    let peer_book = context.peer_book.clone();
+    // sync never pairs: a device that forgot us gets nothing and no prompt
+    let context = NetworkerContext {
+        pairing: Pairing::refuse_all(),
+        ..context
+    };
+
+    // 1. authentication
+    let Authenticated {
+        connection: mut secure_connection,
+        peer,
+        newly_paired,
+    } = authenticate_outgoing(context, connect_addr, outgoing_connection).await?;
+    if newly_paired {
+        // can't happen: every pairing request is refused above
+        return Err(TcpNetworkerErrors::FailedToAuthenticate);
+    }
+
+    // 2. init header
+    let wire_len = u64::try_from(size).map_err(|_| TcpNetworkerErrors::DataTooLarge)?;
+    let mut init_data = Vec::with_capacity(INIT_HEADER_LEN);
+    init_data.push(action_type as u8);
+    init_data.extend_from_slice(&wire_len.to_le_bytes());
+
+    secure_connection
+        .write_timeout(&init_data, Tags::Regular)
+        .await
+        .map_err(|e| {
+            warn!(%connect_addr, error = %e, "failed to send init header");
+            TcpNetworkerErrors::FailedToWriteToStream
+        })?;
+
+    // 3. payload
+    secure_connection
+        .write_encrypted(payload, &d_key, Tags::Regular)
+        .await
+        .map_err(|e| {
+            warn!(%connect_addr, error = %e, "failed to send data packet");
+            TcpNetworkerErrors::FailedToWriteToStream
+        })?;
+
+    // 4. the answer (an older build sends none: a read error)
+    let answer = read_secure(&mut secure_connection, 1, connect_addr).await?;
+    let ack = answer
+        .first()
+        .copied()
+        .and_then(DataAck::from_u8)
+        .filter(|_| answer.len() == 1)
+        .ok_or(TcpNetworkerErrors::FailedToReadFromStream)?;
+
+    if ack == DataAck::DataKeyDiffers {
+        warn!(%connect_addr, peer = %peer.name(), "the device couldn't read our data: the data passwords differ");
+        peer_book
+            .set_state(&peer, PeerState::DataPasswordDiffers)
+            .await;
+    } else {
+        // it read our d_key layer: the data passwords match
+        peer_book.data_ok(&peer).await;
+    }
+
+    debug!(%connect_addr, peer = %peer.name(), action_type = ?action_type, ack = ?ack, "data packet answered");
+    Ok((peer, ack))
 }
 
 /// Joiner side of [`ActionType::GroupSalt`]: authenticates (the user pairs
@@ -711,6 +1020,9 @@ mod tests {
             pairing: Pairing::answer_all(accept),
             guess_limiter: Arc::new(GuessLimiter::new()),
             salt_offer: SaltOffer::default(),
+            peer_book: Arc::default(),
+            peer_port: TCP_PORT,
+            clipboard: None,
         }
     }
 
@@ -756,12 +1068,13 @@ mod tests {
         );
         assert_eq!(ActionType::from_u8(0x03), Some(ActionType::ClipboardSync));
         assert_eq!(ActionType::from_u8(0x04), Some(ActionType::GroupSalt));
+        assert_eq!(ActionType::from_u8(0x05), Some(ActionType::Hello));
     }
 
     /// Test that unknown wire bytes are rejected instead of panicking
     #[test]
     fn test_action_type_from_u8_unknown() {
-        for v in 0x05..=0xFF {
+        for v in 0x06..=0xFF {
             assert_eq!(ActionType::from_u8(v), None);
         }
     }
@@ -780,6 +1093,7 @@ mod tests {
             TcpNetworkerErrors::FailedToDecryptData,
             TcpNetworkerErrors::LockedOut,
             TcpNetworkerErrors::NotInvited,
+            TcpNetworkerErrors::WrongPassword,
         ];
 
         for e in errors {
@@ -816,7 +1130,7 @@ mod tests {
         let (server_result, client_result) = exchange(
             make_context(TEST_A_KEY, ACCEPT_ALL),
             make_context(TEST_A_KEY, ACCEPT_ALL),
-            ActionType::ClipboardSync,
+            ActionType::Debug,
             &data,
         )
         .await;
@@ -1008,7 +1322,7 @@ mod tests {
         .await;
 
         assert!(server_result.unwrap().is_none());
-        assert_eq!(client_result, Err(TcpNetworkerErrors::FailedToAuthenticate));
+        assert_eq!(client_result, Err(TcpNetworkerErrors::WrongPassword));
         assert!(server_peers.read().await.is_empty());
     }
 
@@ -1039,7 +1353,7 @@ mod tests {
         let (server_result, client_result) = exchange(
             make_context(TEST_A_KEY, ACCEPT_ALL),
             make_context_d(TEST_A_KEY, [0x22; 32], ACCEPT_ALL),
-            ActionType::ClipboardSync,
+            ActionType::Debug,
             b"clipboard",
         )
         .await;
@@ -1188,5 +1502,271 @@ mod tests {
         .await;
 
         assert_eq!(result.unwrap_err(), TcpNetworkerErrors::FailedToConnect);
+    }
+
+    /// Pairs `server` and `client` (both accept), so they know each other.
+    async fn pair(server: &NetworkerContext, client: &NetworkerContext) {
+        let (_, paired) = exchange(
+            server.clone(),
+            client.clone(),
+            ActionType::ConnectNewDevice,
+            b"",
+        )
+        .await;
+        assert_eq!(paired, Ok(()));
+    }
+
+    /// Runs one answered send (hello / clipboard) and returns both results.
+    async fn answered_exchange(
+        server: NetworkerContext,
+        client: NetworkerContext,
+        action_type: ActionType,
+        payload: &[u8],
+    ) -> (
+        Result<Option<ReceivedPacket>, TcpNetworkerErrors>,
+        Result<(TrustedPeer, DataAck), TcpNetworkerErrors>,
+        SocketAddr,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let incoming = listener.accept().await.unwrap();
+            recv_handler(incoming, server).await
+        });
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let client_result = send_answered(client, addr, stream, action_type, payload).await;
+        (server_task.await.unwrap(), client_result, addr)
+    }
+
+    /// Test that a hello between paired devices is answered and both
+    /// remember where the other is
+    #[tokio::test]
+    async fn test_hello_answered_and_addresses_learned() {
+        let server = make_context(TEST_A_KEY, ACCEPT_ALL);
+        let client = make_context(TEST_A_KEY, ACCEPT_ALL);
+        pair(&server, &client).await;
+        // both had seen a data mismatch earlier: data that goes through ends it
+        for side in [&client, &server] {
+            let known = side.trusted_peers.read().await.clone();
+            side.peer_book
+                .set_state(known.first().unwrap(), PeerState::DataPasswordDiffers)
+                .await;
+        }
+
+        let (server_result, client_result, addr) = answered_exchange(
+            server.clone(),
+            client.clone(),
+            ActionType::Hello,
+            HELLO_PAYLOAD,
+        )
+        .await;
+
+        let (peer, ack) = client_result.unwrap();
+        assert_eq!(ack, DataAck::Applied);
+        assert_eq!(client.peer_book.state(&peer).await, PeerState::Ok);
+        // the client knows the server at the address it connected to
+        let targets = client.peer_book.targets(std::slice::from_ref(&peer)).await;
+        assert_eq!(targets.first().map(|(_, at)| *at), Some(addr));
+
+        let packet = server_result.unwrap().unwrap();
+        assert_eq!(packet.action_type, ActionType::Hello);
+        // the server knows the client at its IP and the fixed port
+        assert_eq!(server.peer_book.state(&packet.peer).await, PeerState::Ok);
+        let targets = server
+            .peer_book
+            .targets(std::slice::from_ref(&packet.peer))
+            .await;
+        assert_eq!(
+            targets.first().map(|(_, at)| *at),
+            Some(SocketAddr::new(addr.ip(), TCP_PORT))
+        );
+    }
+
+    /// Test that a different data password shows on BOTH sides: the
+    /// receiver can't read the hello, says so, and nothing is applied
+    #[tokio::test]
+    async fn test_hello_with_other_data_password() {
+        let server = make_context(TEST_A_KEY, ACCEPT_ALL);
+        let client = make_context(TEST_A_KEY, ACCEPT_ALL);
+        pair(&server, &client).await;
+        // the client's user changed the data password
+        client.keys.write().await.d_key = DataKey::from_bytes(&[0x22; 32]);
+
+        let (server_result, client_result, _) = answered_exchange(
+            server.clone(),
+            client.clone(),
+            ActionType::Hello,
+            HELLO_PAYLOAD,
+        )
+        .await;
+
+        let (peer, ack) = client_result.unwrap();
+        assert_eq!(ack, DataAck::DataKeyDiffers);
+        assert_eq!(
+            client.peer_book.state(&peer).await,
+            PeerState::DataPasswordDiffers
+        );
+        assert_eq!(
+            server_result.err(),
+            Some(TcpNetworkerErrors::FailedToDecryptData)
+        );
+        let peers = server.trusted_peers.read().await.clone();
+        assert_eq!(
+            server.peer_book.state(peers.first().unwrap()).await,
+            PeerState::DataPasswordDiffers
+        );
+    }
+
+    /// Test that a different auth password shows on both sides, at the
+    /// devices last seen at that address, and pairs nothing
+    #[tokio::test]
+    async fn test_other_auth_password_marks_both_sides() {
+        let server = make_context(TEST_A_KEY, ACCEPT_ALL);
+        let client = make_context(TEST_A_KEY, ACCEPT_ALL);
+        pair(&server, &client).await;
+        // a hello first, so each knows the other's address
+        let (_, sent, _) = answered_exchange(
+            server.clone(),
+            client.clone(),
+            ActionType::Hello,
+            HELLO_PAYLOAD,
+        )
+        .await;
+        let (server_peer, _) = sent.unwrap();
+
+        client.keys.write().await.a_key = AuthKey::from_bytes(&[0x33; 32]);
+        let (server_result, client_result, _) = answered_exchange(
+            server.clone(),
+            client.clone(),
+            ActionType::Hello,
+            HELLO_PAYLOAD,
+        )
+        .await;
+
+        assert_eq!(client_result.err(), Some(TcpNetworkerErrors::WrongPassword));
+        assert!(server_result.unwrap().is_none());
+        assert_eq!(
+            client.peer_book.state(&server_peer).await,
+            PeerState::AuthPasswordDiffers
+        );
+        let peers = server.trusted_peers.read().await.clone();
+        assert_eq!(
+            server.peer_book.state(peers.first().unwrap()).await,
+            PeerState::AuthPasswordDiffers
+        );
+        // paused: sync leaves it alone for a while
+        assert!(
+            client
+                .peer_book
+                .targets(std::slice::from_ref(&server_peer))
+                .await
+                .is_empty()
+        );
+    }
+
+    /// Test that a sync connection never pairs: a device that doesn't know
+    /// us gets no data and nobody is asked, even if it would accept
+    #[tokio::test]
+    async fn test_answered_send_never_pairs() {
+        let server = make_context(TEST_A_KEY, ACCEPT_ALL);
+        let client = make_context(TEST_A_KEY, ACCEPT_ALL);
+
+        let (server_result, client_result, _) = answered_exchange(
+            server.clone(),
+            client.clone(),
+            ActionType::Hello,
+            HELLO_PAYLOAD,
+        )
+        .await;
+
+        assert!(client_result.is_err());
+        assert!(server_result.is_err());
+        assert!(server.trusted_peers.read().await.is_empty());
+        assert!(client.trusted_peers.read().await.is_empty());
+    }
+
+    /// Test that a clipboard update reaches the daemon's inbox and the
+    /// daemon's answer goes back; without an inbox it is Ignored
+    #[tokio::test]
+    async fn test_clipboard_delivered_and_answered() {
+        let (sink, mut inbox) = mpsc::channel(1);
+        let server = NetworkerContext {
+            clipboard: Some(sink),
+            ..make_context(TEST_A_KEY, ACCEPT_ALL)
+        };
+        let client = make_context(TEST_A_KEY, ACCEPT_ALL);
+        pair(&server, &client).await;
+
+        let daemon = tokio::spawn(async move {
+            let delivery = inbox.recv().await.unwrap();
+            let text = crate::clip_sync::decode(&delivery.payload).unwrap().text;
+            delivery.answer.send(DataAck::Applied).unwrap();
+            text.to_string()
+        });
+
+        let payload = crate::clip_sync::encode(&[4; 8], 1, "copied").unwrap();
+        let (server_result, client_result, _) =
+            answered_exchange(server, client.clone(), ActionType::ClipboardSync, &payload).await;
+
+        assert_eq!(client_result.unwrap().1, DataAck::Applied);
+        assert_eq!(daemon.await.unwrap(), "copied");
+        // the content moved to the daemon, nothing is kept by the networker
+        assert!(server_result.unwrap().unwrap().data.is_empty());
+
+        // no inbox (no clipboard on that platform): Ignored
+        let bare = make_context(TEST_A_KEY, ACCEPT_ALL);
+        pair(&bare, &client).await;
+        let (_, client_result, _) =
+            answered_exchange(bare, client, ActionType::ClipboardSync, &payload).await;
+        assert_eq!(client_result.unwrap().1, DataAck::Ignored);
+    }
+
+    /// Test that the sizes are bounded on both ends: a hello must be exact,
+    /// a clipboard update within its limits
+    #[test]
+    fn test_answered_sizes() {
+        let hello = HELLO_PAYLOAD.len() + DATA_LAYER_OVERHEAD;
+        assert!(answered_len_ok(ActionType::Hello, hello));
+        assert!(!answered_len_ok(ActionType::Hello, hello + 1));
+        assert!(!answered_len_ok(ActionType::Hello, hello - 1));
+        assert!(answered_len_ok(
+            ActionType::ClipboardSync,
+            CLIP_MIN_WIRE_LEN
+        ));
+        assert!(answered_len_ok(
+            ActionType::ClipboardSync,
+            CLIP_MAX_WIRE_LEN
+        ));
+        assert!(!answered_len_ok(
+            ActionType::ClipboardSync,
+            CLIP_MIN_WIRE_LEN - 1
+        ));
+        assert!(!answered_len_ok(
+            ActionType::ClipboardSync,
+            CLIP_MAX_WIRE_LEN + 1
+        ));
+        for other in [
+            ActionType::Default,
+            ActionType::Debug,
+            ActionType::ConnectNewDevice,
+            ActionType::GroupSalt,
+        ] {
+            assert!(!answered_len_ok(other, hello));
+        }
+    }
+
+    /// Test that the receiver refuses an oversized clipboard update before
+    /// reading it (a raw header from a paired device)
+    #[tokio::test]
+    async fn test_oversized_clipboard_refused_by_receiver() {
+        let server = make_context(TEST_A_KEY, ACCEPT_ALL);
+        let client = make_context(TEST_A_KEY, ACCEPT_ALL);
+        pair(&server, &client).await;
+
+        // connect_handler sends any size: CLIP_MAX_LEN + header + 1 is too long
+        let big =
+            vec![b'a'; crate::clip_sync::CLIP_HEADER_LEN + crate::clip_sync::CLIP_MAX_LEN + 1];
+        let (server_result, _) = exchange(server, client, ActionType::ClipboardSync, &big).await;
+        assert_eq!(server_result.err(), Some(TcpNetworkerErrors::DataTooLarge));
     }
 }

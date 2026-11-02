@@ -4,7 +4,6 @@
 
 /* TODO NOW:
 
-CLIPBOARD SYNC
 FOLDER SYNC
 
 */
@@ -20,12 +19,14 @@ GET RID OF STORING KEYS IN RAM
  */
 
 mod auth_snow;
+mod clip_sync;
 #[cfg(unix)]
 mod daemon;
 mod guess_limiter;
 mod hybrid_kex;
 #[cfg(unix)]
 mod ipc_server;
+mod peer_book;
 mod salt_service;
 mod spake2;
 mod tcp_networker;

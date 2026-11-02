@@ -774,6 +774,21 @@ impl TrustedPeer {
         }
     }
 
+    /// A made-up peer for tests with this static key.
+    #[cfg(test)]
+    pub fn for_test_key(x25519_pub_key: [u8; 32], name: &str) -> Self {
+        Self {
+            x25519_pub_key,
+            mldsa_verification_key: [0; MLDSA87_VK_LEN],
+            name: name.to_owned(),
+        }
+    }
+
+    /// The peer's Noise static public key: its identity (public).
+    pub fn static_key(&self) -> &[u8; 32] {
+        &self.x25519_pub_key
+    }
+
     /// Human-readable device name shown to the user.
     pub fn name(&self) -> &str {
         &self.name
@@ -860,6 +875,15 @@ impl Pairing {
                 saved,
             },
         )
+    }
+
+    /// A pairing channel that refuses every new device at once, without
+    /// asking anyone: sync connections only ever talk to paired devices.
+    pub fn refuse_all() -> Self {
+        let (pairing, inbox) = Self::channel();
+        // no receiver: every request fails to queue, which is a rejection
+        drop(inbox);
+        pairing
     }
 
     /// A pairing channel whose every request gets the same answer (tests).
@@ -1185,7 +1209,9 @@ async fn ask_user(
         })
         .is_err()
     {
-        tracing::warn!("too many pairings waiting for the user, rejecting");
+        tracing::warn!(
+            "pairing not possible now (too many waiting, or a sync connection), rejecting"
+        );
         return Ok(false);
     }
 

@@ -46,6 +46,8 @@ pub enum Command {
     SetAutoLogin(bool),
     /// Turn networking on or off (saved by the daemon).
     SetSync(bool),
+    /// Turn clipboard sync on or off (saved by the daemon).
+    SetClipboard(bool),
     /// Open the daemon's "Add device" window.
     AddDevice,
     /// The user's answer to a pairing prompt.
@@ -89,6 +91,11 @@ pub enum LinkEvent {
     },
     /// Answer to [`Command::SetSync`].
     SyncSet {
+        on: bool,
+        result: Result<(), IpcErrors>,
+    },
+    /// Answer to [`Command::SetClipboard`].
+    ClipboardSet {
         on: bool,
         result: Result<(), IpcErrors>,
     },
@@ -198,6 +205,10 @@ async fn run_command(socket: Option<&PathBuf>, command: Command) -> LinkEvent {
         Command::SetSync(on) => LinkEvent::SyncSet {
             on,
             result: send_done(socket, Request::SetSync(on)).await,
+        },
+        Command::SetClipboard(on) => LinkEvent::ClipboardSet {
+            on,
+            result: send_done(socket, Request::SetClipboard(on)).await,
         },
         Command::AddDevice => {
             LinkEvent::AddDeviceStarted(send_done(socket, Request::AddDevice).await)
@@ -316,6 +327,7 @@ mod tests {
         let peer = PeerInfo {
             fingerprint: [0xab; ipc::FINGERPRINT_LEN],
             name: "laptop".into(),
+            state: ipc::PeerState::Ok,
         };
         let prompt = PairingPrompt {
             id: 9,
@@ -337,7 +349,7 @@ mod tests {
             rt.block_on(async move {
                 let listener = UnixListener::bind(&server_path).unwrap();
 
-                for _ in 0..14 {
+                for _ in 0..15 {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     let body = ipc::read_frame(&mut stream).await.unwrap();
 
@@ -352,6 +364,7 @@ mod tests {
                         | Request::Unlock(_)
                         | Request::SetAutoLogin(_)
                         | Request::SetSync(_)
+                        | Request::SetClipboard(_)
                         | Request::AddDevice
                         | Request::AnswerPairing { .. }
                         | Request::JoinGroup(_)
@@ -443,6 +456,19 @@ mod tests {
         assert!(matches!(
             Request::decode(&seen_rx.recv().unwrap()).unwrap(),
             Request::SetSync(true)
+        ));
+
+        assert!(link.send(Command::SetClipboard(true)));
+        assert_eq!(
+            wait_for_event(&link),
+            LinkEvent::ClipboardSet {
+                on: true,
+                result: Ok(())
+            }
+        );
+        assert!(matches!(
+            Request::decode(&seen_rx.recv().unwrap()).unwrap(),
+            Request::SetClipboard(true)
         ));
 
         assert!(link.send(Command::AddDevice));
