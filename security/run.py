@@ -216,8 +216,15 @@ def check_clippy() -> ToolResult:
         # behind cfg(not(feature)) (the default build) must each be analysed
         out = ""
         for features in ([], ["--all-features"]):
-            _, o, _ = run(["cargo", "clippy", "-p", crate, "--all-targets", *features,
+            code, o, err = run(["cargo", "clippy", "-p", crate, "--all-targets", *features,
                            "--message-format=json", "--", *flags], timeout=1800)
+            # Completion is independent of diagnostic filtering/deduplication:
+            # even a failure with no usable compiler messages leaves a gap.
+            if code != 0:
+                config = "all features" if features else "default features"
+                r.findings.append(Finding("clippy", "invocation-failed", "info",
+                                          f"{crate} ({config}): cargo clippy exited with {code} "
+                                          f"(incomplete analysis).\n{err[-1500:]}", crate))
             out += o + "\n"
         build_errors = 0
         # compile errors count per crate: a broken dependency also leaves
