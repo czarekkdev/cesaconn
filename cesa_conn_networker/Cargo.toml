@@ -30,8 +30,9 @@ subtle = "2.6.1"
 libcrux-ml-dsa = "0.0.11"
 
 [target.'cfg(unix)'.dependencies]
-# geteuid() without unsafe (the code-signature check is in cesa_conn_system)
-nix = { version = "0.31.3", features = ["user"] }
+# geteuid() without unsafe (the code-signature check is in cesa_conn_system);
+# getifaddrs() for announcing on every interface (net)
+nix = { version = "0.31.3", features = ["user", "net"] }
 
 [dev-dependencies]
 # paused clock for lockout tests

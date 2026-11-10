@@ -1,5 +1,12 @@
 //! LAN discovery over UDP broadcast.
 //!
+//! An announcement goes to `255.255.255.255` and to the broadcast address of
+//! every other IPv4 interface that has one: the OS sends `255.255.255.255`
+//! out of one interface only (the default route), so a second network on
+//! the same machine (a VM's shared network, Ethernet next to Wi-Fi) would
+//! never hear it. Point-to-point interfaces (VPN tunnels) have no broadcast:
+//! devices behind one are reached by address, not by discovery.
+//!
 //! An announcement only says "a CesaConn device listens at this address".
 //! It is deliberately NOT encrypted or authenticated with anything derived
 //! from the password: any password-derived value on the wire (e.g. AES-GCM
@@ -10,9 +17,11 @@
 //! forging announcements can at most make us try a connection that fails.
 
 use core::fmt;
-use core::net::SocketAddr;
+use core::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::time::{Duration, Instant, sleep, timeout_at};
+use tokio::task::JoinSet;
+use tokio::time::{Duration, Instant, sleep, timeout, timeout_at};
 use tracing::{debug, error, info, warn};
 
 use cesa_conn_crypto::crand::random_array;
@@ -22,6 +31,13 @@ pub const DISCOVERY_PORT: u16 = 3636;
 
 /// Longest a broadcast or a search may run (seconds).
 pub const MAX_BROADCAST_DURATION: u64 = 20;
+
+/// Most destinations one announcement goes to: `255.255.255.255` plus one
+/// per interface, so a machine with many interfaces can't make it a flood.
+const MAX_BROADCAST_TARGETS: usize = 16;
+
+/// Longest one send of an announcement may take (seconds).
+const SEND_TIMEOUT: u64 = 1;
 
 /* Announcement layout */
 /// protocol magic (8)
@@ -109,8 +125,124 @@ fn parse_announcement(packet: &[u8]) -> Option<InstanceId> {
     Some(InstanceId(id.try_into().ok()?))
 }
 
+/// One IPv4 address of an interface, as far as broadcasting cares.
+#[derive(Debug, Clone, Copy)]
+struct Ipv4Interface {
+    /// The interface's address.
+    ip: Ipv4Addr,
+    /// Its netmask.
+    netmask: Ipv4Addr,
+    /// The broadcast address the OS reports, if any.
+    broadcast: Option<Ipv4Addr>,
+    /// Up, broadcast-capable, not loopback, not point-to-point.
+    usable: bool,
+}
+
+/// Where one announcement goes: `255.255.255.255` first, then the
+/// broadcast address of every usable interface (the reported one, or the
+/// network's last address), each once, at most [`MAX_BROADCAST_TARGETS`].
+/// A network of /31 or /32 has no broadcast; a reported address outside
+/// the interface's own network, or one that isn't a plain unicast-range
+/// address, is skipped.
+fn broadcast_targets(interfaces: &[Ipv4Interface]) -> Vec<SocketAddr> {
+    let mut targets = vec![SocketAddr::from((Ipv4Addr::BROADCAST, DISCOVERY_PORT))];
+
+    for interface in interfaces.iter().filter(|interface| interface.usable) {
+        let mask = u32::from(interface.netmask);
+        if mask.count_ones() >= 31 {
+            continue;
+        }
+        let network = u32::from(interface.ip) & mask;
+        let address = interface
+            .broadcast
+            .unwrap_or_else(|| Ipv4Addr::from(network | !mask));
+
+        // only an address of the interface's own network
+        let own_network = u32::from(address) & mask == network;
+        if !own_network
+            || address.is_loopback()
+            || address.is_unspecified()
+            || address.is_multicast()
+            || address == Ipv4Addr::BROADCAST
+        {
+            continue;
+        }
+
+        let target = SocketAddr::from((address, DISCOVERY_PORT));
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+
+    targets.truncate(MAX_BROADCAST_TARGETS);
+    targets
+}
+
+/// This machine's IPv4 interface addresses; empty if the OS won't say.
+#[cfg(unix)]
+fn ipv4_interfaces() -> Vec<Ipv4Interface> {
+    use nix::net::if_::InterfaceFlags;
+
+    let addresses = match nix::ifaddrs::getifaddrs() {
+        Ok(addresses) => addresses,
+        Err(e) => {
+            warn!(error = %e, "can't list the network interfaces: announcing on the default route only");
+            return Vec::new();
+        }
+    };
+
+    let ipv4 = |address: Option<nix::sys::socket::SockaddrStorage>| {
+        address.and_then(|address| address.as_sockaddr_in().map(|address| address.ip()))
+    };
+
+    addresses
+        .filter_map(|address| {
+            let flags = address.flags;
+            Some(Ipv4Interface {
+                ip: ipv4(address.address)?,
+                netmask: ipv4(address.netmask)?,
+                broadcast: ipv4(address.broadcast),
+                usable: flags.contains(InterfaceFlags::IFF_UP)
+                    && flags.contains(InterfaceFlags::IFF_BROADCAST)
+                    && !flags.contains(InterfaceFlags::IFF_LOOPBACK)
+                    && !flags.contains(InterfaceFlags::IFF_POINTOPOINT),
+            })
+        })
+        .collect()
+}
+
+/// Not listed elsewhere yet: `255.255.255.255` only.
+#[cfg(not(unix))]
+fn ipv4_interfaces() -> Vec<Ipv4Interface> {
+    Vec::new()
+}
+
+/// Sends one announcement to `destination`, bounded by [`SEND_TIMEOUT`];
+/// `true` if it went out. A failure is only logged: other networks may work.
+async fn send_one(
+    socket: &UdpSocket,
+    packet: [u8; ANNOUNCEMENT_LEN],
+    destination: SocketAddr,
+    tick: u64,
+) -> bool {
+    let send = socket.send_to(&packet, destination);
+    match timeout(Duration::from_secs(SEND_TIMEOUT), send).await {
+        Ok(Ok(_)) => true,
+        Ok(Err(e)) => {
+            debug!(error = %e, tick, %destination, "announcement not sent there");
+            false
+        }
+        Err(_) => {
+            debug!(tick, %destination, "announcement send timed out");
+            false
+        }
+    }
+}
+
 /// Announces this device on the LAN once per second for `duration` seconds
-/// (capped at [`MAX_BROADCAST_DURATION`]).
+/// (capped at [`MAX_BROADCAST_DURATION`]), on every interface (see the
+/// module docs). The interfaces are listed again every second, so one
+/// that comes up (a VM started, a cable plugged in) is announced on too.
 ///
 /// The announcement carries no secret, see the module docs.
 pub async fn udp_broadcast_presence(
@@ -119,7 +251,6 @@ pub async fn udp_broadcast_presence(
 ) -> Result<(), UdpNetworkerErrors> {
     let duration = duration.min(MAX_BROADCAST_DURATION);
     let packet = announcement(id);
-    let destination = SocketAddr::from(([255, 255, 255, 255], DISCOVERY_PORT));
 
     // Ephemeral port: only the destination port matters for the listener.
     // nosemgrep: cesa.net.bind-all-interfaces
@@ -134,15 +265,41 @@ pub async fn udp_broadcast_presence(
         UdpNetworkerErrors::FailedToSetBroadcastMode
     })?;
 
-    info!(duration, %destination, "broadcasting presence");
+    info!(duration, "broadcasting presence");
+
+    // shared by the sends of one tick, which run at once
+    let socket = Arc::new(socket);
 
     for tick in 0..duration {
-        let bytes_sent = socket.send_to(&packet, destination).await.map_err(|e| {
-            error!(error = %e, tick, %destination, "failed to send UDP broadcast packet");
-            UdpNetworkerErrors::FailedToSendBroadcast
-        })?;
+        let targets = broadcast_targets(&ipv4_interfaces());
+        let (first, rest) = targets
+            .split_first()
+            .ok_or(UdpNetworkerErrors::FailedToSendBroadcast)?;
 
-        debug!(tick, bytes_sent, "announcement sent");
+        // 255.255.255.255 first, then every interface at once: one slow or
+        // refusing network (down, no route) neither stops nor delays the
+        // others, so a tick takes at most two SEND_TIMEOUTs, not one per target
+        let mut sent = usize::from(send_one(&socket, packet, *first, tick).await);
+        let mut sends = JoinSet::new();
+        for destination in rest.iter().copied() {
+            let socket = socket.clone();
+            sends.spawn(async move { send_one(&socket, packet, destination, tick).await });
+        }
+        while let Some(done) = sends.join_next().await {
+            if matches!(done, Ok(true)) {
+                sent = sent.saturating_add(1);
+            }
+        }
+        if sent == 0 {
+            error!(
+                tick,
+                targets = targets.len(),
+                "failed to send the announcement anywhere"
+            );
+            return Err(UdpNetworkerErrors::FailedToSendBroadcast);
+        }
+
+        debug!(tick, targets = targets.len(), sent, "announcement sent");
 
         sleep(Duration::from_secs(1)).await;
     }
@@ -444,5 +601,95 @@ mod tests {
         ] {
             assert!(!e.to_string().is_empty());
         }
+    }
+
+    fn iface(ip: [u8; 4], prefix: u32, broadcast: Option<[u8; 4]>, usable: bool) -> Ipv4Interface {
+        Ipv4Interface {
+            ip: Ipv4Addr::from(ip),
+            netmask: Ipv4Addr::from(
+                32u32
+                    .checked_sub(prefix)
+                    .and_then(|shift| u32::MAX.checked_shl(shift))
+                    .unwrap_or(0),
+            ),
+            broadcast: broadcast.map(Ipv4Addr::from),
+            usable,
+        }
+    }
+
+    fn target(ip: [u8; 4]) -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::from(ip), DISCOVERY_PORT))
+    }
+
+    /// Test that an announcement goes to 255.255.255.255 and to every
+    /// usable interface's broadcast address once (a Mac on Wi-Fi with a
+    /// VM's shared network), computed when the OS reports none
+    #[test]
+    fn test_broadcast_targets_every_interface() {
+        let targets = broadcast_targets(&[
+            // Wi-Fi /20 with its broadcast reported
+            iface([172, 17, 243, 179], 20, Some([172, 17, 255, 255]), true),
+            // the VM's shared network /24, none reported: computed
+            iface([10, 211, 55, 2], 24, None, true),
+            // a second address on the same network: no duplicate
+            iface([10, 211, 55, 3], 24, Some([10, 211, 55, 255]), true),
+        ]);
+
+        assert_eq!(
+            targets,
+            vec![
+                target([255, 255, 255, 255]),
+                target([172, 17, 255, 255]),
+                target([10, 211, 55, 255]),
+            ]
+        );
+    }
+
+    /// Test that loopback, down, point-to-point (VPN) interfaces, /31 and
+    /// /32 networks and a reported broadcast outside the interface's own
+    /// network get nothing beyond 255.255.255.255
+    #[test]
+    fn test_broadcast_targets_skips_unusable() {
+        let targets = broadcast_targets(&[
+            iface([127, 0, 0, 1], 8, None, false),
+            iface([192, 168, 1, 5], 24, Some([192, 168, 1, 255]), false),
+            iface([10, 8, 0, 2], 32, None, true),
+            iface([10, 9, 0, 0], 31, None, true),
+            iface([192, 168, 2, 5], 24, Some([8, 8, 8, 8]), true),
+            iface([192, 168, 3, 5], 24, Some([224, 0, 0, 1]), true),
+            // flags the OS got wrong: loopback, multicast or 0.0.0.0 networks
+            iface([127, 0, 0, 1], 8, None, true),
+            iface([224, 1, 1, 1], 24, None, true),
+            iface([0, 0, 0, 1], 24, Some([0, 0, 0, 0]), true),
+        ]);
+
+        assert_eq!(targets, vec![target([255, 255, 255, 255])]);
+        assert!(broadcast_targets(&[]).len() == 1);
+    }
+
+    /// Test that a machine with very many interfaces can't make one
+    /// announcement a flood
+    #[test]
+    fn test_broadcast_targets_bounded() {
+        let many: Vec<Ipv4Interface> = (0..=255u8)
+            .map(|i| iface([10, i, 0, 1], 24, None, true))
+            .collect();
+
+        let targets = broadcast_targets(&many);
+        assert_eq!(targets.len(), MAX_BROADCAST_TARGETS);
+        assert_eq!(targets.first(), Some(&target([255, 255, 255, 255])));
+    }
+
+    /// Test that the OS's interface list is read, with loopback marked not
+    /// usable
+    #[cfg(unix)]
+    #[test]
+    fn test_ipv4_interfaces_lists_loopback_unusable() {
+        let interfaces = ipv4_interfaces();
+        let loopback = interfaces
+            .iter()
+            .find(|interface| interface.ip == Ipv4Addr::LOCALHOST)
+            .unwrap();
+        assert!(!loopback.usable);
     }
 }
