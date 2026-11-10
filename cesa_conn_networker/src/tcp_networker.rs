@@ -1438,6 +1438,32 @@ mod tests {
         assert!(client_result.is_err());
     }
 
+    /// A full limiter refuses untracked peers on both sides before authentication.
+    #[tokio::test]
+    async fn test_full_guess_limiter_refuses_handshakes() {
+        use crate::guess_limiter::MAX_TRACKED;
+
+        for full_server in [true, false] {
+            let server = make_context(TEST_A_KEY, ACCEPT_ALL);
+            let client = make_context(TEST_A_KEY, ACCEPT_ALL);
+            let full = if full_server { &server } else { &client };
+            for i in 0..u32::try_from(MAX_TRACKED).unwrap() {
+                full.guess_limiter
+                    .record_failure(std::net::IpAddr::V4(i.into()))
+                    .await;
+            }
+            let (server_result, client_result) =
+                exchange(server, client, ActionType::Debug, b"hi").await;
+            if full_server {
+                assert_eq!(server_result.err(), Some(TcpNetworkerErrors::LockedOut));
+                assert!(client_result.is_err());
+            } else {
+                assert_eq!(client_result.err(), Some(TcpNetworkerErrors::LockedOut));
+                assert!(server_result.is_err());
+            }
+        }
+    }
+
     /// Test that a server failing our confirmation is locked out on the client too
     #[tokio::test]
     async fn test_client_locks_out_failing_server() {

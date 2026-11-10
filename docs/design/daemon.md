@@ -730,9 +730,16 @@ IPv4).
 
 - 5 failures in a row lock the source out for 1 min, doubling with each
   further lockout up to 1 h. A successful handshake resets the source.
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:16733bfa015d2507c344d5dc5b6a39ba38f69414c2ffb87b7de562fbdff77d5a -->
+
 - At most 4096 sources tracked; stale ones (not locked, quiet 2 h) are
-  dropped first; if it is still full, a new source is not tracked (better
-  than locking out everybody new).
+  dropped first; if it is still full, new sources are refused before the
+  handshake until space becomes available. Existing sources keep their
+  failure counters and lockouts.
+
+<!-- /coderabbit-ai-generated:v1 -->
 - **Server side**: a locked source gets no handshake at all; a wrong client
   confirmation counts as a failure.
 - **Client side**: a fake server learns one guess from our confirmation value,

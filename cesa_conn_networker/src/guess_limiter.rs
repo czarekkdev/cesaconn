@@ -8,7 +8,9 @@
 //!
 //! After [`MAX_FAILURES`] failures in a row the source is locked out for
 //! [`FIRST_LOCKOUT`], doubling with every further lockout up to
-//! [`MAX_LOCKOUT`]. A successful handshake resets the source.
+//! [`MAX_LOCKOUT`]. A successful handshake resets the source. When all
+//! [`MAX_TRACKED`] entries are active, new sources are refused until space
+//! becomes available; filling the table must not bypass guess limiting.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr};
@@ -93,8 +95,8 @@ fn count_failure(entries: &mut HashMap<Source, Entry>, source: Source, now: Inst
         entries.retain(|_, entry| !entry.is_stale(now));
 
         if entries.len() >= MAX_TRACKED {
-            // full of active sources: not tracking one more beats locking
-            // out everybody new
+            // An already admitted handshake can finish after the table fills.
+            // Future handshakes from untracked sources are refused by is_locked.
             return Counted::NotTracked;
         }
     }
@@ -140,15 +142,19 @@ impl GuessLimiter {
         Self::default()
     }
 
-    /// `true` if `ip` is locked out right now: don't run a handshake with it.
+    /// `true` if `ip` is locked out or cannot be tracked: don't run a handshake with it.
     pub async fn is_locked(&self, ip: IpAddr) -> bool {
         let now = Instant::now();
 
-        self.entries
-            .lock()
-            .await
-            .get(&Source::of(ip))
-            .is_some_and(|entry| entry.is_locked(now))
+        let mut entries = self.entries.lock().await;
+        if let Some(entry) = entries.get(&Source::of(ip)) {
+            return entry.is_locked(now);
+        }
+
+        if entries.len() >= MAX_TRACKED {
+            entries.retain(|_, entry| !entry.is_stale(now));
+        }
+        entries.len() >= MAX_TRACKED
     }
 
     /// Counts a failed SPAKE2 confirmation (wrong password) for `ip`.
@@ -296,6 +302,35 @@ mod tests {
         tokio::time::advance(FORGET_AFTER + Duration::from_secs(1)).await;
         fail(&limiter, V4, MAX_FAILURES).await;
         assert!(limiter.is_locked(V4).await);
+    }
+
+    /// Saturation refuses new sources, preserves existing lockouts, and recovers.
+    #[tokio::test(start_paused = true)]
+    async fn test_full_table_refuses_untracked_sources() {
+        let limiter = GuessLimiter::new();
+        for i in 0..u32::try_from(MAX_TRACKED).unwrap() {
+            limiter.record_failure(IpAddr::V4(i.into())).await;
+        }
+        let tracked = IpAddr::V4(0.into());
+        assert!(!limiter.is_locked(tracked).await);
+        fail(&limiter, tracked, MAX_FAILURES - 1).await;
+        assert!(limiter.is_locked(tracked).await);
+        for _ in 0..MAX_FAILURES * 2 {
+            assert!(limiter.is_locked(V4).await);
+            // Also cover failures from handshakes admitted before saturation.
+            limiter.record_failure(V4).await;
+        }
+        assert_eq!(limiter.entries.lock().await.len(), MAX_TRACKED);
+
+        limiter.record_success(tracked).await;
+        assert!(!limiter.is_locked(V4).await);
+        limiter.record_failure(V4).await;
+        assert!(limiter.is_locked(tracked).await);
+
+        tokio::time::advance(FORGET_AFTER + Duration::from_secs(1)).await;
+        assert!(!limiter.is_locked(tracked).await);
+        fail(&limiter, tracked, MAX_FAILURES).await;
+        assert!(limiter.is_locked(tracked).await);
     }
 
     /// Test the lockout length formula, including overflow
