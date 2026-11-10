@@ -650,7 +650,21 @@ to `StorageFailed`, with details only in the daemon log.
 ### 9.1 Discovery (UDP) **[built; the daemon runs it only in the "Add device" window]**
 
 - Port 3636. Announcement = `"CESACONN" (8) || version 0x01 (1) || instance id (16)`,
-  25 bytes, sent to `255.255.255.255` once per second.
+  25 bytes, sent once per second to `255.255.255.255` **and to the
+  broadcast address of every other IPv4 interface** **[built]**. The OS
+  sends `255.255.255.255` out of the default-route interface only, so a
+  second network on the same machine (a VM's shared network such as
+  Parallels' `bridge100`, Ethernet next to Wi-Fi) never heard it. Usable =
+  up, broadcast-capable, not loopback, not point-to-point (VPN tunnels have
+  no broadcast); the reported broadcast address, or the network's last
+  address; nothing for /31 and /32, nothing outside the interface's own
+  network, each address once, at most 16 destinations. The list is read
+  again every second (`getifaddrs` through `nix`, safe API), so an
+  interface that comes up during a window is used too. A send that fails on
+  one network doesn't stop the others; the round fails only if no
+  destination took it. Windows: `255.255.255.255` only for now. Receivers
+  are unchanged (a wildcard bind gets directed broadcasts too), so older
+  versions hear it.
 - The instance id is random per start, only so a device ignores its own
   broadcasts. It is not an identity and not a secret.
 - The listener accepts exactly 25-byte packets with the right magic and
@@ -1575,7 +1589,8 @@ Tests (`cargo test --workspace --all-features`):
 Every new protection gets a test that fails without it.
 
 Manual two-machine test of the real app (macOS, both devices on one LAN with
-broadcast; allow incoming connections, or open UDP 3636 and TCP 3232 / 3233):
+broadcast, or a VM in the host's shared network; allow incoming
+connections, or open UDP 3636 and TCP 3232 / 3233):
 1. device A: daemon + TUI, set both passwords, Settings > Sync on, then
    Devices > `n` (invite window, 2 min; `x` stops it);
 2. device B (fresh): daemon + TUI, Devices > `n`, the same two passwords;
@@ -1740,6 +1755,13 @@ Decided:
   password" when the devices connect (6.5, 13.1), instead of a warning or
   refusal before the change.
 - (2026-10-31) Clipboard sync is the first sync feature (12).
+
+Proposed in the every-interface broadcast PR, for his review:
+- `nix` (`net` feature, already a dependency) for the interface list
+  instead of a new crate (`if-addrs`); Windows keeps `255.255.255.255`
+  only until its networking runs (9.1);
+- `255.255.255.255` is still sent first, then one directed broadcast per
+  interface, at most 16 (9.1).
 
 Proposed in the clipboard PR, for his review:
 - clipboard access with our own macOS module on `objc2` safe bindings, not
