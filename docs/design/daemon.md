@@ -19,6 +19,8 @@ Every section is marked with its state:
 
 ## Contents
 
+Diagrams of everything below: [`docs/diagrams/`](../diagrams/README.md).
+
 1. What the daemon is
 2. Ground rules (binding)
 3. Threat model
@@ -181,6 +183,8 @@ up front so they never reallocate (a reallocation would leave an unwiped copy).
 
 ## 5. Process architecture
 
+Diagrams: [`docs/diagrams/architecture.md`](../diagrams/architecture.md).
+
 ### 5.1 Runtime **[built]**
 
 One tokio multi-thread runtime (`#[tokio::main]`). Blocking work (Argon2, the
@@ -261,6 +265,8 @@ struct KeySlots {
 ---
 
 ## 6. Lifecycle and state machine
+
+Diagrams: [`docs/diagrams/daemon-states.md`](../diagrams/daemon-states.md).
 
 ### 6.1 States **[built]**
 
@@ -392,6 +398,8 @@ open, saved vault (`Locked` / `NotSaved` otherwise).
 ---
 
 ## 7. Local IPC (UI <-> daemon)
+
+Diagrams: [`docs/diagrams/ipc.md`](../diagrams/ipc.md).
 
 ### 7.1 Transport **[built]**
 
@@ -569,6 +577,8 @@ clipboard switch (12) are built.
 
 ## 8. Storage: keychain and vault
 
+Diagrams: [`docs/diagrams/keys-and-storage.md`](../diagrams/keys-and-storage.md).
+
 ### 8.1 Where each thing is **[built]**
 
 | What | Where |
@@ -738,6 +748,8 @@ IPv4).
 ---
 
 ## 10. `auth_snow`: the handshake
+
+Diagrams: [`docs/diagrams/handshake.md`](../diagrams/handshake.md).
 
 `auth_snow` turns a TCP stream into an authenticated, encrypted
 `SecureConnection` to a known (or newly confirmed) device. Entry points:
@@ -1032,6 +1044,8 @@ in 9.4.
 
 ## 11. Groups and salt sync **[built]**
 
+Diagrams: [`docs/diagrams/join.md`](../diagrams/join.md).
+
 ### 11.1 The problem
 
 `a_key = Argon2(pw1, a_salt)` is the SPAKE2 password, so two devices only
@@ -1197,6 +1211,8 @@ manual test (17).
 
 ## 12. Clipboard sync (v1) **[built on macOS]**
 
+Diagrams: [`docs/diagrams/clipboard-sync.md`](../diagrams/clipboard-sync.md).
+
 His decision (2026-10-31): clipboard sync is the first sync feature. The
 access and delivery choices that were open are made below and listed as
 proposals for his review in 19.
@@ -1320,6 +1336,8 @@ switch as "not supported on this platform yet".
 
 ## 13. Networking switch and pairing over IPC **[built]**
 
+Diagrams: [`docs/diagrams/add-device.md`](../diagrams/add-device.md).
+
 **Sync switch.** "Sync" in the UI, **off by default**, saved in the vault
 config (`SetSync`; saved first, kept second). It needs an open, saved vault:
 `Locked` / `NotSaved` otherwise, so RAM-only platforms (Linux today) have no
@@ -1411,6 +1429,8 @@ reaching the network, the Sync switch surviving restarts and automatic
 login.
 
 ### 13.1 Connection state and "incorrect password" **[built]**
+
+Diagrams: [`docs/diagrams/peer-state.md`](../diagrams/peer-state.md).
 
 His request (2026-10-31): after a password change on one device, the
 devices must say **"incorrect password"** when they connect, instead of
@@ -1504,6 +1524,8 @@ firewall that allows them).
 ---
 
 ## 14. Rotation, revocation, reset
+
+Diagrams: [`docs/diagrams/forget-reset.md`](../diagrams/forget-reset.md).
 
 - **Group password rotation** **[open]**: a password change means new salts
   and keys, re-distributed to the remaining devices. Until it exists, a local

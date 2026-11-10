@@ -138,6 +138,9 @@ Managing devices:
 Allow incoming connections when macOS asks (UDP 3636, TCP 3232 and 3233).
 The full design, threat model and known limits are in
 [`docs/design/daemon.md`](docs/design/daemon.md).
+Diagrams of how it works (architecture, handshake, joining, Add device,
+clipboard sync, keys and storage, and more) are in
+[`docs/diagrams/`](docs/diagrams/README.md).
 
 ---
 
