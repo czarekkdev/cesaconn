@@ -29,7 +29,7 @@ data-protection keychain (WhenUnlockedThisDeviceOnly) together with release sign
 //! connections show (an incorrect password, unreachable) is kept per device
 //! for the UI (`peer_book`).
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
@@ -37,7 +37,7 @@ use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
-use tokio::sync::{RwLock, Semaphore, mpsc};
+use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, sleep, timeout};
 use tokio_util::sync::CancellationToken;
@@ -71,7 +71,8 @@ use crate::{
         TcpNetworkerErrors,
     },
     udp_networker::{
-        InstanceId, MAX_BROADCAST_DURATION, udp_broadcast_presence, udp_find_broadcasters,
+        InstanceId, MAX_BROADCAST_DURATION, is_own_address, udp_broadcast_presence,
+        udp_find_broadcasters,
     },
     vault::{self, Salts, VaultContents, VaultErrors, WrappedDek},
 };
@@ -227,6 +228,40 @@ struct InviteSlot {
     generation: u64,
     window: CancellationToken,
     offer: SaltOffer,
+    /// What this window found, was given and connected to.
+    addrs: Arc<WindowAddrs>,
+}
+
+/// The addresses of one invite window, each list at most
+/// [`MAX_TRIED_PER_WINDOW`]. Kept apart: a device the LAN search found but
+/// leaves to the other side (lower-id rule) may never be connected to by
+/// it (the broadcast only went one way), and the user typing its address
+/// must still make this side connect.
+#[derive(Default)]
+struct WindowAddrs {
+    /// Found by the LAN search (each is checked once).
+    searched: Tried,
+    /// Typed by the user (each is waited for once).
+    typed: Tried,
+    /// Connected to by this side, found or typed: one connection per
+    /// device and window.
+    connected: Tried,
+}
+
+/// A list of addresses that each count once.
+#[derive(Default)]
+struct Tried(Mutex<Vec<IpAddr>>);
+
+impl Tried {
+    /// `true` (and remembered) if `ip` wasn't tried yet and there is room.
+    async fn claim(&self, ip: IpAddr) -> bool {
+        let mut tried = self.0.lock().await;
+        if tried.contains(&ip) || tried.len() >= MAX_TRIED_PER_WINDOW {
+            return false;
+        }
+        tried.push(ip);
+        true
+    }
 }
 
 /// Where a join looks for the member: its salt query and its listener.
@@ -358,6 +393,9 @@ pub struct Daemon {
     peer_book: Arc<PeerBook>,
     /// The port paired devices listen on: [`TCP_PORT`] (tests: theirs).
     peer_port: AtomicU16,
+    /// The port of the salt query on a device at a typed address:
+    /// [`SALT_PORT`] (tests: theirs).
+    peer_salt_port: AtomicU16,
     /// The OS clipboard, `None` where it isn't supported (and in tests
     /// that don't give one).
     clipboard: Option<Arc<dyn Clipboard>>,
@@ -444,6 +482,7 @@ impl Daemon {
             salt_addr,
             peer_book: Arc::default(),
             peer_port: AtomicU16::new(TCP_PORT),
+            peer_salt_port: AtomicU16::new(SALT_PORT),
             clipboard: None,
             #[cfg(test)]
             test_members: RwLock::default(),
@@ -475,16 +514,26 @@ impl Daemon {
                     Err(e) => Response::encode_error(e),
                 }
             }
-            Request::AddDevice => match self.add_device().await {
+            Request::AddDevice => match self.add_device(None).await {
+                Ok(()) => Response::Done.encode(),
+                Err(e) => Response::encode_error(e),
+            },
+            Request::AddDeviceAt(at) => match self.add_device(Some(at.ip())).await {
                 Ok(()) => Response::Done.encode(),
                 Err(e) => Response::encode_error(e),
             },
             // starts the join and returns: it runs (and waits for the user)
             // in its own task, taking the change slot only to commit
-            Request::JoinGroup(passwords) => match self.join_group(passwords).await {
+            Request::JoinGroup(passwords) => match self.join_group(passwords, None).await {
                 Ok(()) => Response::Done.encode(),
                 Err(e) => Response::encode_error(e),
             },
+            Request::JoinGroupAt(at, passwords) => {
+                match self.join_group(passwords, Some(at.ip())).await {
+                    Ok(()) => Response::Done.encode(),
+                    Err(e) => Response::encode_error(e),
+                }
+            }
             Request::CancelJoin => {
                 self.cancel_join().await;
                 Response::Done.encode()
@@ -530,7 +579,9 @@ impl Daemon {
             | Request::PendingPairing
             | Request::AnswerPairing { .. }
             | Request::AddDevice
+            | Request::AddDeviceAt(_)
             | Request::JoinGroup(_)
+            | Request::JoinGroupAt(..)
             | Request::CancelJoin
             | Request::StopAddDevice => Err(DaemonError::BadRequest),
         };
@@ -1822,12 +1873,28 @@ impl Daemon {
     /// whole window it also searches (in [`ADD_DEVICE_SEARCH`] rounds) for
     /// other members with a window open and connects to them (re-pairing two
     /// devices that are both in the group already).
-    async fn add_device(self: &Arc<Self>) -> Result<(), DaemonError> {
-        let Some(invite) = self.open_invite().await? else {
-            // already open: one window at a time
-            return Ok(());
-        };
+    ///
+    /// `at`: a typed address (another network, a VPN) to connect to as
+    /// well, also when the window is open already ([`connect_at`]).
+    async fn add_device(self: &Arc<Self>, at: Option<IpAddr>) -> Result<(), DaemonError> {
+        if at.is_some_and(is_own_address) {
+            return Err(DaemonError::OwnAddress);
+        }
 
+        // already open: one window at a time, an address joins that one
+        if let Some(invite) = self.open_invite().await? {
+            self.run_invite(invite);
+        }
+        if let Some(ip) = at {
+            self.connect_at_in_window(ip).await;
+        }
+
+        Ok(())
+    }
+
+    /// The LAN part of a window just opened, in its own task: announce,
+    /// search and connect until the window ends, then close it.
+    fn run_invite(self: &Arc<Self>, invite: Invite) {
         info!(seconds = INVITE_WINDOW, "add device: invite window open");
 
         let daemon = self.clone();
@@ -1838,11 +1905,12 @@ impl Daemon {
                 id,
                 window,
                 generation,
+                addrs,
             } = invite;
 
             select! {
                 () = token.cancelled() => {},
-                () = invite_window(context, id, window.clone(), daemon.other_group.clone()) => {},
+                () = invite_window(context, id, window.clone(), daemon.other_group.clone(), addrs) => {},
             }
             // the salt goes away with the window, whatever ended it; a
             // window the user stopped (or a newer one) isn't touched here
@@ -1850,8 +1918,6 @@ impl Daemon {
                 info!("add device: invite window closed");
             }
         });
-
-        Ok(())
     }
 
     /// The invite part of [`Daemon::add_device`] without the LAN: marks the
@@ -1891,10 +1957,12 @@ impl Daemon {
 
         let window = CancellationToken::new();
         let generation = self.next_invite.fetch_add(1, Ordering::SeqCst);
+        let addrs = Arc::new(WindowAddrs::default());
         *self.invite.write().await = Some(InviteSlot {
             generation,
             window: window.clone(),
             offer: context.salt_offer.clone(),
+            addrs: addrs.clone(),
         });
 
         // the salt query exists only during the window: no port outside it
@@ -1924,7 +1992,63 @@ impl Daemon {
             id,
             window,
             generation,
+            addrs,
         }))
+    }
+
+    /// Where a device at a typed address listens: its salt query and its
+    /// listener, on the fixed ports.
+    fn member_at(&self, ip: IpAddr) -> MemberAddrs {
+        MemberAddrs {
+            salt: SocketAddr::new(ip, self.peer_salt_port.load(Ordering::SeqCst)),
+            tcp: SocketAddr::new(ip, self.peer_port.load(Ordering::SeqCst)),
+        }
+    }
+
+    /// The typed address of `AddDeviceAt` is connected to within the open
+    /// window (just opened, or open already).
+    async fn connect_at_in_window(self: &Arc<Self>, ip: IpAddr) {
+        let slot = self
+            .invite
+            .read()
+            .await
+            .as_ref()
+            .map(|slot| (slot.window.clone(), slot.addrs.clone()));
+        let running = self
+            .network
+            .read()
+            .await
+            .as_ref()
+            .filter(|network| network.running())
+            .map(|network| (network.context.clone(), network.token.clone()));
+
+        match (slot, running) {
+            (Some((window, addrs)), Some((context, token))) => {
+                self.spawn_connect_at(context, token, window, addrs, ip);
+            }
+            // the window ended (or networking stopped) right in between: the
+            // user presses again
+            _ => warn!(%ip, "add device: no open window to connect to the address from"),
+        }
+    }
+
+    /// Runs [`connect_at`] for `ip` in its own task, until it is done or
+    /// networking ends.
+    fn spawn_connect_at(
+        self: &Arc<Self>,
+        context: NetworkerContext,
+        token: CancellationToken,
+        window: CancellationToken,
+        addrs: Arc<WindowAddrs>,
+        ip: IpAddr,
+    ) {
+        let (member, other_group) = (self.member_at(ip), self.other_group.clone());
+        tokio::spawn(async move {
+            select! {
+                () = token.cancelled() => {},
+                () = connect_at(context, member, window, addrs, other_group) => {},
+            }
+        });
     }
 
     /// Ends the invite window `generation` (`None`: whichever is open):
@@ -1965,11 +2089,22 @@ impl Daemon {
     /// what it gets. The passwords move into the join's task and are wiped
     /// when it ends: success, [`JOIN_WINDOW`], [`JOIN_MAX_ATTEMPTS`],
     /// `CancelJoin` or shutdown.
-    async fn join_group(self: &Arc<Self>, passwords: JoinPasswords) -> Result<(), DaemonError> {
+    ///
+    /// `at`: a typed address (another network, a VPN): the join goes through
+    /// the device there instead of searching the LAN.
+    async fn join_group(
+        self: &Arc<Self>,
+        passwords: JoinPasswords,
+        at: Option<IpAddr>,
+    ) -> Result<(), DaemonError> {
         // a joined device must survive a restart
         if self.storage.is_none() {
             return Err(DaemonError::NotSaved);
         }
+        if at.is_some_and(is_own_address) {
+            return Err(DaemonError::OwnAddress);
+        }
+        let at = at.map(|ip| self.member_at(ip));
         if !self.is_fresh().await {
             return Err(DaemonError::AlreadyInGroup);
         }
@@ -1997,7 +2132,12 @@ impl Daemon {
             drop(join);
         }
 
-        info!("joining a group: looking for a device with \"Add device\" open");
+        match at {
+            Some(member) => {
+                info!(addr = %member.tcp, "joining a group through the device at the address")
+            }
+            None => info!("joining a group: looking for a device with \"Add device\" open"),
+        }
 
         let daemon = self.clone();
         tokio::spawn(async move {
@@ -2005,7 +2145,7 @@ impl Daemon {
                 () = token.cancelled() => info!("join cancelled"),
                 result = timeout(
                     Duration::from_secs(JOIN_WINDOW),
-                    daemon.run_join(passwords, identity, resets),
+                    daemon.run_join(passwords, identity, resets, at),
                 ) => match result {
                     Ok(Ok(())) => info!("joined the group"),
                     Ok(Err(e)) => warn!(error = %e, "join failed"),
@@ -2072,21 +2212,29 @@ impl Daemon {
         }
     }
 
-    /// The join itself: search for members, try each until one succeeds or
-    /// [`JOIN_MAX_ATTEMPTS`] salt attempts are used up.
+    /// The join itself: search for members (or take the one at `at`), try
+    /// each until one succeeds or [`JOIN_MAX_ATTEMPTS`] salt attempts are
+    /// used up. A device that gives no salt (its window isn't open yet)
+    /// costs no attempt: it is asked again after [`JOIN_RETRY_PAUSE`].
     async fn run_join(
         self: &Arc<Self>,
         passwords: JoinPasswords,
         identity: Zeroizing<[u8; IDENTITY_SEED_LEN]>,
         resets: u64,
+        at: Option<MemberAddrs>,
     ) -> Result<(), DaemonError> {
         let mut attempts = 0u32;
 
         while attempts < JOIN_MAX_ATTEMPTS {
-            for member in self.find_members().await {
+            let members = match at {
+                Some(member) => vec![member],
+                None => self.find_members().await,
+            };
+            for member in members {
                 if attempts >= JOIN_MAX_ATTEMPTS {
                     break;
                 }
+                let before = attempts;
                 match self
                     .join_attempt(&passwords, &identity, member, &mut attempts)
                     .await
@@ -2100,6 +2248,11 @@ impl Daemon {
                         })
                         .await
                         .map_err(|_| DaemonError::Internal)?;
+                    }
+                    // no salt there (its window isn't open yet): no attempt used,
+                    // quiet, since a typed address is asked every few seconds
+                    Err(e) if attempts == before => {
+                        debug!(addr = %member.tcp, error = %e, "no join through the device yet");
                     }
                     Err(e) => warn!(addr = %member.tcp, error = %e, "join attempt failed"),
                 }
@@ -2377,6 +2530,8 @@ struct Invite {
     window: CancellationToken,
     /// This window's generation (see [`Daemon::end_invite`]).
     generation: u64,
+    /// The addresses this window works with (see [`WindowAddrs`]).
+    addrs: Arc<WindowAddrs>,
 }
 
 /// Runs the accept loop in its own task until the token is cancelled. If
@@ -2403,11 +2558,64 @@ async fn invite_window(
     id: InstanceId,
     window: CancellationToken,
     other_group: Arc<AtomicBool>,
+    addrs: Arc<WindowAddrs>,
 ) {
     tokio::join!(
         announce_until(id, window.clone()),
-        search_and_connect(context, id, window.clone(), other_group),
+        search_and_connect(context, id, window.clone(), other_group, addrs),
     );
+}
+
+/// "Add device" with a typed address (a device on another network, e.g.
+/// behind a VPN, that discovery can't reach): asks the device there for
+/// its group salt every [`JOIN_RETRY_PAUSE`] until its own window is open
+/// (the salt query only exists then), then connects once. A device of
+/// another group is reported instead (as in [`on_found`]). Unlike a found
+/// device it doesn't wait for the other side to connect: the user named
+/// it, and the other side may not see this one at all.
+async fn connect_at(
+    context: NetworkerContext,
+    member: MemberAddrs,
+    window: CancellationToken,
+    addrs: Arc<WindowAddrs>,
+    other_group: Arc<AtomicBool>,
+) {
+    if !addrs.typed.claim(member.tcp.ip()).await {
+        debug!(addr = %member.tcp, "add device: that address is waited for in this window already");
+        return;
+    }
+    let own_a_salt = context.keys.read().await.a_salt.clone();
+    info!(addr = %member.tcp, "add device: waiting for the device at the address to open Add device");
+
+    loop {
+        let check = select! {
+            () = window.cancelled() => return,
+            check = check_group(&own_a_salt, member.salt) => check,
+        };
+        match check {
+            GroupCheck::Same => {
+                if addrs.connected.claim(member.tcp.ip()).await {
+                    // a full handshake: boxed, so the future isn't kept on the stack
+                    let _ = Box::pin(connect_to(context, member.tcp)).await;
+                } else {
+                    debug!(addr = %member.tcp, "add device: connected to that device in this window already");
+                }
+                return;
+            }
+            GroupCheck::Different => {
+                warn!(addr = %member.tcp, "the device at the address is in a different group (other salts): not connecting; to add it, reset it and use Join on it");
+                other_group.store(true, Ordering::SeqCst);
+                return;
+            }
+            GroupCheck::Unknown => {
+                debug!(addr = %member.tcp, "no Add device window at the address yet");
+                select! {
+                    () = window.cancelled() => return,
+                    () = sleep(Duration::from_secs(JOIN_RETRY_PAUSE)) => {},
+                }
+            }
+        }
+    }
 }
 
 /// What a found device's salt says about its group.
@@ -2502,11 +2710,10 @@ async fn search_and_connect(
     id: InstanceId,
     window: CancellationToken,
     other_group: Arc<AtomicBool>,
+    addrs: Arc<WindowAddrs>,
 ) {
     let own_a_salt = context.keys.read().await.a_salt.clone();
     let mut connects = JoinSet::new();
-    // one connection per address and window (bounded by the search caps)
-    let mut tried: Vec<std::net::IpAddr> = Vec::new();
 
     while !window.is_cancelled() {
         let found = select! {
@@ -2527,22 +2734,31 @@ async fn search_and_connect(
         };
 
         for (addr, their_id) in found {
-            if tried.contains(&addr.ip()) || tried.len() >= MAX_TRIED_PER_WINDOW {
+            // each found device is checked once per window
+            if !addrs.searched.claim(addr.ip()).await {
                 continue;
             }
-            tried.push(addr.ip());
 
             // its own task: a device that doesn't answer the group check
             // (up to the timeouts) never holds up the search or the others
-            let (context, own_a_salt, other_group) =
-                (context.clone(), own_a_salt.clone(), other_group.clone());
+            let (context, own_a_salt, other_group, addrs) = (
+                context.clone(),
+                own_a_salt.clone(),
+                other_group.clone(),
+                addrs.clone(),
+            );
             connects.spawn(async move {
                 // only the IP comes from discovery (an unauthenticated hint)
                 let salt_addr = SocketAddr::new(addr.ip(), SALT_PORT);
                 match on_found(&own_a_salt, salt_addr, id, their_id, &other_group).await {
-                    Found::Connect => {
+                    // one connection per device and window (typed ones included)
+                    Found::Connect if addrs.connected.claim(addr.ip()).await => {
                         // a full handshake: boxed, so the future isn't kept on the stack
                         Box::pin(connect_to(context, SocketAddr::new(addr.ip(), TCP_PORT))).await
+                    }
+                    Found::Connect => {
+                        debug!(%addr, "connected to that device in this window already");
+                        Ok(())
                     }
                     Found::TheyConnect => {
                         debug!(%addr, "found device connects to us");
@@ -2725,7 +2941,7 @@ pub async fn run() {
 mod tests {
     use super::*;
     use crate::auth_snow::HANDSHAKE_DEADLINE;
-    use cesa_conn_system::ipc::{IpcErrors, prepare_socket_dir, request_at};
+    use cesa_conn_system::ipc::{DeviceAddress, IpcErrors, prepare_socket_dir, request_at};
     use cesa_conn_system::keychain::KeychainErrors;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2846,6 +3062,7 @@ mod tests {
                     0x0D => DaemonError::JoinRunning,
                     0x0E => DaemonError::UnknownPeer,
                     0x0F => DaemonError::ClipboardUnavailable,
+                    0x10 => DaemonError::OwnAddress,
                     _ => DaemonError::Internal,
                 }),
                 _ => panic!("unexpected response"),
@@ -4440,6 +4657,236 @@ mod tests {
         // and a new window starts clean
         let _again = a.open_invite().await.unwrap().unwrap();
         assert!(!a.status().await.other_group_nearby);
+    }
+
+    // ── devices on another network: a typed address ───────────────────────
+
+    const LOCALHOST: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
+    /// Where `daemon` finds the device at a typed address: `other`'s ports.
+    fn reach_at(daemon: &Daemon, other: &Daemon) {
+        daemon
+            .peer_salt_port
+            .store(other.salt_addr.port(), Ordering::SeqCst);
+        daemon
+            .peer_port
+            .store(other.listen_addr.port(), Ordering::SeqCst);
+    }
+
+    /// Answers `daemon`'s waiting pairing with yes.
+    async fn accept_prompt(daemon: &Arc<Daemon>, prompt: &PairingPrompt) {
+        ask(
+            daemon,
+            Request::AnswerPairing {
+                id: prompt.id,
+                code: prompt.code,
+                accept: true,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Test that a join at a typed address goes to that device only (no
+    /// LAN search), waits without using attempts until its "Add device"
+    /// window opens, then joins as usual
+    #[tokio::test]
+    async fn test_join_at_address() {
+        let (storage_a, storage_b) = (TestStorage::new("joinat-a"), TestStorage::new("joinat-b"));
+        let member = storage_a.daemon_on_localhost().await;
+        setup(&member).await;
+        ask(&member, Request::SetSync(true)).await.unwrap();
+
+        let joiner = storage_b.daemon_on_localhost().await;
+        reach_at(&joiner, &member);
+        let passwords = JoinPasswords {
+            auth: update(AUTH_PW),
+            data: update(DATA_PW),
+        };
+        joiner.join_group(passwords, Some(LOCALHOST)).await.unwrap();
+
+        // no window there yet: it keeps asking, nobody is prompted
+        sleep(Duration::from_secs(1)).await;
+        assert!(joiner.status().await.joining);
+        assert!(member.pending_pairing().await.is_none());
+
+        let _invite = member.open_invite().await.unwrap().unwrap();
+        let prompt_member = wait_for_prompt(&member).await;
+        let prompt_joiner = wait_for_prompt(&joiner).await;
+        assert_eq!(prompt_member.code, prompt_joiner.code);
+        accept_prompt(&member, &prompt_member).await;
+        accept_prompt(&joiner, &prompt_joiner).await;
+
+        let status = wait_for_status(&joiner, |s| s.saved && s.network_running).await;
+        assert_eq!(status.trusted_peers, 1);
+        assert_eq!(key_bytes(&member).await, key_bytes(&joiner).await);
+    }
+
+    /// Test that "Add device" at a typed address connects to a member of
+    /// the group there once its window opens (the other side never has to
+    /// find this one), both users are asked, and both end up paired
+    #[tokio::test]
+    async fn test_add_device_at_address() {
+        let (storage_a, storage_b) = (TestStorage::new("addat-a"), TestStorage::new("addat-b"));
+        let (a, b) = group_of_two(&storage_a, &storage_b).await;
+        reach_at(&a, &b);
+        assert_eq!(a.status().await.trusted_peers, 0);
+
+        // the window without the LAN part (no broadcast, no UDP port): the
+        // address goes into it the way AddDeviceAt does with a window open
+        let _a_window = a.open_invite().await.unwrap().unwrap();
+        a.add_device(Some(LOCALHOST)).await.unwrap();
+        // the same address again in the same window: still one connection
+        a.add_device(Some(LOCALHOST)).await.unwrap();
+        sleep(Duration::from_secs(1)).await;
+        assert!(b.pending_pairing().await.is_none());
+
+        let _b_window = b.open_invite().await.unwrap().unwrap();
+        let prompt_a = wait_for_prompt(&a).await;
+        let prompt_b = wait_for_prompt(&b).await;
+        assert_eq!(prompt_a.code, prompt_b.code);
+        accept_prompt(&a, &prompt_a).await;
+        accept_prompt(&b, &prompt_b).await;
+
+        wait_for_status(&a, |s| s.trusted_peers == 1).await;
+        wait_for_status(&b, |s| s.trusted_peers == 1).await;
+        sleep(Duration::from_secs(1)).await;
+        assert!(a.pending_pairing().await.is_none());
+        assert!(b.pending_pairing().await.is_none());
+    }
+
+    /// Test that a typed address already waited for in this window, or a
+    /// device this window connected to already (e.g. found by the search),
+    /// gets no second connection
+    #[tokio::test]
+    async fn test_connect_at_once_per_window() {
+        let (storage_a, storage_b) = (TestStorage::new("once-a"), TestStorage::new("once-b"));
+        let (a, b) = group_of_two(&storage_a, &storage_b).await;
+        let _b_window = b.open_invite().await.unwrap().unwrap();
+        reach_at(&a, &b);
+        let (context_a, window) = (context(&a).await, CancellationToken::new());
+
+        // typed twice: the second one ends at once
+        let typed = Arc::new(WindowAddrs::default());
+        assert!(typed.typed.claim(LOCALHOST).await);
+        timeout(
+            Duration::from_secs(1),
+            connect_at(
+                context_a.clone(),
+                a.member_at(LOCALHOST),
+                window.clone(),
+                typed,
+                Arc::default(),
+            ),
+        )
+        .await
+        .unwrap();
+
+        // connected already: the window is open there, still no connection
+        let connected = Arc::new(WindowAddrs::default());
+        assert!(connected.connected.claim(LOCALHOST).await);
+        timeout(
+            Duration::from_secs(10),
+            connect_at(
+                context_a,
+                a.member_at(LOCALHOST),
+                window,
+                connected,
+                Arc::default(),
+            ),
+        )
+        .await
+        .unwrap();
+
+        sleep(Duration::from_secs(1)).await;
+        assert!(b.pending_pairing().await.is_none());
+        assert!(a.pending_pairing().await.is_none());
+    }
+
+    /// Test that a typed address of a device of another group is reported
+    /// and never connected to (no prompt, no guess-limiter slot)
+    #[tokio::test]
+    async fn test_add_device_at_other_group() {
+        let (storage_a, storage_c) = (TestStorage::new("addat-o-a"), TestStorage::new("addat-o-c"));
+        let a = storage_a.daemon_on_localhost().await;
+        setup(&a).await;
+        ask(&a, Request::SetSync(true)).await.unwrap();
+        let c = storage_c.daemon_on_localhost().await;
+        setup(&c).await;
+        ask(&c, Request::SetSync(true)).await.unwrap();
+        let _c_window = c.open_invite().await.unwrap().unwrap();
+        reach_at(&a, &c);
+
+        // the window without the LAN part (see test_add_device_at_address)
+        let _a_window = a.open_invite().await.unwrap().unwrap();
+        a.add_device(Some(LOCALHOST)).await.unwrap();
+        wait_for_status(&a, |s| s.other_group_nearby).await;
+        sleep(Duration::from_secs(1)).await;
+        assert!(c.pending_pairing().await.is_none());
+        assert!(!c.guess_limiter.is_locked(LOCALHOST).await);
+    }
+
+    /// Test that this device's own address is refused for both requests
+    #[tokio::test]
+    async fn test_own_address_refused() {
+        let Some(own) = own_lan_ip() else {
+            // a machine with loopback only: nothing to test
+            return;
+        };
+        let at = DeviceAddress::new(own).unwrap();
+
+        let storage = TestStorage::new("own-addr");
+        let member = storage.daemon_on_localhost().await;
+        setup(&member).await;
+        ask(&member, Request::SetSync(true)).await.unwrap();
+        assert_eq!(
+            ask(&member, Request::AddDeviceAt(at)).await,
+            Err(DaemonError::OwnAddress)
+        );
+        // refused before any window opens
+        assert!(!member.status().await.adding_device);
+
+        let fresh_storage = TestStorage::new("own-addr-fresh");
+        let fresh = fresh_storage.daemon_on_localhost().await;
+        let passwords = JoinPasswords {
+            auth: update(AUTH_PW),
+            data: update(DATA_PW),
+        };
+        assert_eq!(
+            ask(&fresh, Request::JoinGroupAt(at, passwords)).await,
+            Err(DaemonError::OwnAddress)
+        );
+        assert!(!fresh.status().await.joining);
+    }
+
+    /// A non-loopback address of this machine, if it has one.
+    fn own_lan_ip() -> Option<IpAddr> {
+        nix::ifaddrs::getifaddrs()
+            .ok()?
+            .filter_map(|address| address.address?.as_sockaddr_in().map(|v4| v4.ip()))
+            .find(|ip| !ip.is_loopback() && !ip.is_link_local())
+            .map(IpAddr::V4)
+    }
+
+    /// Test that each address counts once per list, at most
+    /// MAX_TRIED_PER_WINDOW, and that the lists are apart: a device the
+    /// search left to the other side can still be typed and connected to
+    #[tokio::test]
+    async fn test_tried_claim() {
+        let addrs = WindowAddrs::default();
+        assert!(addrs.searched.claim(LOCALHOST).await);
+        assert!(addrs.typed.claim(LOCALHOST).await);
+        assert!(addrs.connected.claim(LOCALHOST).await);
+        assert!(!addrs.connected.claim(LOCALHOST).await);
+
+        let tried = Tried::default();
+        assert!(tried.claim(LOCALHOST).await);
+        assert!(!tried.claim(LOCALHOST).await);
+        for i in 1..MAX_TRIED_PER_WINDOW {
+            let ip = IpAddr::from([10, 0, 0, u8::try_from(i).unwrap()]);
+            assert!(tried.claim(ip).await);
+        }
+        assert!(!tried.claim(IpAddr::from([10, 0, 1, 1])).await);
     }
 
     /// Test that only a fresh device with storage may join, and one join

@@ -11,8 +11,8 @@
 mod daemon_link;
 
 use cesa_conn_system::ipc::{
-    DaemonError, IpcErrors, JoinPasswords, MIN_NEW_PASSWORD_LEN, PairingPrompt, PasswordUpdate,
-    PeerInfo, PeerState, Status,
+    DaemonError, DeviceAddress, IpcErrors, JoinPasswords, MIN_NEW_PASSWORD_LEN, PairingPrompt,
+    PasswordUpdate, PeerInfo, PeerState, Status,
 };
 use cesa_conn_system::pairing_code;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -128,6 +128,9 @@ enum ActivePopup {
     /// The daemon (re)started locked: the data password, asked for
     /// without a trip to Settings.
     Unlock,
+    /// `a` on Devices: the IPv4 address of a device on another network (a
+    /// VPN, a routed subnet) that discovery can't reach.
+    DeviceAddress,
 }
 
 /// Which password the join popup asks for.
@@ -159,6 +162,12 @@ pub struct App {
     /// Enter was pressed on a new password below the minimum: the edit
     /// popup stays open and says so (in red) until the input is cleared.
     password_too_short: bool,
+    /// Enter was pressed on something that isn't a usable IP address: the
+    /// address popup stays open and says so until the input is cleared.
+    address_invalid: bool,
+    /// The typed address a join goes through (`a` on a fresh device), kept
+    /// while the two passwords are typed. Not a secret.
+    join_at: Option<DeviceAddress>,
     /// The join's auth password while the data password is typed; pre-sized
     /// like `input_buf` and wiped as soon as the join is sent or cancelled.
     join_auth: Zeroizing<Vec<u8>>,
@@ -233,6 +242,8 @@ impl App {
             active_popup: ActivePopup::None,
             input_buf: Zeroizing::new(String::with_capacity(INPUT_CAPACITY)),
             password_too_short: false,
+            address_invalid: false,
+            join_at: None,
             join_auth: Zeroizing::new(Vec::with_capacity(INPUT_CAPACITY)),
             should_quit: false,
             daemon: DaemonState::Unknown,
@@ -381,6 +392,10 @@ fn handle_input(app: &mut App) -> io::Result<()> {
             handle_unlock_input(app, key.code);
             return Ok(());
         }
+        ActivePopup::DeviceAddress => {
+            handle_address_input(app, key.code);
+            return Ok(());
+        }
         ActivePopup::None => {}
     }
 
@@ -396,6 +411,7 @@ fn handle_input(app: &mut App) -> io::Result<()> {
             KeyCode::Up | KeyCode::Char('k') => app.prev_peer(),
             KeyCode::Down | KeyCode::Char('j') => app.next_peer(),
             KeyCode::Char('n') => start_add_device(app),
+            KeyCode::Char('a') => start_add_at(app),
             KeyCode::Char('x') => stop_or_cancel(app),
             KeyCode::Char('d') => ask_forget_selected(app),
             _ => {}
@@ -630,9 +646,72 @@ fn start_add_device(app: &mut App) {
         DaemonState::Up(status) if is_fresh(status) => {
             clear_input(app);
             app.join_auth.zeroize();
+            app.join_at = None;
             app.active_popup = ActivePopup::JoinGroup(JoinStep::Auth);
         }
         _ => app.push_log("[ WARN] Turn Sync on first (Settings > Sync)"),
+    }
+}
+
+/// `a` on Devices: like `n`, for a device discovery can't reach (another
+/// network, a VPN): asks for its IPv4 address first. A member connects to it
+/// within its "Add device" window, a fresh device joins through it.
+fn start_add_at(app: &mut App) {
+    match &app.daemon {
+        DaemonState::Up(status) if status.joining => {
+            app.push_log("[ INFO] Joining already: x cancels");
+        }
+        DaemonState::Up(status) if status.network_running || is_fresh(status) => {
+            clear_input(app);
+            app.active_popup = ActivePopup::DeviceAddress;
+        }
+        _ => app.push_log("[ WARN] Turn Sync on first (Settings > Sync)"),
+    }
+}
+
+/// Typing the other device's address: Enter checks it (an IP this device
+/// can reach) and goes on, Esc cancels.
+fn handle_address_input(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Esc => {
+            app.active_popup = ActivePopup::None;
+            clear_input(app);
+        }
+        KeyCode::Enter => {
+            let Some(at) = DeviceAddress::parse(&app.input_buf) else {
+                // stays open with what was typed, and says why
+                app.address_invalid = true;
+                return;
+            };
+            clear_input(app);
+            match &app.daemon {
+                DaemonState::Up(status) if status.network_running => {
+                    app.active_popup = ActivePopup::None;
+                    app.outbox.push(Command::AddDeviceAt(at));
+                    app.push_log(format!(
+                        "[ INFO] Add device open for 2 min (x stops it): connecting to {at} as soon as Add device is open there too, then compare the code"
+                    ));
+                }
+                DaemonState::Up(status) if is_fresh(status) => {
+                    app.join_auth.zeroize();
+                    app.join_at = Some(at);
+                    app.active_popup = ActivePopup::JoinGroup(JoinStep::Auth);
+                }
+                _ => {
+                    app.active_popup = ActivePopup::None;
+                    app.push_log("[ WARN] Turn Sync on first (Settings > Sync)");
+                }
+            }
+        }
+        KeyCode::Backspace => {
+            app.input_buf.pop();
+            app.address_invalid = false;
+        }
+        KeyCode::Char(c) => {
+            push_input(app, c);
+            app.address_invalid = false;
+        }
+        _ => {}
     }
 }
 
@@ -666,6 +745,7 @@ fn handle_join_input(app: &mut App, code: KeyCode, step: JoinStep) {
         KeyCode::Esc => {
             clear_input(app);
             app.join_auth.zeroize();
+            app.join_at = None;
             app.active_popup = ActivePopup::None;
         }
         KeyCode::Enter if app.input_buf.is_empty() => {}
@@ -678,20 +758,31 @@ fn handle_join_input(app: &mut App, code: KeyCode, step: JoinStep) {
                 app.active_popup = ActivePopup::JoinGroup(JoinStep::Data);
             }
             JoinStep::Data => {
-                app.outbox.push(Command::JoinGroup(JoinPasswords {
+                let passwords = JoinPasswords {
                     auth: PasswordUpdate {
                         password: Zeroizing::new(app.join_auth.to_vec()),
                     },
                     data: PasswordUpdate {
                         password: Zeroizing::new(app.input_buf.as_bytes().to_vec()),
                     },
-                }));
+                };
+                match app.join_at.take() {
+                    Some(at) => {
+                        app.outbox.push(Command::JoinGroupAt(at, passwords));
+                        app.push_log(format!(
+                            "[ INFO] Joining through {at}: waiting for Add device to be open there (takes a moment)"
+                        ));
+                    }
+                    None => {
+                        app.outbox.push(Command::JoinGroup(passwords));
+                        app.push_log(
+                            "[ INFO] Joining: looking for a device with Add device open (takes a moment)",
+                        );
+                    }
+                }
                 app.join_auth.zeroize();
                 clear_input(app);
                 app.active_popup = ActivePopup::None;
-                app.push_log(
-                    "[ INFO] Joining: looking for a device with Add device open (takes a moment)",
-                );
             }
         },
         KeyCode::Backspace => {
@@ -777,6 +868,7 @@ fn push_input(app: &mut App, c: char) {
 fn clear_input(app: &mut App) {
     app.input_buf.zeroize();
     app.password_too_short = false;
+    app.address_invalid = false;
 }
 
 /// Which key the selected setting is, if it is one.
@@ -1224,6 +1316,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
         ActivePopup::ConfirmForget(peer) => render_confirm_forget_popup(frame, area, &peer),
         ActivePopup::ConfirmReset => render_confirm_reset_popup(frame, area, app),
         ActivePopup::Unlock => render_unlock_popup(frame, area, app),
+        ActivePopup::DeviceAddress => render_address_popup(frame, area, app),
         ActivePopup::None => {}
     }
 }
@@ -1356,7 +1449,7 @@ fn render_devices(frame: &mut Frame, area: Rect, app: &mut App) {
     )));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  n: add device / join    x: stop / cancel join    d: forget",
+        "  n: add device / join    a: by IP (VPN)    x: stop / cancel    d: forget",
         Style::default().fg(Color::DarkGray),
     )));
 
@@ -1671,6 +1764,62 @@ fn render_edit_setting_popup(frame: &mut Frame, area: Rect, app: &App) {
     ));
 }
 
+/// The address popup: what was typed, in red why it can't be used after
+/// Enter, and what the other device must do.
+fn render_address_popup(frame: &mut Frame, area: Rect, app: &App) {
+    let typed = app.input_buf.to_string();
+
+    let w = 66u16.min(area.width);
+    let h = 8u16.min(area.height);
+    let popup = centered_rect(area, w, h);
+
+    let status = if app.address_invalid {
+        Line::from(Span::styled(
+            "  Not usable: an IPv4 address like 10.0.0.5, no name, no port",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        Line::from(Span::styled(
+            "  On that device: Devices > n (Add device) too.",
+            Style::default().fg(Color::DarkGray),
+        ))
+    };
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "  The other device's IPv4 address (e.g. its VPN address):",
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from(format!("  {typed}")),
+        Line::from(""),
+        status,
+        Line::from(Span::styled(
+            "  Enter: connect   Esc: cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" Device on another network ")
+                .title_alignment(Alignment::Center)
+                .border_type(BorderType::Double)
+                .style(Style::default().fg(Color::Cyan)),
+        ),
+        popup,
+    );
+
+    frame.set_cursor_position((
+        popup
+            .x
+            .saturating_add(3)
+            .saturating_add(to_u16(typed.chars().count())),
+        popup.y.saturating_add(2),
+    ));
+}
+
 fn render_join_popup(frame: &mut Frame, area: Rect, step: JoinStep, app: &App) {
     let (title, which) = match step {
         JoinStep::Auth => (" Join a group (1/2) ", "auth"),
@@ -1683,11 +1832,12 @@ fn render_join_popup(frame: &mut Frame, area: Rect, step: JoinStep, app: &App) {
     let h = 8u16.min(area.height);
     let popup = centered_rect(area, w, h);
 
+    let first = match app.join_at {
+        Some(at) => format!("  Through {at}: Devices > n (Add device) there."),
+        None => "  On a device of the group: Devices > n (Add device) first.".to_owned(),
+    };
     let lines = vec![
-        Line::from(Span::styled(
-            "  On a device of the group: Devices > n (Add device) first.",
-            Style::default().fg(Color::DarkGray),
-        )),
+        Line::from(Span::styled(first, Style::default().fg(Color::DarkGray))),
         Line::from(Span::styled(
             format!("  The group's {which} password:"),
             Style::default().fg(Color::Cyan),
@@ -2819,6 +2969,127 @@ mod tests {
         };
         assert_eq!(sent.auth.password.as_slice(), b" auth pw ");
         assert_eq!(sent.data.password.as_slice(), b"data pw");
+    }
+
+    fn type_address(app: &mut App, text: &str) {
+        for c in text.chars() {
+            handle_address_input(app, KeyCode::Char(c));
+        }
+    }
+
+    fn member_running() -> LinkEvent {
+        LinkEvent::Refreshed(Ok((
+            Status {
+                auth_key_set: true,
+                data_key_set: true,
+                saved: true,
+                sync_enabled: true,
+                network_running: true,
+                ..Status::default()
+            },
+            Vec::new(),
+            None,
+        )))
+    }
+
+    /// Test that a on a member asks for an address, keeps the popup open
+    /// with a red reason for anything that isn't a usable IP, and sends
+    /// AddDeviceAt with the address once it is one
+    #[test]
+    fn test_add_device_at_address() {
+        let mut app = App::new();
+        handle_link_event(&mut app, member_running());
+        app.outbox.clear();
+
+        start_add_at(&mut app);
+        assert_eq!(app.active_popup, ActivePopup::DeviceAddress);
+        assert!(screen(&mut app).contains("Device on another network"));
+
+        for bad in ["laptop.local", "127.0.0.1", "10.0.0.1:3232", "fd00::5"] {
+            type_address(&mut app, bad);
+            handle_address_input(&mut app, KeyCode::Enter);
+            assert_eq!(app.active_popup, ActivePopup::DeviceAddress, "{bad}");
+            assert!(app.address_invalid);
+            assert!(screen(&mut app).contains("Not usable"));
+            assert!(app.outbox.is_empty());
+            // typing on clears the warning
+            for _ in bad.chars() {
+                handle_address_input(&mut app, KeyCode::Backspace);
+            }
+            assert!(!app.address_invalid);
+        }
+
+        type_address(&mut app, " 10.211.55.4 ");
+        handle_address_input(&mut app, KeyCode::Enter);
+        assert_eq!(app.active_popup, ActivePopup::None);
+        assert!(app.input_buf.is_empty());
+        let [Command::AddDeviceAt(at)] = app.outbox.as_slice() else {
+            panic!("no AddDeviceAt sent");
+        };
+        assert_eq!(at.to_string(), "10.211.55.4");
+    }
+
+    /// Test that a on a fresh device asks for the address, then both
+    /// passwords, and joins through that address; Esc forgets it, so a
+    /// later n searches the LAN again
+    #[test]
+    fn test_join_at_address() {
+        let mut app = App::new();
+        handle_link_event(&mut app, fresh_status(false));
+        app.outbox.clear();
+
+        start_add_at(&mut app);
+        type_address(&mut app, "172.17.243.179");
+        handle_address_input(&mut app, KeyCode::Enter);
+        assert_eq!(app.active_popup, ActivePopup::JoinGroup(JoinStep::Auth));
+        assert!(screen(&mut app).contains("Through 172.17.243.179"));
+
+        type_text(&mut app, "auth pw");
+        press_in_join(&mut app, KeyCode::Enter);
+        type_text(&mut app, "data pw");
+        press_in_join(&mut app, KeyCode::Enter);
+        assert_eq!(app.active_popup, ActivePopup::None);
+        assert!(app.join_at.is_none());
+        let [Command::JoinGroupAt(at, sent)] = app.outbox.as_slice() else {
+            panic!("no JoinGroupAt sent");
+        };
+        assert_eq!(at.to_string(), "172.17.243.179");
+        assert_eq!(sent.auth.password.as_slice(), b"auth pw");
+        assert_eq!(sent.data.password.as_slice(), b"data pw");
+
+        // an address, then Esc in the join: n afterwards is a plain join
+        app.outbox.clear();
+        start_add_at(&mut app);
+        type_address(&mut app, "10.0.0.9");
+        handle_address_input(&mut app, KeyCode::Enter);
+        press_in_join(&mut app, KeyCode::Esc);
+        assert!(app.join_at.is_none());
+        start_add_device(&mut app);
+        type_text(&mut app, "auth pw");
+        press_in_join(&mut app, KeyCode::Enter);
+        type_text(&mut app, "data pw");
+        press_in_join(&mut app, KeyCode::Enter);
+        assert!(matches!(app.outbox.as_slice(), [Command::JoinGroup(_)]));
+    }
+
+    /// Test that a does nothing but say so without networking on a member,
+    /// and Esc in the address popup sends nothing
+    #[test]
+    fn test_add_at_needs_sync_and_esc_cancels() {
+        let mut app = App::new();
+        handle_link_event(&mut app, up(true, true));
+        app.outbox.clear();
+        start_add_at(&mut app);
+        assert_eq!(app.active_popup, ActivePopup::None);
+        assert!(app.logs.iter().any(|l| l.contains("Turn Sync on")));
+
+        handle_link_event(&mut app, member_running());
+        start_add_at(&mut app);
+        type_address(&mut app, "10.0.0.9");
+        handle_address_input(&mut app, KeyCode::Esc);
+        assert_eq!(app.active_popup, ActivePopup::None);
+        assert!(app.input_buf.is_empty());
+        assert!(app.outbox.is_empty());
     }
 
     /// Test that Esc in the join popup sends nothing and wipes the kept

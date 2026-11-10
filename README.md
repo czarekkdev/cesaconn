@@ -114,6 +114,14 @@ know the others' addresses yet: open Add device (`n`) on both at the same
 time once. From then on they find each other by themselves, as long as one
 of the two keeps its network address between restarts.
 
+Devices on another network (a VPN, another subnet), or ones that don't
+find each other: on the first device press `n` (Add device) as usual; on
+the **new** device press `a` on Devices instead of `n`, type the first
+device's IPv4 address (e.g. its VPN address), then the two passwords. Two
+devices that are both in the group already: `a` on one of them with the
+other's address, `n` on the other. They connect as soon as both are
+ready. TCP ports 3232 and 3233 must be reachable between them.
+
 Changing a password: set the same new password on every device. Until you
 have, the devices that still use the old one show "incorrect password".
 

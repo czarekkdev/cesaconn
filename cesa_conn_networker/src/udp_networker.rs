@@ -211,6 +211,39 @@ fn ipv4_interfaces() -> Vec<Ipv4Interface> {
         .collect()
 }
 
+/// Whether `ip` is an address of one of this machine's interfaces, so
+/// connecting there would reach this device itself. Loopback is never
+/// "own" here (the IPC refuses typed loopback addresses before; tests use
+/// it for two daemons on one machine). `false` if the OS won't say.
+#[cfg(unix)]
+pub fn is_own_address(ip: core::net::IpAddr) -> bool {
+    if ip.is_loopback() {
+        return false;
+    }
+    let Ok(addresses) = nix::ifaddrs::getifaddrs() else {
+        return false;
+    };
+    addresses
+        .filter_map(|address| address.address)
+        .filter_map(|address| {
+            address
+                .as_sockaddr_in()
+                .map(|v4| core::net::IpAddr::V4(v4.ip()))
+                .or_else(|| {
+                    address
+                        .as_sockaddr_in6()
+                        .map(|v6| core::net::IpAddr::V6(v6.ip()))
+                })
+        })
+        .any(|own| own == ip)
+}
+
+/// Not listed elsewhere yet: no address is known to be this machine's.
+#[cfg(not(unix))]
+pub fn is_own_address(_ip: core::net::IpAddr) -> bool {
+    false
+}
+
 /// Not listed elsewhere yet: `255.255.255.255` only.
 #[cfg(not(unix))]
 fn ipv4_interfaces() -> Vec<Ipv4Interface> {
@@ -691,5 +724,24 @@ mod tests {
             .find(|interface| interface.ip == Ipv4Addr::LOCALHOST)
             .unwrap();
         assert!(!loopback.usable);
+    }
+
+    /// Test that this machine's own LAN address counts as its own, while
+    /// loopback (left to the IPC) and an address of nobody here don't
+    #[cfg(unix)]
+    #[test]
+    fn test_is_own_address() {
+        use core::net::IpAddr;
+
+        assert!(!is_own_address(IpAddr::from(Ipv4Addr::LOCALHOST)));
+        // TEST-NET-1: never a real interface's address
+        assert!(!is_own_address(IpAddr::from([192, 0, 2, 1])));
+
+        let lan = ipv4_interfaces()
+            .into_iter()
+            .find(|interface| interface.usable && !interface.ip.is_link_local());
+        if let Some(lan) = lan {
+            assert!(is_own_address(IpAddr::V4(lan.ip)));
+        }
     }
 }

@@ -16,8 +16,8 @@ use std::thread;
 
 use cesa_conn_system::{
     ipc::{
-        self, FINGERPRINT_LEN, IpcErrors, JoinPasswords, PairingPrompt, PasswordUpdate, PeerInfo,
-        Request, Response, Status,
+        self, DeviceAddress, FINGERPRINT_LEN, IpcErrors, JoinPasswords, PairingPrompt,
+        PasswordUpdate, PeerInfo, Request, Response, Status,
     },
     pairing_code::PairingCode,
 };
@@ -50,6 +50,8 @@ pub enum Command {
     SetClipboard(bool),
     /// Open the daemon's "Add device" window.
     AddDevice,
+    /// "Add device", and connect to the device at this address too.
+    AddDeviceAt(DeviceAddress),
     /// The user's answer to a pairing prompt.
     AnswerPairing {
         id: u32,
@@ -58,6 +60,8 @@ pub enum Command {
     },
     /// Join the group of a device with "Add device" open (both passwords).
     JoinGroup(JoinPasswords),
+    /// Join through the device at this address (no LAN search).
+    JoinGroupAt(DeviceAddress, JoinPasswords),
     /// End a running join.
     CancelJoin,
     /// End the "Add device" window early.
@@ -213,6 +217,9 @@ async fn run_command(socket: Option<&PathBuf>, command: Command) -> LinkEvent {
         Command::AddDevice => {
             LinkEvent::AddDeviceStarted(send_done(socket, Request::AddDevice).await)
         }
+        Command::AddDeviceAt(at) => {
+            LinkEvent::AddDeviceStarted(send_done(socket, Request::AddDeviceAt(at)).await)
+        }
         Command::AnswerPairing { id, code, accept } => LinkEvent::PairingAnswered {
             accept,
             result: send_done(socket, Request::AnswerPairing { id, code, accept }).await,
@@ -220,6 +227,9 @@ async fn run_command(socket: Option<&PathBuf>, command: Command) -> LinkEvent {
         // the passwords move into the request, wiped when it is dropped
         Command::JoinGroup(passwords) => {
             LinkEvent::JoinStarted(send_done(socket, Request::JoinGroup(passwords)).await)
+        }
+        Command::JoinGroupAt(at, passwords) => {
+            LinkEvent::JoinStarted(send_done(socket, Request::JoinGroupAt(at, passwords)).await)
         }
         Command::CancelJoin => {
             LinkEvent::JoinCancelled(send_done(socket, Request::CancelJoin).await)
@@ -349,7 +359,7 @@ mod tests {
             rt.block_on(async move {
                 let listener = UnixListener::bind(&server_path).unwrap();
 
-                for _ in 0..15 {
+                for _ in 0..17 {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     let body = ipc::read_frame(&mut stream).await.unwrap();
 
@@ -371,7 +381,9 @@ mod tests {
                         | Request::CancelJoin
                         | Request::StopAddDevice
                         | Request::ForgetPeer(_)
-                        | Request::ResetDevice => {
+                        | Request::ResetDevice
+                        | Request::AddDeviceAt(_)
+                        | Request::JoinGroupAt(..) => {
                             seen_tx.send(body.to_vec()).unwrap();
                             Response::Done.encode()
                         }
@@ -514,6 +526,34 @@ mod tests {
         };
         assert_eq!(sent.auth.password.as_slice(), b"group auth");
         assert_eq!(sent.data.password.as_slice(), b" group data ");
+
+        // a typed address goes along unchanged
+        let at = DeviceAddress::parse("10.211.55.2").unwrap();
+        assert!(link.send(Command::AddDeviceAt(at)));
+        assert_eq!(wait_for_event(&link), LinkEvent::AddDeviceStarted(Ok(())));
+        assert!(matches!(
+            Request::decode(&seen_rx.recv().unwrap()).unwrap(),
+            Request::AddDeviceAt(sent) if sent == at
+        ));
+        assert!(link.send(Command::JoinGroupAt(
+            at,
+            JoinPasswords {
+                auth: PasswordUpdate {
+                    password: Zeroizing::new(b"group auth".to_vec()),
+                },
+                data: PasswordUpdate {
+                    password: Zeroizing::new(b"group data".to_vec()),
+                },
+            }
+        )));
+        assert_eq!(wait_for_event(&link), LinkEvent::JoinStarted(Ok(())));
+        let Some(Request::JoinGroupAt(sent_at, sent)) = Request::decode(&seen_rx.recv().unwrap())
+        else {
+            panic!("not a JoinGroupAt");
+        };
+        assert_eq!(sent_at, at);
+        assert_eq!(sent.auth.password.as_slice(), b"group auth");
+        assert_eq!(sent.data.password.as_slice(), b"group data");
 
         assert!(link.send(Command::CancelJoin));
         assert_eq!(wait_for_event(&link), LinkEvent::JoinCancelled(Ok(())));
