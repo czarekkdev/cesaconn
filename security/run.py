@@ -310,8 +310,12 @@ def check_deny() -> ToolResult:
     if not have_cargo_sub("deny"):
         r.status, r.note = "skipped", "cargo-deny not installed (cargo install cargo-deny --locked)"
         return r
-    for check, sev in (("sources", "critical"), ("bans", "warning"), ("licenses", "warning")):
+    # cargo-deny uses a bit per failed check: advisories=1, bans=2,
+    # licenses=4, sources=8. Operational errors also exit 1.
+    for check, sev, policy_exit in (("sources", "critical", 8), ("bans", "warning", 2),
+                                    ("licenses", "warning", 4)):
         code, out, err = run(["cargo", "deny", "--format", "json", "check", check], timeout=600)
+        policy_error = False
         for line in err.splitlines():
             try:
                 d = json.loads(line)
@@ -322,11 +326,15 @@ def check_deny() -> ToolResult:
             f = d["fields"]
             if f.get("severity") not in ("error", "warning"):
                 continue
+            policy_error |= f["severity"] == "error"
             s = sev if f["severity"] == "error" else "warning"
             r.findings.append(Finding("cargo-deny", f"{check}:{f.get('code', '')}", s,
                                       f.get("message", ""), "Cargo.lock"))
-        if code not in (0, 1) and not r.findings:
-            r.findings.append(Finding("cargo-deny", check, "info", f"cargo deny check {check} failed: {err[-400:]}"))
+        # Findings from other invocations cannot explain this one's exit.
+        # Keep coverage gaps separate from accept-able Cargo.lock warnings.
+        if code != 0 and not (code == policy_exit and policy_error):
+            r.findings.append(Finding("cargo-deny", check, "info",
+                                      f"cargo deny check {check} failed (exit {code}): {err[-400:]}"))
     return r
 
 
