@@ -1400,7 +1400,7 @@ mod tests {
         let (status, keys) = (row(22), row(23));
 
         assert!(status.contains("daemon: keys 2/2"), "status: {status}");
-        for key in ["q:Quit", "n:Add/Join", "x:Stop", "d:Forget"] {
+        for key in ["q:Quit", "n:Add/Join", "a:By IP", "x:Stop", "d:Forget"] {
             assert!(keys.contains(key), "{key} missing in: {keys}");
         }
     }
