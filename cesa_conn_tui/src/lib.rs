@@ -156,6 +156,9 @@ pub struct App {
     /// Text typed into a popup. Can hold a password, so it is pre-sized
     /// (never reallocates, which would leave un-wiped copies) and wiped on clear.
     input_buf: Zeroizing<String>,
+    /// Enter was pressed on a new password below the minimum: the edit
+    /// popup stays open and says so (in red) until the input is cleared.
+    password_too_short: bool,
     /// The join's auth password while the data password is typed; pre-sized
     /// like `input_buf` and wiped as soon as the join is sent or cancelled.
     join_auth: Zeroizing<Vec<u8>>,
@@ -229,6 +232,7 @@ impl App {
             log_follow: true,
             active_popup: ActivePopup::None,
             input_buf: Zeroizing::new(String::with_capacity(INPUT_CAPACITY)),
+            password_too_short: false,
             join_auth: Zeroizing::new(Vec::with_capacity(INPUT_CAPACITY)),
             should_quit: false,
             daemon: DaemonState::Unknown,
@@ -738,7 +742,11 @@ fn handle_edit_setting_input(app: &mut App, code: KeyCode) {
         KeyCode::Enter => {
             // every editable setting is a password: exactly as typed (never
             // trimmed), straight to the daemon
-            send_password_from_input(app);
+            if !send_password_from_input(app) {
+                // too short: the popup says so and keeps what was typed
+                app.password_too_short = true;
+                return;
+            }
             app.active_popup = ActivePopup::None;
             clear_input(app);
         }
@@ -761,9 +769,11 @@ fn push_input(app: &mut App, c: char) {
     }
 }
 
-/// Wipes the whole input buffer (spare capacity too), keeping its allocation.
+/// Wipes the whole input buffer (spare capacity too), keeping its allocation,
+/// and the too-short warning that belonged to it.
 fn clear_input(app: &mut App) {
     app.input_buf.zeroize();
+    app.password_too_short = false;
 }
 
 /// Which key the selected setting is, if it is one.
@@ -778,13 +788,15 @@ fn selected_key_kind(app: &App) -> Option<KeyKind> {
 /// Hands the typed password to the daemon link. The only copy is an
 /// exact-size zeroizing buffer that the link drops right after sending; the
 /// caller wipes the input buffer. The daemon picks and keeps the salt.
-fn send_password_from_input(app: &mut App) {
+/// Returns `false` only for a new password below the minimum (nothing
+/// sent, the popup stays open); `true` when the popup can close.
+fn send_password_from_input(app: &mut App) -> bool {
     let Some(kind) = selected_key_kind(app) else {
-        return;
+        return true;
     };
 
     if app.input_buf.is_empty() {
-        return;
+        return true;
     }
 
     let name = match kind {
@@ -806,15 +818,15 @@ fn send_password_from_input(app: &mut App) {
         } else {
             app.push_log("[ WARN] Saved keys are locked: unlock with the data password first");
         }
-        return;
+        return true;
     }
 
     // the daemon checks this too; this only saves a round trip
     if app.input_buf.chars().count() < MIN_NEW_PASSWORD_LEN {
         app.push_log(format!(
-            "[ WARN] Use at least {MIN_NEW_PASSWORD_LEN} characters, nothing sent"
+            "[ WARN] The {name} password is too short: use at least {MIN_NEW_PASSWORD_LEN} characters, nothing sent"
         ));
-        return;
+        return false;
     }
 
     app.outbox.push(Command::SetPassword {
@@ -826,6 +838,7 @@ fn send_password_from_input(app: &mut App) {
     app.push_log(format!(
         "[ INFO] Sending the {name} password to the daemon (deriving the key takes a moment)"
     ));
+    true
 }
 
 /// Applies what the daemon link reported.
@@ -1593,17 +1606,47 @@ fn render_edit_setting_popup(frame: &mut Frame, area: Rect, app: &App) {
         app.input_buf.to_string()
     };
 
+    // a new password: how many characters so far against the minimum (an
+    // unlock takes the existing password, any length)
+    let typed = app.input_buf.chars().count();
+    let hint = match setting.kind {
+        SettingKind::Secret { .. } if app.password_too_short && typed < MIN_NEW_PASSWORD_LEN => {
+            Some(Line::from(Span::styled(
+                format!(
+                    " Too short ({typed}/{MIN_NEW_PASSWORD_LEN}): at least {MIN_NEW_PASSWORD_LEN} characters"
+                ),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )))
+        }
+        SettingKind::Secret { .. } if typed < MIN_NEW_PASSWORD_LEN => {
+            Some(Line::from(Span::styled(
+                format!(
+                    " {typed}/{MIN_NEW_PASSWORD_LEN} characters (at least {MIN_NEW_PASSWORD_LEN})"
+                ),
+                Style::default().fg(Color::Yellow),
+            )))
+        }
+        SettingKind::Secret { .. } => Some(Line::from(Span::styled(
+            format!(" {typed} characters: long enough"),
+            Style::default().fg(Color::Green),
+        ))),
+        _ => None,
+    };
+
     let title = format!(" Edit: {} ", setting.label);
     let w = to_u16(title.len())
         .saturating_add(10)
-        .max(52)
+        .max(60)
         .min(area.width);
-    let h = 5u16.min(area.height);
+    let h = if hint.is_some() { 6u16 } else { 5u16 }.min(area.height);
     let popup = centered_rect(area, w, h);
+
+    let mut lines = vec![Line::from(format!(" {display_input}"))];
+    lines.extend(hint);
 
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(format!(" {}", display_input)).block(
+        Paragraph::new(lines).block(
             Block::bordered()
                 .title(title)
                 .title_alignment(Alignment::Center)
@@ -2252,8 +2295,45 @@ mod tests {
         type_and_enter(&mut app, &"a".repeat(MIN_NEW_PASSWORD_LEN - 1));
 
         assert!(app.outbox.is_empty());
+        assert!(app.logs.iter().any(|l| l.contains("too short")));
+        // the popup stays open with what was typed, and says why in red
+        assert_eq!(app.active_popup, ActivePopup::EditSetting);
+        assert_eq!(app.input_buf.chars().count(), MIN_NEW_PASSWORD_LEN - 1);
+        assert!(screen(&mut app).contains("Too short (11/12)"));
+
+        // typing on to the minimum: long enough, sent, closed and wiped
+        handle_edit_setting_input(&mut app, KeyCode::Char('a'));
+        assert!(screen(&mut app).contains("long enough"));
+        handle_edit_setting_input(&mut app, KeyCode::Enter);
+        assert!(matches!(
+            app.outbox.as_slice(),
+            [Command::SetPassword { .. }]
+        ));
+        assert_eq!(app.active_popup, ActivePopup::None);
         assert!(app.input_buf.is_empty());
-        assert!(app.logs.iter().any(|l| l.contains("at least")));
+        assert!(!app.password_too_short);
+    }
+
+    /// Test that the new-password popup counts characters against the
+    /// minimum while typing, and Esc wipes the input and the warning
+    #[test]
+    fn test_password_length_hint() {
+        let mut app = App::new();
+        select(&mut app, AUTH_KEY_LABEL);
+        app.active_popup = ActivePopup::EditSetting;
+
+        assert!(screen(&mut app).contains("0/12 characters"));
+        for c in "abcde".chars() {
+            handle_edit_setting_input(&mut app, KeyCode::Char(c));
+        }
+        assert!(screen(&mut app).contains("5/12 characters"));
+        handle_edit_setting_input(&mut app, KeyCode::Enter);
+        assert!(app.password_too_short);
+
+        handle_edit_setting_input(&mut app, KeyCode::Esc);
+        assert_eq!(app.active_popup, ActivePopup::None);
+        assert!(app.input_buf.is_empty());
+        assert!(!app.password_too_short);
     }
 
     /// Test that while the vault is locked the data key field unlocks (any
