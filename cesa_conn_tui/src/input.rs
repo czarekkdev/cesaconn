@@ -4,6 +4,8 @@ use super::*;
 
 // ── Input handling ────────────────────────────────────────────────────────────
 
+/// One key press: Ctrl-C quits; otherwise an open popup takes it, then q
+/// (quit) and Tab, then the active tab.
 pub(super) fn handle_input(app: &mut App) -> io::Result<()> {
     let Event::Key(key) = event::read()? else {
         return Ok(());
@@ -99,6 +101,8 @@ pub(super) fn handle_input(app: &mut App) -> io::Result<()> {
     Ok(())
 }
 
+/// Enter on Settings: Reset asks for `RESET`, a switch goes to the daemon
+/// (automatic login warns first), a password field opens its popup.
 pub(super) fn handle_settings_enter(app: &mut App) {
     let idx = app.settings_selected;
 
@@ -175,6 +179,7 @@ pub(super) fn unlock_wait(app: &App) -> u16 {
     }
 }
 
+/// Logs how long the daemon still refuses `Unlock`.
 pub(super) fn log_unlock_wait(app: &mut App) {
     let secs = unlock_wait(app);
     app.push_log(format!(

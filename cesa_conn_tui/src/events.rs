@@ -264,6 +264,7 @@ pub(super) fn show_pairing(app: &mut App, pairing: Option<PairingPrompt>) {
     }
 }
 
+/// Shows the auth and data key fields as set or not (what the daemon has).
 pub(super) fn set_key_flags(app: &mut App, auth: bool, data: bool) {
     for (label, configured) in [(AUTH_KEY_LABEL, auth), (DATA_KEY_LABEL, data)] {
         if let Some(s) = app.setting_mut(label) {

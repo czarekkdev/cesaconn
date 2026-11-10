@@ -4,6 +4,8 @@ use super::*;
 
 // ── Rendering ─────────────────────────────────────────────────────────────────
 
+/// Draws the whole screen: header, the active tab, the status bar, and the
+/// popup on top if one is open.
 pub(super) fn ui(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
@@ -36,6 +38,7 @@ pub(super) fn ui(frame: &mut Frame, app: &mut App) {
     }
 }
 
+/// The tab bar.
 pub(super) fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     let tabs = Tabs::new(["  Devices  ", "  Settings  ", "  Logs  "])
         .block(
@@ -59,6 +62,7 @@ pub(super) fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(tabs, area);
 }
 
+/// The active tab.
 pub(super) fn render_content(frame: &mut Frame, area: Rect, app: &mut App) {
     match app.active_tab {
         Tab::Devices => render_devices(frame, area, app),
@@ -67,6 +71,8 @@ pub(super) fn render_content(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
+/// Devices: the daemon's paired devices with their state, the selected
+/// one's details, what is going on, and the keys.
 pub(super) fn render_devices(frame: &mut Frame, area: Rect, app: &mut App) {
     let [list_area, detail_area] =
         Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).areas(area);
@@ -178,6 +184,7 @@ pub(super) fn render_devices(frame: &mut Frame, area: Rect, app: &mut App) {
     );
 }
 
+/// Settings: every setting with its value from the daemon.
 pub(super) fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
     let outer_block = Block::bordered()
         .title(" Settings ")
@@ -222,6 +229,8 @@ pub(super) fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// Logs: the log lines coloured by level, following the newest unless
+/// scrolled up.
 pub(super) fn render_logs(frame: &mut Frame, area: Rect, app: &mut App) {
     let inner_height = area.height.saturating_sub(2) as usize;
 
@@ -264,6 +273,7 @@ pub(super) fn render_logs(frame: &mut Frame, area: Rect, app: &mut App) {
     );
 }
 
+/// The two-line status bar: the daemon's state and the keys of the tab.
 pub(super) fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
     let help = match app.active_tab {
         Tab::Devices => " q:Quit  Tab:Switch  ↑↓:Select  n:Add/Join  x:Stop  d:Forget ",
@@ -326,6 +336,7 @@ pub(super) fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// A new device asks to pair: the code to compare, then y / n.
 pub(super) fn render_pairing_popup(frame: &mut Frame, area: Rect, prompt: &PairingPrompt) {
     let w = 68u16.min(area.width);
     let h = 13u16.min(area.height);
@@ -535,6 +546,8 @@ pub(super) fn render_address_popup(frame: &mut Frame, area: Rect, app: &App) {
     ));
 }
 
+/// Joining a group: the auth, then the data password (one star per
+/// character).
 pub(super) fn render_join_popup(frame: &mut Frame, area: Rect, step: JoinStep, app: &App) {
     let (title, which) = match step {
         JoinStep::Auth => (" Join a group (1/2) ", "auth"),
@@ -586,6 +599,7 @@ pub(super) fn render_join_popup(frame: &mut Frame, area: Rect, step: JoinStep, a
     ));
 }
 
+/// "Change the password?" before a set password is replaced.
 pub(super) fn render_confirm_change_popup(frame: &mut Frame, area: Rect, kind: KeyKind) {
     let name = match kind {
         KeyKind::Auth => "auth",
@@ -640,6 +654,7 @@ pub(super) fn render_confirm_change_popup(frame: &mut Frame, area: Rect, kind: K
     );
 }
 
+/// The data password that unlocks the saved keys after a daemon restart.
 pub(super) fn render_unlock_popup(frame: &mut Frame, area: Rect, app: &App) {
     // one star per character, the byte length would leak more than the length
     let stars = "*".repeat(app.input_buf.chars().count());
@@ -687,6 +702,7 @@ pub(super) fn render_unlock_popup(frame: &mut Frame, area: Rect, app: &App) {
     ));
 }
 
+/// "Forget this device?" (y / n), and that it can still pair again.
 pub(super) fn render_confirm_forget_popup(frame: &mut Frame, area: Rect, peer: &PeerInfo) {
     let w = 64u16.min(area.width);
     let h = 10u16.min(area.height);
@@ -742,6 +758,7 @@ pub(super) fn render_confirm_forget_popup(frame: &mut Frame, area: Rect, peer: &
     );
 }
 
+/// "Reset this device?": the user types `RESET`.
 pub(super) fn render_confirm_reset_popup(frame: &mut Frame, area: Rect, app: &App) {
     let w = 66u16.min(area.width);
     let h = 13u16.min(area.height);
@@ -795,6 +812,8 @@ pub(super) fn render_confirm_reset_popup(frame: &mut Frame, area: Rect, app: &Ap
     );
 }
 
+/// The automatic-login warning: what keeping `d_key` in the keychain
+/// means, then y / n.
 pub(super) fn render_security_warning_popup(frame: &mut Frame, area: Rect, idx: usize, app: &App) {
     let Some(setting) = app.settings.get(idx) else {
         return;
