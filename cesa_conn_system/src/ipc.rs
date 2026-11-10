@@ -13,7 +13,7 @@
 //!   a daemon of the same user, and on macOS only to one whose signature
 //!   satisfies [`DAEMON_CODE_REQUIREMENT`].
 //!
-//! Wire format (version 8), one request and one response per connection:
+//! Wire format (version 9), one request and one response per connection:
 //! `frame = length (u32 LE, 1..=MAX_FRAME_LEN) || body`
 //!
 //! Request body: `kind (1) || payload`
@@ -45,6 +45,13 @@
 //!   sure a reset is never decoded from anything sent by mistake
 //! * `0x12` SetClipboard: `on (1)`, exactly `0x00` or `0x01`; clipboard sync
 //!   on/off, saved in the vault
+//! * `0x13` AddDeviceAt: `address`; AddDevice that also connects to the
+//!   device at that address (another network: a VPN, a routed subnet)
+//! * `0x14` JoinGroupAt: `address || JoinGroup's payload`; JoinGroup
+//!   through the device at that address instead of searching the LAN
+//! * `address` = `4 (1) || IPv4 (4)`, a [`DeviceAddress`]: not unspecified,
+//!   loopback, multicast or the broadcast. Family `6` is reserved for IPv6
+//!   (the listener is IPv4 only for now) and refused, like any other
 //! * `0x02` / `0x03` are retired (version 1 sent `salt || password` there).
 //!   They are refused, so a mismatched UI and daemon fail loudly instead of
 //!   deriving a key from the wrong bytes.
@@ -64,7 +71,8 @@
 //!   loudly too.
 //! * SetAuthPassword / SetDataPassword / Unlock / SetAutoLogin / SetSync /
 //!   AddDevice / AnswerPairing / JoinGroup / CancelJoin / StopAddDevice /
-//!   ForgetPeer / ResetDevice / SetClipboard: empty
+//!   ForgetPeer / ResetDevice / SetClipboard / AddDeviceAt / JoinGroupAt:
+//!   empty
 //! * ListPeers: `count (u16 LE) || count * (fingerprint (8) || state (1) ||
 //!   name len (1) || name)`; state is a [`PeerState`] byte, others are refused
 //! * PendingPairing: `0x00` (none) or `0x01 || id (u32 LE) || code (8) ||
@@ -72,6 +80,7 @@
 //!   [`crate::pairing_code::PAIRING_SYMBOLS`], the name has no control characters
 
 use core::fmt;
+use core::net::{IpAddr, Ipv4Addr};
 #[cfg(unix)]
 use std::path::Path;
 use std::path::PathBuf;
@@ -145,6 +154,12 @@ const REQ_STOP_ADD_DEVICE: u8 = 0x0F;
 const REQ_FORGET_PEER: u8 = 0x10;
 const REQ_RESET_DEVICE: u8 = 0x11;
 const REQ_SET_CLIPBOARD: u8 = 0x12;
+const REQ_ADD_DEVICE_AT: u8 = 0x13;
+const REQ_JOIN_GROUP_AT: u8 = 0x14;
+
+/* device address */
+/// family byte of an IPv4 address (then 4 bytes)
+const ADDR_V4: u8 = 4;
 
 /// The payload of `ResetDevice`: nothing sent by mistake decodes as a reset.
 pub const RESET_CONFIRM: [u8; 8] = *b"CN-RESET";
@@ -260,6 +275,8 @@ pub enum DaemonError {
     UnknownPeer = 0x0E,
     /// SetClipboard: this platform has no clipboard support yet.
     ClipboardUnavailable = 0x0F,
+    /// AddDeviceAt / JoinGroupAt: that address is this device's own.
+    OwnAddress = 0x10,
 }
 
 impl DaemonError {
@@ -280,6 +297,7 @@ impl DaemonError {
             0x0D => Some(Self::JoinRunning),
             0x0E => Some(Self::UnknownPeer),
             0x0F => Some(Self::ClipboardUnavailable),
+            0x10 => Some(Self::OwnAddress),
             _ => None,
         }
     }
@@ -317,6 +335,12 @@ impl fmt::Display for DaemonError {
             DaemonError::UnknownPeer => write!(f, "no paired device has that fingerprint"),
             DaemonError::ClipboardUnavailable => {
                 write!(f, "clipboard sync isn't supported on this platform yet")
+            }
+            DaemonError::OwnAddress => {
+                write!(
+                    f,
+                    "that is this device's own address: type the other device's"
+                )
             }
         }
     }
@@ -369,6 +393,68 @@ pub enum Request {
     ResetDevice,
     /// Turn clipboard sync on (`true`) or off; saved.
     SetClipboard(bool),
+    /// [`Request::AddDevice`], and connect to the device at this address
+    /// too (it must have "Add device" open as well).
+    AddDeviceAt(DeviceAddress),
+    /// [`Request::JoinGroup`] through the device at this address, instead
+    /// of searching the LAN.
+    JoinGroupAt(DeviceAddress, JoinPasswords),
+}
+
+/// The address of another device, typed by the user: where to connect
+/// when discovery can't reach it (another network, a VPN). Only the IP: the
+/// ports are fixed. Only a hint like a discovered address: the handshake
+/// decides trust. IPv4 only: the listener and the salt query bind IPv4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceAddress(Ipv4Addr);
+
+impl DeviceAddress {
+    /// `ip` if a device can be reached there: IPv4 (an IPv4-mapped IPv6
+    /// address counts as its IPv4 address), not unspecified, loopback (this
+    /// device), multicast or the broadcast.
+    pub fn new(ip: IpAddr) -> Option<Self> {
+        let IpAddr::V4(v4) = ip.to_canonical() else {
+            return None;
+        };
+        let usable =
+            !v4.is_unspecified() && !v4.is_loopback() && !v4.is_multicast() && !v4.is_broadcast();
+        usable.then_some(Self(v4))
+    }
+
+    /// Parses what the user typed: an IPv4 address (or its IPv4-mapped IPv6
+    /// form), nothing else (no host names, no port); surrounding spaces are
+    /// ignored.
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::new(text.trim().parse().ok()?)
+    }
+
+    /// The IP address.
+    pub fn ip(&self) -> IpAddr {
+        IpAddr::V4(self.0)
+    }
+
+    /// `family (1) || ip (4)`, appended to `out`.
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        out.push(ADDR_V4);
+        out.extend_from_slice(&self.0.octets());
+    }
+
+    /// Splits an address off the front of `payload`; `None` unless it is
+    /// family 4 with exactly 4 bytes and a usable address.
+    fn decode_from(payload: &[u8]) -> Option<(Self, &[u8])> {
+        let (&family, rest) = payload.split_first()?;
+        if family != ADDR_V4 {
+            return None;
+        }
+        let (octets, rest) = rest.split_first_chunk::<4>()?;
+        Some((Self::new(IpAddr::from(*octets))?, rest))
+    }
+}
+
+impl fmt::Display for DeviceAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
 /// The two group passwords for `JoinGroup`, each in its own exact-size
@@ -500,6 +586,46 @@ fn short_name(name: &str) -> &[u8] {
 }
 
 /// Parses a `password` payload.
+/// `JoinGroup` / `JoinGroupAt` body: `kind || [address] || auth len (u16
+/// LE) || auth || data`. Sized up front so the buffer never reallocates
+/// (it holds both passwords).
+fn encode_join(at: Option<&DeviceAddress>, passwords: &JoinPasswords) -> Zeroizing<Vec<u8>> {
+    let (auth, data) = (&passwords.auth.password, &passwords.data.password);
+    // the encoder never cuts: a too long password goes out whole and the
+    // daemon refuses it
+    let auth_len = u16::try_from(auth.len()).unwrap_or(u16::MAX);
+    let mut body = Zeroizing::new(Vec::with_capacity(
+        (1usize + 1 + 4 + 2)
+            .saturating_add(auth.len())
+            .saturating_add(data.len()),
+    ));
+    match at {
+        Some(at) => {
+            body.push(REQ_JOIN_GROUP_AT);
+            at.encode_into(&mut body);
+        }
+        None => body.push(REQ_JOIN_GROUP),
+    }
+    body.extend_from_slice(&auth_len.to_le_bytes());
+    body.extend_from_slice(auth);
+    body.extend_from_slice(data);
+    body
+}
+
+/// The two passwords of a join, consumed exactly.
+fn parse_join(payload: &[u8]) -> Option<JoinPasswords> {
+    let (auth_len, rest) = payload.split_first_chunk::<2>()?;
+    let auth_len = usize::from(u16::from_le_bytes(*auth_len));
+    if auth_len > rest.len() {
+        return None;
+    }
+    let (auth, data) = rest.split_at(auth_len);
+    Some(JoinPasswords {
+        auth: parse_password_update(auth)?,
+        data: parse_password_update(data)?,
+    })
+}
+
 fn parse_password_update(password: &[u8]) -> Option<PasswordUpdate> {
     if password.is_empty() || password.len() > MAX_PASSWORD_LEN {
         return None;
@@ -536,20 +662,13 @@ impl Request {
             Request::ResetDevice => {
                 return Zeroizing::new([&[REQ_RESET_DEVICE][..], &RESET_CONFIRM].concat());
             }
-            Request::JoinGroup(passwords) => {
-                let (auth, data) = (&passwords.auth.password, &passwords.data.password);
-                // the encoder never cuts: a too long password goes out whole
-                // and the daemon refuses it
-                let auth_len = u16::try_from(auth.len()).unwrap_or(u16::MAX);
-                // sized up front so the buffer never reallocates
-                let mut body = Zeroizing::new(Vec::with_capacity(
-                    3usize.saturating_add(auth.len()).saturating_add(data.len()),
-                ));
-                body.push(REQ_JOIN_GROUP);
-                body.extend_from_slice(&auth_len.to_le_bytes());
-                body.extend_from_slice(auth);
-                body.extend_from_slice(data);
-                return body;
+            Request::JoinGroup(passwords) => return encode_join(None, passwords),
+            Request::JoinGroupAt(at, passwords) => return encode_join(Some(at), passwords),
+            Request::AddDeviceAt(at) => {
+                let mut body = Vec::with_capacity(1 + 1 + 4);
+                body.push(REQ_ADD_DEVICE_AT);
+                at.encode_into(&mut body);
+                return Zeroizing::new(body);
             }
             Request::AnswerPairing { id, code, accept } => {
                 let mut body = Zeroizing::new(Vec::with_capacity(1 + 4 + PAIRING_CODE_LEN + 1));
@@ -595,18 +714,15 @@ impl Request {
             // a public constant, not a secret: nothing for timing to reveal
             // nosemgrep: cesa.net.non-constant-time-compare
             REQ_RESET_DEVICE if payload == RESET_CONFIRM => Some(Request::ResetDevice),
-            REQ_JOIN_GROUP => {
-                let (auth_len, rest) = payload.split_first_chunk::<2>()?;
-                let auth_len = usize::from(u16::from_le_bytes(*auth_len));
-                if auth_len > rest.len() {
-                    return None;
-                }
-                let (auth, data) = rest.split_at(auth_len);
-                Some(Request::JoinGroup(JoinPasswords {
-                    auth: parse_password_update(auth)?,
-                    data: parse_password_update(data)?,
-                }))
+            REQ_JOIN_GROUP => parse_join(payload).map(Request::JoinGroup),
+            REQ_JOIN_GROUP_AT => {
+                let (at, rest) = DeviceAddress::decode_from(payload)?;
+                parse_join(rest).map(|passwords| Request::JoinGroupAt(at, passwords))
             }
+            REQ_ADD_DEVICE_AT => match DeviceAddress::decode_from(payload)? {
+                (at, []) => Some(Request::AddDeviceAt(at)),
+                _ => None,
+            },
             REQ_ANSWER_PAIRING => {
                 let (id, rest) = payload.split_first_chunk::<4>()?;
                 let (code, accept) = rest.split_first_chunk::<PAIRING_CODE_LEN>()?;
@@ -757,6 +873,8 @@ impl Response {
             | Request::ForgetPeer(_)
             | Request::ResetDevice
             | Request::SetClipboard(_)
+            | Request::AddDeviceAt(_)
+            | Request::JoinGroupAt(..)
                 if payload.is_empty() =>
             {
                 Ok(Response::Done)
@@ -773,7 +891,9 @@ impl Response {
             | Request::StopAddDevice
             | Request::ForgetPeer(_)
             | Request::ResetDevice
-            | Request::SetClipboard(_) => Err(IpcErrors::Malformed),
+            | Request::SetClipboard(_)
+            | Request::AddDeviceAt(_)
+            | Request::JoinGroupAt(..) => Err(IpcErrors::Malformed),
             Request::ListPeers => decode_peers(payload).ok_or(IpcErrors::Malformed),
             Request::PendingPairing => decode_pairing(payload).ok_or(IpcErrors::Malformed),
         }
@@ -1065,6 +1185,21 @@ mod tests {
                 auth: update(&vec![b'a'; MAX_PASSWORD_LEN]),
                 data: update(&vec![b'd'; MAX_PASSWORD_LEN]),
             }),
+            Request::AddDeviceAt(DeviceAddress::parse("10.211.55.4").unwrap()),
+            Request::JoinGroupAt(
+                DeviceAddress::parse("172.17.243.179").unwrap(),
+                JoinPasswords {
+                    auth: update(b"auth pass"),
+                    data: update(b" data "),
+                },
+            ),
+            Request::JoinGroupAt(
+                DeviceAddress::parse("10.37.129.3").unwrap(),
+                JoinPasswords {
+                    auth: update(&vec![b'a'; MAX_PASSWORD_LEN]),
+                    data: update(&vec![b'd'; MAX_PASSWORD_LEN]),
+                },
+            ),
         ] {
             let decoded = Request::decode(&req.encode()).unwrap();
             assert_eq!(decoded.encode().as_slice(), req.encode().as_slice());
@@ -1160,6 +1295,87 @@ mod tests {
         assert!(Request::decode(&reset(b"")).is_none());
         assert!(Request::decode(&reset(b"CN-RESEX")).is_none());
         assert!(Request::decode(&reset(b"CN-RESET!")).is_none());
+
+        // add device at: exactly one usable address
+        let at = |body: &[u8]| [&[REQ_ADD_DEVICE_AT][..], body].concat();
+        assert!(Request::decode(&at(&[4, 10, 0, 0, 1])).is_some());
+        assert!(Request::decode(&at(&[])).is_none());
+        assert!(Request::decode(&at(&[4, 10, 0, 0])).is_none());
+        assert!(Request::decode(&at(&[4, 10, 0, 0, 1, 0])).is_none());
+        assert!(Request::decode(&at(&[5, 10, 0, 0, 1])).is_none());
+        assert!(Request::decode(&at(&[6, 10, 0, 0, 1])).is_none());
+        for unusable in [[0, 0, 0, 0], [127, 0, 0, 1], [224, 0, 0, 1], [255; 4]] {
+            assert!(Request::decode(&at(&[&[4][..], &unusable].concat())).is_none());
+        }
+        // family 6 is reserved (the listener is IPv4 only), refused
+        let v6: core::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        assert!(Request::decode(&at(&[&[6][..], &v6.octets()].concat())).is_none());
+
+        // join at: an address, then the join's payload, consumed exactly
+        let join_at = |addr: &[u8], auth_len: u16, auth: &[u8], data: &[u8]| {
+            [
+                &[REQ_JOIN_GROUP_AT][..],
+                addr,
+                &auth_len.to_le_bytes(),
+                auth,
+                data,
+            ]
+            .concat()
+        };
+        let Some(Request::JoinGroupAt(addr, passwords)) =
+            Request::decode(&join_at(&[4, 10, 211, 55, 2], 3, b" a ", b"b "))
+        else {
+            panic!("join at didn't decode");
+        };
+        assert_eq!(addr, DeviceAddress::parse("10.211.55.2").unwrap());
+        assert_eq!(passwords.auth.password.as_slice(), b" a ");
+        assert_eq!(passwords.data.password.as_slice(), b"b ");
+        assert!(Request::decode(&join_at(&[4, 127, 0, 0, 1], 2, b"ab", b"cd")).is_none());
+        assert!(Request::decode(&join_at(&[4, 10, 0, 0], 2, b"ab", b"cd")).is_none());
+        assert!(Request::decode(&join_at(&[4, 10, 0, 0, 1], 2, b"ab", b"")).is_none());
+        assert!(Request::decode(&[REQ_JOIN_GROUP_AT]).is_none());
+    }
+
+    /// Test what a typed address may be: an IPv4 address only, trimmed, and
+    /// only one a device can be reached at; an IPv4-mapped IPv6 address is
+    /// its IPv4 address, any other IPv6 address is refused (IPv4 listener)
+    #[test]
+    fn test_device_address_parse() {
+        for ok in [
+            "10.211.55.4",
+            " 172.17.243.179 ",
+            "169.254.1.2",
+            "100.64.0.7",
+        ] {
+            assert!(DeviceAddress::parse(ok).is_some(), "{ok}");
+        }
+        for bad in [
+            "",
+            "laptop.local",
+            "10.0.0.1:3232",
+            "10.0.0",
+            "0.0.0.0",
+            "127.0.0.1",
+            "255.255.255.255",
+            "239.1.1.1",
+            "::",
+            "::1",
+            "fe80::1",
+            "ff02::1",
+            "::ffff:127.0.0.1",
+            "2001:db8::1",
+            "fd00::5",
+        ] {
+            assert!(DeviceAddress::parse(bad).is_none(), "{bad}");
+        }
+        assert_eq!(
+            DeviceAddress::parse("::ffff:10.0.0.1").map(|a| a.ip()),
+            Some(IpAddr::from([10, 0, 0, 1]))
+        );
+        assert_eq!(
+            DeviceAddress::parse("10.0.0.1").unwrap().to_string(),
+            "10.0.0.1"
+        );
     }
 
     /// Test that every daemon error code round-trips, and unknown status bits are refused
@@ -1181,6 +1397,7 @@ mod tests {
             DaemonError::JoinRunning,
             DaemonError::UnknownPeer,
             DaemonError::ClipboardUnavailable,
+            DaemonError::OwnAddress,
         ] {
             assert_eq!(
                 Response::decode(&Request::Status, &Response::encode_error(e)),
@@ -1190,7 +1407,7 @@ mod tests {
 
         // unknown error codes are refused
         assert_eq!(
-            Response::decode(&Request::Status, &[RESP_ERR, 0x10]),
+            Response::decode(&Request::Status, &[RESP_ERR, 0x11]),
             Err(IpcErrors::Malformed)
         );
 

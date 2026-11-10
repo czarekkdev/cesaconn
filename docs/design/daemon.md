@@ -449,7 +449,7 @@ Frames that carry a request are read into `Zeroizing` buffers (a request may
 hold a password). Compile-time asserts keep the largest request and the
 largest `ListPeers` answer under `MAX_FRAME_LEN`.
 
-### 7.4 Wire format, version 8 **[built]**
+### 7.4 Wire format, version 9 **[built]**
 
 ```
 frame    = length (u32 LE, 1..=MAX_FRAME_LEN) || body
@@ -476,6 +476,14 @@ response = 0x00 || payload        (success)
 | `0x10` | ForgetPeer | `fingerprint (8)`, exactly | empty (14.1) |
 | `0x11` | ResetDevice | exactly the 8 bytes `CN-RESET` | empty (14.2) |
 | `0x12` | SetClipboard | exactly `0x00` or `0x01` | empty (12.1) |
+| `0x13` | AddDeviceAt | `address` | empty (13.2) |
+| `0x14` | JoinGroupAt | `address \|\| JoinGroup's payload` | empty (13.2) |
+
+`address` = `0x04 (1) || IPv4 (4)`, exact length. Refused (`BadRequest`):
+unspecified, loopback, multicast, the broadcast, and every other family
+byte. `0x06` is reserved for IPv6: the listener and the salt query bind
+IPv4 only (9.2), so an IPv6 address would never be answered. The TUI takes
+an IPv4-mapped IPv6 address as its IPv4 address.
 | `0x02`, `0x03` | retired (v1 sent `salt \|\| password`) | refused, so a mismatched UI and daemon fail loudly | |
 
 Status flags: bit 0 auth key set, 1 data key set, 2 network running, 3 vault
@@ -514,14 +522,16 @@ that id and code: answered already, timed out, or a different pairing),
 `0x0D` JoinRunning (JoinGroup while a join runs), `0x0E` UnknownPeer
 (ForgetPeer: no paired device has that fingerprint), `0x0F`
 ClipboardUnavailable (SetClipboard on on a platform without clipboard
-support).
+support), `0x10` OwnAddress (AddDeviceAt / JoinGroupAt with an address of
+this machine).
 
 `ResetDevice` carries fixed confirm bytes so that nothing sent by mistake
 (a wrong kind byte, a UI bug) decodes as a reset; the user's confirmation
 itself is in the UI (typing `RESET`, 7.5). Version 7 only added requests and
 an error code. Version 8 adds `SetClipboard`, two status bits, an error
 code and the state byte in `ListPeers`: a version 7 UI fails on the peer
-list loudly (`Malformed`), as intended.
+list loudly (`Malformed`), as intended. Version 9 only adds two requests
+and an error code: a version 8 daemon answers them with `BadRequest`.
 
 An answer names the id **and the code** the user saw. Ids start at 0 again
 when the daemon restarts, so an id alone could land on a newer pairing that
@@ -1454,6 +1464,43 @@ and the log says it once when a device starts showing it: "*name*:
 incorrect password. The auth password differs between this device and it:
 set the same one on both".
 
+### 13.2 Devices on another network: a typed address **[built]**
+
+His request: devices that discovery can't reach (another subnet, behind a
+VPN) must pair too. Broadcasts never cross a router, and VPN tunnels have
+none (9.1), but a TCP connection to the address works wherever there is a
+route. So on Devices, `a` asks for the other device's **IPv4 address** (no
+host names, no port: the ports are fixed; no IPv6 yet, the listener is
+IPv4 only) and then:
+- on a member (networking on), `AddDeviceAt`: the "Add device" window
+  opens as with `n` (or the open one is used), and the device at the
+  address is asked for its group salt every 5 s (`JOIN_RETRY_PAUSE`) until
+  its own window is open (the salt query only exists then). Same group:
+  connect once, both users compare the code as usual. Another group:
+  reported like a found one (13), never connected to. Unlike a found
+  device the lower-id rule doesn't apply: the user named it, and the other
+  side may not see this one at all;
+- on a fresh device, `JoinGroupAt`: the join (11) goes to that address
+  instead of searching the LAN; a device without an open window there
+  costs no salt attempt and is asked again after 5 s.
+
+So a **new** device types the member's address (a member can't reach a
+fresh device: it has no window and no salt query); between two members,
+either one types the other's.
+
+The address is a hint like a discovered one: only the handshake decides
+trust, and the pairing code is still compared on both screens. An address
+of this machine is refused (`OwnAddress`, checked against the interface
+list), loopback already by the IPC (7.4). One window connects to one
+address once: a window keeps three lists (found by the search, typed,
+connected to), each at most 16. They are apart on purpose: a device the
+search found but left to the other side (lower id) may never connect to
+this one, because the broadcast went only one way, and typing its address
+must still make this side connect. After pairing, the peer book (13.1) keeps the address, so sync and the
+hello reach the device there by themselves. Needs TCP 3232 and 3233
+reachable at the other device (a VPN that routes between the two; a
+firewall that allows them).
+
 ---
 
 ## 14. Rotation, revocation, reset
@@ -1564,6 +1611,13 @@ Tests (`cargo test --workspace --all-features`):
   sent, switched off = not applied, the switch saved); the switch's
   refusals (no clipboard, no vault, locked); applying only well-formed,
   newer updates with the switch on (12, 13.1);
+- discovery and typed addresses: the broadcast destinations per interface
+  (usable ones only, bounded, each once), this machine's own addresses; a
+  join and an "Add device" through a typed address end to end (waiting
+  for the other window without using attempts, no LAN search), another
+  group at the address reported and never connected to, an own address
+  refused, one connection per address and window; the address strict on
+  the IPC and in the TUI (13.2);
 - clipboard: the message format strict both ways and on random input, the
   ordering per peer and its memory bound; the peer book (addresses only from
   authenticated connections, the pause only for connections we made, the
@@ -1721,6 +1775,14 @@ Stated plainly so nobody relies on a property that isn't there.
     paste action (macOS pasteboard privacy, preview since 15.4): if it
     becomes the default, the daemon will need the user's "always allow",
     or sending stops working. Receiving (writing) is not affected.
+20. **A typed address is a hint** (13.2): whoever answers there can make
+    the window ask the user about a device (only after a full handshake
+    with the group's passwords, so only a device that knows them) or say
+    "another group" (a forged salt answer, like a forged announcement).
+    If both users type each other's address, or one is also found by the
+    LAN search of the other, two connections can run at once and ask twice;
+    answering both the same way is harmless. IPv6 addresses can't be
+    typed yet (IPv4 listener), host names aren't resolved.
 
 ---
 
@@ -1756,6 +1818,14 @@ Decided:
   password" when the devices connect (6.5, 13.1), instead of a warning or
   refusal before the change.
 - (2026-10-31) Clipboard sync is the first sync feature (12).
+
+Proposed in the connect-by-address PR, for his review:
+- `a` on Devices for a typed IP address, as two new requests (IPC 9)
+  instead of extending `AddDevice` / `JoinGroup` (13.2);
+- IPv4 only for now (the listener binds IPv4; family `0x06` reserved);
+  no host names (no DNS lookups from the daemon), no ports (fixed);
+- the device at the address is polled every 5 s for an open window, and
+  connected to regardless of the instance-id rule (13.2).
 
 Proposed in the every-interface broadcast PR, for his review:
 - `nix` (`net` feature, already a dependency) for the interface list
