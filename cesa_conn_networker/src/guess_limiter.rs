@@ -9,6 +9,14 @@
 //! After [`MAX_FAILURES`] failures in a row the source is locked out for
 //! [`FIRST_LOCKOUT`], doubling with every further lockout up to
 //! [`MAX_LOCKOUT`]. A successful handshake resets the source.
+//!
+//! The table holds [`MAX_TRACKED`] sources. When that many are active, the
+//! listener refuses a new source before the handshake ([`GuessLimiter::is_full_for`]):
+//! otherwise filling the table from many addresses would give every further
+//! address unlimited guesses. A paired device at its known address still
+//! gets in while [`RESERVE`] extra slots have room, so its failures are
+//! counted too; those slots also take failures of our own outgoing
+//! connections. A source is only admitted while its failure can be counted.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr};
@@ -24,6 +32,9 @@ pub const FIRST_LOCKOUT: Duration = Duration::from_secs(60);
 pub const MAX_LOCKOUT: Duration = Duration::from_secs(60 * 60);
 /// most sources tracked at once, so the limiter itself can't eat all memory
 pub const MAX_TRACKED: usize = 4096;
+/// extra slots for failures from paired devices' addresses (admitted while
+/// the table is full) and our own outgoing connections
+pub const RESERVE: usize = 256;
 /// a source without failures for this long is forgotten
 const FORGET_AFTER: Duration = Duration::from_secs(2 * 60 * 60);
 
@@ -89,12 +100,12 @@ enum Counted {
 
 /// Records one failure of `source` in `entries` (see the module docs).
 fn count_failure(entries: &mut HashMap<Source, Entry>, source: Source, now: Instant) -> Counted {
-    if !entries.contains_key(&source) && entries.len() >= MAX_TRACKED {
+    let limit = MAX_TRACKED.saturating_add(RESERVE);
+    if !entries.contains_key(&source) && entries.len() >= limit {
         entries.retain(|_, entry| !entry.is_stale(now));
 
-        if entries.len() >= MAX_TRACKED {
-            // full of active sources: not tracking one more beats locking
-            // out everybody new
+        if entries.len() >= limit {
+            // reserve used up too: memory stays bounded
             return Counted::NotTracked;
         }
     }
@@ -151,6 +162,26 @@ impl GuessLimiter {
             .is_some_and(|entry| entry.is_locked(now))
     }
 
+    /// `true` if `ip` isn't tracked and no failure of it could be counted
+    /// now: [`MAX_TRACKED`] active sources, or with `known` (a paired
+    /// device's address) [`MAX_TRACKED`] + [`RESERVE`]. The listener refuses
+    /// such a source (see the module docs). Stale sources are dropped first.
+    pub async fn is_full_for(&self, ip: IpAddr, known: bool) -> bool {
+        let now = Instant::now();
+        let limit = if known {
+            MAX_TRACKED.saturating_add(RESERVE)
+        } else {
+            MAX_TRACKED
+        };
+        let mut entries = self.entries.lock().await;
+
+        if entries.contains_key(&Source::of(ip)) || entries.len() < limit {
+            return false;
+        }
+        entries.retain(|_, entry| !entry.is_stale(now));
+        entries.len() >= limit
+    }
+
     /// Counts a failed SPAKE2 confirmation (wrong password) for `ip`.
     pub async fn record_failure(&self, ip: IpAddr) {
         // the guard is a temporary: the lock is released before logging
@@ -162,7 +193,7 @@ impl GuessLimiter {
 
         match outcome {
             Counted::NotTracked => {
-                warn!(%ip, max = MAX_TRACKED, "guess limiter full, failure not tracked");
+                warn!(%ip, max = MAX_TRACKED.saturating_add(RESERVE), "guess limiter full, failure not tracked");
             }
             Counted::LockedOut(duration) => {
                 warn!(%ip, lockout_secs = duration.as_secs(), "too many wrong passwords, locked out");
@@ -279,23 +310,76 @@ mod tests {
         assert!(!limiter.is_locked("192.168.1.51".parse().unwrap()).await);
     }
 
-    /// Test that the map never grows past MAX_TRACKED
+    /// Test that the map never grows past MAX_TRACKED + RESERVE
     #[tokio::test(start_paused = true)]
     async fn test_memory_bounded() {
         let limiter = GuessLimiter::new();
 
-        let max = u32::try_from(MAX_TRACKED).unwrap();
+        let max = u32::try_from(MAX_TRACKED + RESERVE).unwrap();
 
         for i in 0..(max + 100) {
             limiter.record_failure(IpAddr::V4(i.into())).await;
         }
 
-        assert!(limiter.entries.lock().await.len() <= MAX_TRACKED);
+        assert_eq!(limiter.entries.lock().await.len(), MAX_TRACKED + RESERVE);
 
         // stale entries make room again
         tokio::time::advance(FORGET_AFTER + Duration::from_secs(1)).await;
         fail(&limiter, V4, MAX_FAILURES).await;
         assert!(limiter.is_locked(V4).await);
+    }
+
+    /// Fills the table with `MAX_TRACKED` sources (10.0.x.y), one failure each.
+    async fn fill(limiter: &GuessLimiter) {
+        for i in 0..u32::try_from(MAX_TRACKED).unwrap() {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::from(0x0A00_0000 | i));
+            limiter.record_failure(ip).await;
+        }
+    }
+
+    /// Test that a full table is full only for new sources, and frees up
+    /// once its sources go stale
+    #[tokio::test(start_paused = true)]
+    async fn test_full_table_refuses_new_sources() {
+        let limiter = GuessLimiter::new();
+        let tracked = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 7));
+
+        fill(&limiter).await;
+        assert!(limiter.is_full_for(V4, false).await);
+        assert!(!limiter.is_full_for(tracked, false).await);
+
+        // one source fewer: room again
+        limiter.record_success(tracked).await;
+        assert!(!limiter.is_full_for(V4, false).await);
+        limiter.record_failure(tracked).await;
+        assert!(limiter.is_full_for(V4, false).await);
+
+        tokio::time::advance(FORGET_AFTER + Duration::from_secs(1)).await;
+        assert!(!limiter.is_full_for(V4, false).await);
+    }
+
+    /// Test that a paired device's address is admitted while the reserve
+    /// has room, its failures are counted there (it gets locked out), and
+    /// once the reserve is full it isn't admitted either
+    #[tokio::test(start_paused = true)]
+    async fn test_full_table_still_counts_admitted_sources() {
+        let limiter = GuessLimiter::new();
+        fill(&limiter).await;
+
+        assert!(!limiter.is_full_for(V4, true).await);
+        fail(&limiter, V4, MAX_FAILURES).await;
+        assert!(limiter.is_locked(V4).await);
+
+        // the rest of the reserve, e.g. outgoing connections that failed
+        let other = IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 77));
+        for i in 0..u32::try_from(RESERVE - 1).unwrap() {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::from(0x0B00_0000 | i));
+            assert!(!limiter.is_full_for(ip, true).await);
+            limiter.record_failure(ip).await;
+        }
+        assert!(limiter.is_full_for(other, true).await);
+        // tracked sources keep their place
+        assert!(!limiter.is_full_for(V4, true).await);
     }
 
     /// Test the lockout length formula, including overflow

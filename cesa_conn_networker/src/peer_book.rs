@@ -151,6 +151,15 @@ impl PeerBook {
         }
     }
 
+    /// `true` if a paired device was last seen at `ip`.
+    pub async fn knows_ip(&self, ip: IpAddr) -> bool {
+        self.entries
+            .read()
+            .await
+            .iter()
+            .any(|entry| entry.addr.is_some_and(|addr| addr.ip() == ip))
+    }
+
     /// `peer`'s state (`Unknown` if it was never contacted).
     pub async fn state(&self, peer: &TrustedPeer) -> PeerState {
         self.entries
