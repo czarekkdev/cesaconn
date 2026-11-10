@@ -660,9 +660,10 @@ to `StorageFailed`, with details only in the daemon log.
   address; nothing for /31 and /32, nothing outside the interface's own
   network, each address once, at most 16 destinations. The list is read
   again every second (`getifaddrs` through `nix`, safe API), so an
-  interface that comes up during a window is used too. A send that fails on
-  one network doesn't stop the others; the round fails only if no
-  destination took it. Windows: `255.255.255.255` only for now. Receivers
+  interface that comes up during a window is used too. `255.255.255.255`
+  is sent first, then every interface at once (each send bounded by 1 s), so
+  a slow or refusing network neither stops nor delays the others; the round
+  fails only if no destination took it. Windows: `255.255.255.255` only for now. Receivers
   are unchanged (a wildcard bind gets directed broadcasts too), so older
   versions hear it.
 - The instance id is random per start, only so a device ignores its own

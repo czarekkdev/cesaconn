@@ -18,7 +18,9 @@
 
 use core::fmt;
 use core::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use tokio::net::UdpSocket;
+use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant, sleep, timeout, timeout_at};
 use tracing::{debug, error, info, warn};
 
@@ -215,6 +217,28 @@ fn ipv4_interfaces() -> Vec<Ipv4Interface> {
     Vec::new()
 }
 
+/// Sends one announcement to `destination`, bounded by [`SEND_TIMEOUT`];
+/// `true` if it went out. A failure is only logged: other networks may work.
+async fn send_one(
+    socket: &UdpSocket,
+    packet: [u8; ANNOUNCEMENT_LEN],
+    destination: SocketAddr,
+    tick: u64,
+) -> bool {
+    let send = socket.send_to(&packet, destination);
+    match timeout(Duration::from_secs(SEND_TIMEOUT), send).await {
+        Ok(Ok(_)) => true,
+        Ok(Err(e)) => {
+            debug!(error = %e, tick, %destination, "announcement not sent there");
+            false
+        }
+        Err(_) => {
+            debug!(tick, %destination, "announcement send timed out");
+            false
+        }
+    }
+}
+
 /// Announces this device on the LAN once per second for `duration` seconds
 /// (capped at [`MAX_BROADCAST_DURATION`]), on every interface (see the
 /// module docs). The interfaces are listed again every second, so one
@@ -243,17 +267,27 @@ pub async fn udp_broadcast_presence(
 
     info!(duration, "broadcasting presence");
 
+    // shared by the sends of one tick, which run at once
+    let socket = Arc::new(socket);
+
     for tick in 0..duration {
         let targets = broadcast_targets(&ipv4_interfaces());
+        let (first, rest) = targets
+            .split_first()
+            .ok_or(UdpNetworkerErrors::FailedToSendBroadcast)?;
 
-        // one network that refuses (down, no route) doesn't stop the others
-        let mut sent = 0usize;
-        for destination in &targets {
-            let send = socket.send_to(&packet, destination);
-            match timeout(Duration::from_secs(SEND_TIMEOUT), send).await {
-                Ok(Ok(_)) => sent = sent.saturating_add(1),
-                Ok(Err(e)) => debug!(error = %e, tick, %destination, "announcement not sent there"),
-                Err(_) => debug!(tick, %destination, "announcement send timed out"),
+        // 255.255.255.255 first, then every interface at once: one slow or
+        // refusing network (down, no route) neither stops nor delays the
+        // others, so a tick takes at most two SEND_TIMEOUTs, not one per target
+        let mut sent = usize::from(send_one(&socket, packet, *first, tick).await);
+        let mut sends = JoinSet::new();
+        for destination in rest.iter().copied() {
+            let socket = socket.clone();
+            sends.spawn(async move { send_one(&socket, packet, destination, tick).await });
+        }
+        while let Some(done) = sends.join_next().await {
+            if matches!(done, Ok(true)) {
+                sent = sent.saturating_add(1);
             }
         }
         if sent == 0 {
