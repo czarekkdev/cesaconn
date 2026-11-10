@@ -43,6 +43,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -335,17 +336,26 @@ def check_gitleaks(git_range: str | None) -> ToolResult:
     if not have("gitleaks"):
         r.status, r.note = "skipped", "gitleaks not installed"
         return r
-    report = OUT / "gitleaks.json"
-    cmd = ["gitleaks", "git", "--no-banner", "--redact", "--exit-code", "0",
-           "--report-format", "json", "--report-path", str(report)]
-    if git_range:
-        cmd += ["--log-opts", git_range]
-    cmd.append(".")
-    code, out, err = run(cmd, timeout=600)
-    if not report.exists():
-        r.status, r.note = "failed", (err or out)[-600:]
-        return r
-    for leak in json.loads(report.read_text() or "[]"):
+    # A report is evidence only for the invocation that produced it.
+    with tempfile.TemporaryDirectory(prefix="gitleaks-", dir=OUT) as report_dir:
+        report = Path(report_dir) / "gitleaks.json"
+        cmd = ["gitleaks", "git", "--no-banner", "--redact", "--exit-code", "0",
+               "--report-format", "json", "--report-path", str(report)]
+        if git_range:
+            cmd += ["--log-opts", git_range]
+        cmd.append(".")
+        code, out, err = run(cmd, timeout=600)
+        if code != 0:
+            r.status, r.note = "failed", f"gitleaks exited with {code}: {(err or out)[-600:]}"
+            return r
+        try:
+            leaks = json.loads(report.read_text())
+            if not isinstance(leaks, list) or any(not isinstance(leak, dict) for leak in leaks):
+                raise ValueError("expected a JSON array of findings")
+        except (OSError, ValueError) as ex:
+            r.status, r.note = "failed", f"invalid gitleaks report: {ex}"
+            return r
+    for leak in leaks:
         r.findings.append(Finding("gitleaks", leak.get("RuleID", "secret"), "critical",
                                   f"Possible secret committed in {leak.get('Commit', '')[:10]}: "
                                   f"{leak.get('Description', '')}",
