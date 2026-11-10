@@ -200,6 +200,33 @@ def check_semgrep() -> ToolResult:
 
 
 # ---- clippy -----------------------------------------------------------------
+def clippy_exit_unexplained(code: int, output: str) -> bool:
+    """A nonzero clippy exit is explained only by an error this report shows:
+    a deny-level lint or a compile error in a workspace file (or clippy.toml).
+    Anything else (a timeout, a manifest or lockfile error, a dependency
+    outside the workspace that doesn't build) left code unanalysed with no
+    finding, so it's a coverage gap."""
+    if code == 0:
+        return False
+    if code == 124:  # timed out: whatever was printed is partial
+        return True
+    for line in output.splitlines():
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(msg, dict) or msg.get("reason") != "compiler-message":
+            continue
+        m = msg.get("message") or {}
+        if m.get("level") != "error":
+            continue
+        span = next((s for s in m.get("spans", []) if s.get("is_primary")), None)
+        path = (span or {}).get("file_name", "")
+        if path.endswith("clippy.toml") or any(path.startswith(c) for c in CRATES):
+            return False
+    return True
+
+
 def check_clippy() -> ToolResult:
     r = ToolResult("clippy")
     flags = []
@@ -217,8 +244,14 @@ def check_clippy() -> ToolResult:
         # behind cfg(not(feature)) (the default build) must each be analysed
         out = ""
         for features in ([], ["--all-features"]):
-            _, o, _ = run(["cargo", "clippy", "-p", crate, "--all-targets", *features,
-                           "--message-format=json", "--", *flags], timeout=1800)
+            code, o, err = run(["cargo", "clippy", "-p", crate, "--all-targets", *features,
+                                "--message-format=json", "--", *flags], timeout=1800)
+            if clippy_exit_unexplained(code, o):
+                config = "all features" if features else "default features"
+                r.findings.append(Finding("clippy", "invocation-failed", "info",
+                                          f"{crate} ({config}): cargo clippy exited with {code} and "
+                                          f"no reported error explains it (incomplete analysis).\n"
+                                          f"{err[-1500:]}", crate))
             out += o + "\n"
         build_errors = 0
         # compile errors count per crate: a broken dependency also leaves

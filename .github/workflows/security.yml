@@ -61,6 +61,9 @@ jobs:
           tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
           sudo install /tmp/gitleaks /usr/local/bin/gitleaks
 
+      - name: Gate's own tests (coverage-gap handling, no toolchain needed)
+        run: python3 -m unittest discover -s security -p 'test_*.py' -v
+
       - name: Security gate
         run: python3 security/run.py --only semgrep,clippy,audit,deny,gitleaks
 
