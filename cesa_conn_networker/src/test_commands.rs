@@ -150,6 +150,20 @@ fn test_keys(password: &str, salts: &[u8; SALTS_LEN]) -> Option<Arc<RwLock<Keys>
     }
 }
 
+/// Read only from the controlling terminal with echo disabled. The password
+/// is erased when this function returns, before discovery or pairing starts.
+fn prompt_test_keys(salts: &[u8; SALTS_LEN]) -> Option<Arc<RwLock<Keys>>> {
+    let password = match rpassword::prompt_password("Test-session password: ") {
+        Ok(password) => Zeroizing::new(password),
+        Err(e) => {
+            error!(error = %e, "failed to read password from terminal");
+            return None;
+        }
+    };
+
+    test_keys(&password, salts)
+}
+
 /// UDP discovery for servertest: alternates between broadcasting presence and
 /// listening, so both sides find each other regardless of who starts first.
 async fn server_discovery(id: InstanceId) {
@@ -191,8 +205,8 @@ async fn client_discovery(id: InstanceId) -> Option<SocketAddr> {
     }
 }
 
-/// `servertest <password>`: prints fresh salts, listens for one test client.
-async fn servertest(password: &str) {
+/// `servertest`: prints fresh salts, listens for one test client.
+async fn servertest() {
     let salts = match (random_array::<32>(), random_array::<32>()) {
         (Ok(a_salt), Ok(d_salt)) => {
             let mut salts = Zeroizing::new([0u8; SALTS_LEN]);
@@ -212,7 +226,7 @@ async fn servertest(password: &str) {
     // salts aren't secret, the client needs them to derive the same keys
     println!("salts: {}", to_hex(salts.as_slice()));
 
-    let Some(keys) = test_keys(password, &salts) else {
+    let Some(keys) = prompt_test_keys(&salts) else {
         return;
     };
 
@@ -243,8 +257,8 @@ async fn servertest(password: &str) {
     }
 }
 
-/// `clienttest <message> <password> <salts>`: finds the server, sends `message`.
-async fn clienttest(message: &str, password: &str, salts_hex: &str) {
+/// `clienttest <message> <salts>`: finds the server, sends `message`.
+async fn clienttest(message: &str, salts_hex: &str) {
     let Some(salts) = salts_from_hex(salts_hex) else {
         error!(
             "salts must be the {} hex characters servertest printed",
@@ -253,7 +267,7 @@ async fn clienttest(message: &str, password: &str, salts_hex: &str) {
         return;
     };
 
-    let Some(keys) = test_keys(password, &salts) else {
+    let Some(keys) = prompt_test_keys(&salts) else {
         return;
     };
 
@@ -295,30 +309,31 @@ async fn clienttest(message: &str, password: &str, salts_hex: &str) {
 pub async fn run(args: &[String]) {
     let bin = args.first().map_or("cesa_conn_networker", String::as_str);
     let usage = format!(
-        "Usage:\n  {bin} servertest <password>\n  {bin} clienttest <message> <password> <salts>"
+        "Usage:\n  {bin} servertest\n  {bin} clienttest <message> <salts>\nPassword is prompted on the terminal (input hidden)."
     );
 
-    match (
-        args.get(1).map(String::as_str),
-        args.get(2),
-        args.get(3),
-        args.get(4),
-    ) {
-        (Some("servertest"), Some(password), _, _) => servertest(password).await,
-        (Some("clienttest"), Some(message), Some(password), Some(salts)) => {
-            clienttest(message, password, salts).await;
+    match args.get(1..).unwrap_or_default() {
+        [sub] if sub == "servertest" => servertest().await,
+        [sub, message, salts] if sub == "clienttest" => {
+            clienttest(message, salts).await;
         }
-        (Some(sub @ ("servertest" | "clienttest")), ..) => {
-            error!("Missing argument for '{sub}'.\n{usage}");
-        }
-        (Some(unknown), ..) => error!("Unknown subcommand: '{unknown}'.\n{usage}"),
-        (None, ..) => error!("No subcommand provided.\n{usage}"),
+        _ => error!("Invalid test command arguments.\n{usage}"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn legacy_password_arguments_are_rejected() {
+        for args in [
+            vec!["bin", "servertest", "must-not-be-read"],
+            vec!["bin", "clienttest", "message", "must-not-be-read", "salts"],
+        ] {
+            run(&args.into_iter().map(String::from).collect::<Vec<_>>()).await;
+        }
+    }
 
     /// Test that salts round-trip through hex
     #[test]

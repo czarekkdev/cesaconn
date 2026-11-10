@@ -10,7 +10,7 @@ path = "src/cesa_conn_networker.rs"
 
 [features]
 # servertest / clienttest manual end-to-end commands; never in release builds
-test-commands = []
+test-commands = ["dep:rpassword"]
 
 [dependencies]
 tokio = { version = "1.50.0", features = ["full"] }
@@ -20,6 +20,7 @@ tokio-util = "0.7.18"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize = "1.8.2"
+rpassword = { version = "7.4.0", optional = true }
 snow = "0.10.0"
 rand = "0.10.1"
 libcrux-ml-kem = "0.0.11"
