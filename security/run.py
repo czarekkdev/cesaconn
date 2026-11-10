@@ -43,6 +43,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -199,7 +200,37 @@ def check_semgrep() -> ToolResult:
 
 
 # ---- clippy -----------------------------------------------------------------
+def clippy_exit_unexplained(code: int, output: str, crate: str) -> bool:
+    """A nonzero clippy exit of `crate`'s run is explained only by an error
+    this report shows in `crate` itself: a deny-level lint or a compile error
+    in one of its files, or in clippy.toml. Anything else left `crate`
+    unanalysed, so it's a coverage gap: a timeout, a manifest or lockfile
+    error, or an error in a crate it depends on (that one is reported, but
+    `crate` was never linted)."""
+    if code == 0:
+        return False
+    if code == 124:  # timed out: whatever was printed is partial
+        return True
+    for line in output.splitlines():
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(msg, dict) or msg.get("reason") != "compiler-message":
+            continue
+        m = msg.get("message") or {}
+        if m.get("level") != "error":
+            continue
+        span = next((s for s in m.get("spans", []) if s.get("is_primary")), None)
+        path = (span or {}).get("file_name", "")
+        if path.endswith("clippy.toml") or path.startswith(crate + "/"):
+            return False
+    return True
+
+
 def check_clippy() -> ToolResult:
+    """Clippy on every crate, default and all features; findings, unused-code
+    notes, and gaps for crates that weren't fully analysed."""
     r = ToolResult("clippy")
     flags = []
     for l in CLIPPY_WARN + CLIPPY_CRITICAL:
@@ -216,8 +247,15 @@ def check_clippy() -> ToolResult:
         # behind cfg(not(feature)) (the default build) must each be analysed
         out = ""
         for features in ([], ["--all-features"]):
-            _, o, _ = run(["cargo", "clippy", "-p", crate, "--all-targets", *features,
-                           "--message-format=json", "--", *flags], timeout=1800)
+            code, o, err = run(["cargo", "clippy", "-p", crate, "--all-targets", *features,
+                                "--message-format=json", "--", *flags], timeout=1800)
+            if clippy_exit_unexplained(code, o, crate):
+                config = "all features" if features else "default features"
+                r.findings.append(Finding("clippy", "invocation-failed", "info",
+                                          f"{crate} ({config}): cargo clippy exited with {code} and "
+                                          f"no error reported in this crate explains it "
+                                          f"(incomplete analysis).\n"
+                                          f"{err[-1500:]}", crate))
             out += o + "\n"
         build_errors = 0
         # compile errors count per crate: a broken dependency also leaves
@@ -305,12 +343,18 @@ def check_audit() -> ToolResult:
 
 # ---- cargo deny -------------------------------------------------------------
 def check_deny() -> ToolResult:
+    """cargo-deny sources, bans and licenses; an exit its own policy errors
+    don't explain is a gap."""
     r = ToolResult("cargo-deny")
     if not have_cargo_sub("deny"):
         r.status, r.note = "skipped", "cargo-deny not installed (cargo install cargo-deny --locked)"
         return r
-    for check, sev in (("sources", "critical"), ("bans", "warning"), ("licenses", "warning")):
-        code, out, err = run(["cargo", "deny", "--format", "json", "check", check], timeout=600)
+    # cargo-deny uses a bit per failed check: advisories=1, bans=2,
+    # licenses=4, sources=8. Operational errors also exit 1.
+    for check, sev, policy_exit in (("sources", "critical", 8), ("bans", "warning", 2),
+                                    ("licenses", "warning", 4)):
+        code, _out, err = run(["cargo", "deny", "--format", "json", "check", check], timeout=600)
+        policy_error = False
         for line in err.splitlines():
             try:
                 d = json.loads(line)
@@ -321,31 +365,46 @@ def check_deny() -> ToolResult:
             f = d["fields"]
             if f.get("severity") not in ("error", "warning"):
                 continue
+            policy_error |= f["severity"] == "error"
             s = sev if f["severity"] == "error" else "warning"
             r.findings.append(Finding("cargo-deny", f"{check}:{f.get('code', '')}", s,
                                       f.get("message", ""), "Cargo.lock"))
-        if code not in (0, 1) and not r.findings:
-            r.findings.append(Finding("cargo-deny", check, "info", f"cargo deny check {check} failed: {err[-400:]}"))
+        # Findings from other invocations cannot explain this one's exit.
+        # Keep coverage gaps separate from accept-able Cargo.lock warnings.
+        if code != 0 and not (code == policy_exit and policy_error):
+            r.findings.append(Finding("cargo-deny", check, "info",
+                                      f"cargo deny check {check} failed (exit {code}): {err[-400:]}"))
     return r
 
 
 # ---- gitleaks ---------------------------------------------------------------
 def check_gitleaks(git_range: str | None) -> ToolResult:
+    """gitleaks over the git history (or `git_range`); a failed scan or an
+    invalid report is a gap, never an empty result."""
     r = ToolResult("gitleaks")
     if not have("gitleaks"):
         r.status, r.note = "skipped", "gitleaks not installed"
         return r
-    report = OUT / "gitleaks.json"
-    cmd = ["gitleaks", "git", "--no-banner", "--redact", "--exit-code", "0",
-           "--report-format", "json", "--report-path", str(report)]
-    if git_range:
-        cmd += ["--log-opts", git_range]
-    cmd.append(".")
-    code, out, err = run(cmd, timeout=600)
-    if not report.exists():
-        r.status, r.note = "failed", (err or out)[-600:]
-        return r
-    for leak in json.loads(report.read_text() or "[]"):
+    # A report is evidence only for the invocation that produced it.
+    with tempfile.TemporaryDirectory(prefix="gitleaks-", dir=OUT) as report_dir:
+        report = Path(report_dir) / "gitleaks.json"
+        cmd = ["gitleaks", "git", "--no-banner", "--redact", "--exit-code", "0",
+               "--report-format", "json", "--report-path", str(report)]
+        if git_range:
+            cmd += ["--log-opts", git_range]
+        cmd.append(".")
+        code, out, err = run(cmd, timeout=600)
+        if code != 0:
+            r.status, r.note = "failed", f"gitleaks exited with {code}: {(err or out)[-600:]}"
+            return r
+        try:
+            leaks = json.loads(report.read_text())
+            if not isinstance(leaks, list) or any(not isinstance(leak, dict) for leak in leaks):
+                raise ValueError("expected a JSON array of findings")
+        except (OSError, ValueError) as ex:
+            r.status, r.note = "failed", f"invalid gitleaks report: {ex}"
+            return r
+    for leak in leaks:
         r.findings.append(Finding("gitleaks", leak.get("RuleID", "secret"), "critical",
                                   f"Possible secret committed in {leak.get('Commit', '')[:10]}: "
                                   f"{leak.get('Description', '')}",
