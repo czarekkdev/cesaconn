@@ -4,6 +4,8 @@
 //! Only compiled with `--features test-commands`, so release builds don't
 //! ship them. Each run uses fresh random salts (printed by `servertest`,
 //! passed to `clienttest`) and derives two different keys from the password.
+//! The password is typed at a prompt with echo off, never passed as an
+//! argument (that would land in the shell history and in `ps`).
 
 use std::{
     io::{self, BufRead, Write},
@@ -16,7 +18,10 @@ use tracing::error;
 use zeroize::Zeroizing;
 
 use cesa_conn_crypto::{crand::random_array, pswd_manager::derive_key};
-use cesa_conn_system::pairing_code::{PairingCode, symbol};
+use cesa_conn_system::{
+    ipc::MAX_PASSWORD_LEN,
+    pairing_code::{PairingCode, symbol},
+};
 
 use crate::{
     auth_snow::{AuthKey, DataKey, DeviceKeypairs, Keys, Pairing},
@@ -129,6 +134,81 @@ fn salts_from_hex(hex: &str) -> Option<[u8; SALTS_LEN]> {
     Some(out)
 }
 
+/// Reads the test password from the terminal with echo off (blocking: run
+/// it on a blocking thread). `None` if stdin isn't a terminal, the read
+/// fails, the line is empty or longer than [`MAX_PASSWORD_LEN`].
+#[cfg(unix)]
+fn read_password_hidden() -> Option<Zeroizing<String>> {
+    use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
+    use std::{io::Read, os::fd::AsFd};
+
+    let stdin = io::stdin();
+    let Ok(old) = tcgetattr(stdin.as_fd()) else {
+        error!("the password needs a terminal (stdin isn't one)");
+        return None;
+    };
+    // room for the longest password and its newline; computed before echo
+    // goes off, so no early return can leave the terminal silent
+    let limit = MAX_PASSWORD_LEN.saturating_add(2);
+    let limit_u64 = u64::try_from(limit).ok()?;
+
+    let mut hidden = old.clone();
+    hidden.local_flags.remove(LocalFlags::ECHO);
+    // the Enter still moves to a new line
+    hidden.local_flags.insert(LocalFlags::ECHONL);
+
+    print!("Test-session password: ");
+    io::stdout().flush().ok()?;
+    if tcsetattr(stdin.as_fd(), SetArg::TCSANOW, &hidden).is_err() {
+        error!("couldn't turn terminal echo off");
+        return None;
+    }
+
+    // read through `take`: the String never reallocates and leaves no
+    // unwiped copy behind
+    let mut line = Zeroizing::new(String::with_capacity(limit));
+    let read = stdin.lock().take(limit_u64).read_line(&mut line);
+
+    // echo back on before anything else, whatever the read did
+    if tcsetattr(stdin.as_fd(), SetArg::TCSANOW, &old).is_err() {
+        error!("couldn't turn terminal echo back on (run `stty echo`)");
+    }
+
+    if let Err(e) = read {
+        error!(error = %e, "failed to read the password");
+        return None;
+    }
+    if !line.ends_with('\n') {
+        error!(max = MAX_PASSWORD_LEN, "password too long or input ended");
+        return None;
+    }
+    let len = line.trim_end_matches(['\r', '\n']).len();
+    line.truncate(len);
+    if line.is_empty() {
+        error!("empty password");
+        return None;
+    }
+    Some(line)
+}
+
+/// No hidden terminal input here: refuse instead of echoing the password.
+#[cfg(not(unix))]
+fn read_password_hidden() -> Option<Zeroizing<String>> {
+    error!("hidden password input is only built for Unix terminals");
+    None
+}
+
+/// Asks for the password (echo off, on a blocking thread), then derives
+/// the test keys; the password is wiped when this returns.
+async fn prompt_test_keys(salts: &[u8; SALTS_LEN]) -> Option<Arc<RwLock<Keys>>> {
+    let password = tokio::task::spawn_blocking(read_password_hidden)
+        .await
+        .ok()
+        .flatten()?;
+
+    test_keys(&password, salts)
+}
+
 /// Derives `a_key` and `d_key` from one password with two different salts.
 fn test_keys(password: &str, salts: &[u8; SALTS_LEN]) -> Option<Arc<RwLock<Keys>>> {
     let (a_salt, d_salt) = salts.split_first_chunk::<32>()?;
@@ -192,7 +272,7 @@ async fn client_discovery(id: InstanceId) -> Option<SocketAddr> {
 }
 
 /// `servertest <password>`: prints fresh salts, listens for one test client.
-async fn servertest(password: &str) {
+async fn servertest() {
     let salts = match (random_array::<32>(), random_array::<32>()) {
         (Ok(a_salt), Ok(d_salt)) => {
             let mut salts = Zeroizing::new([0u8; SALTS_LEN]);
@@ -212,7 +292,7 @@ async fn servertest(password: &str) {
     // salts aren't secret, the client needs them to derive the same keys
     println!("salts: {}", to_hex(salts.as_slice()));
 
-    let Some(keys) = test_keys(password, &salts) else {
+    let Some(keys) = prompt_test_keys(&salts).await else {
         return;
     };
 
@@ -244,7 +324,7 @@ async fn servertest(password: &str) {
 }
 
 /// `clienttest <message> <password> <salts>`: finds the server, sends `message`.
-async fn clienttest(message: &str, password: &str, salts_hex: &str) {
+async fn clienttest(message: &str, salts_hex: &str) {
     let Some(salts) = salts_from_hex(salts_hex) else {
         error!(
             "salts must be the {} hex characters servertest printed",
@@ -253,7 +333,7 @@ async fn clienttest(message: &str, password: &str, salts_hex: &str) {
         return;
     };
 
-    let Some(keys) = test_keys(password, &salts) else {
+    let Some(keys) = prompt_test_keys(&salts).await else {
         return;
     };
 
@@ -291,34 +371,78 @@ async fn clienttest(message: &str, password: &str, salts_hex: &str) {
     tokio::time::sleep(tokio::time::Duration::from_secs(70)).await;
 }
 
+/// A test subcommand, parsed from the command line.
+#[derive(Debug, PartialEq)]
+enum Command<'a> {
+    /// `servertest`
+    Server,
+    /// `clienttest <message> <salts>`
+    Client {
+        /// what to send
+        message: &'a str,
+        /// salts printed by `servertest`, hex
+        salts: &'a str,
+    },
+}
+
+/// Parses `args` (args[0] = binary). Extra arguments are refused: the old
+/// forms took the password there, and it must not be taken that way.
+fn parse(args: &[String]) -> Result<Command<'_>, &'static str> {
+    match args.get(1..).unwrap_or_default() {
+        [sub] if sub == "servertest" => Ok(Command::Server),
+        [sub, message, salts] if sub == "clienttest" => Ok(Command::Client { message, salts }),
+        [sub, ..] if sub == "servertest" || sub == "clienttest" => {
+            Err("Wrong arguments (the password is no longer an argument: it's asked for, hidden).")
+        }
+        [_, ..] => Err("Unknown subcommand."),
+        [] => Err("No subcommand provided."),
+    }
+}
+
 /// Runs a test subcommand from `args` (args[0] = binary).
 pub async fn run(args: &[String]) {
     let bin = args.first().map_or("cesa_conn_networker", String::as_str);
     let usage = format!(
-        "Usage:\n  {bin} servertest <password>\n  {bin} clienttest <message> <password> <salts>"
+        "Usage:\n  {bin} servertest\n  {bin} clienttest <message> <salts>\n\
+         The password is asked for on the terminal (input hidden)."
     );
 
-    match (
-        args.get(1).map(String::as_str),
-        args.get(2),
-        args.get(3),
-        args.get(4),
-    ) {
-        (Some("servertest"), Some(password), _, _) => servertest(password).await,
-        (Some("clienttest"), Some(message), Some(password), Some(salts)) => {
-            clienttest(message, password, salts).await;
-        }
-        (Some(sub @ ("servertest" | "clienttest")), ..) => {
-            error!("Missing argument for '{sub}'.\n{usage}");
-        }
-        (Some(unknown), ..) => error!("Unknown subcommand: '{unknown}'.\n{usage}"),
-        (None, ..) => error!("No subcommand provided.\n{usage}"),
+    match parse(args) {
+        Ok(Command::Server) => servertest().await,
+        Ok(Command::Client { message, salts }) => clienttest(message, salts).await,
+        Err(e) => error!("{e}\n{usage}"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test that the subcommands parse, and that the old forms with the
+    /// password as an argument are refused
+    #[test]
+    fn test_parse_refuses_password_arguments() {
+        let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        assert_eq!(parse(&args(&["bin", "servertest"])), Ok(Command::Server));
+        assert_eq!(
+            parse(&args(&["bin", "clienttest", "hi", "ab"])),
+            Ok(Command::Client {
+                message: "hi",
+                salts: "ab"
+            })
+        );
+
+        for old in [
+            &["bin", "servertest", "secret"][..],
+            &["bin", "clienttest", "hi", "secret", "ab"][..],
+            &["bin", "clienttest", "hi"][..],
+            &["bin", "other"][..],
+            &["bin"][..],
+        ] {
+            assert!(parse(&args(old)).is_err(), "{old:?}");
+        }
+    }
 
     /// Test that salts round-trip through hex
     #[test]
