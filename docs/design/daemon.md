@@ -478,13 +478,13 @@ response = 0x00 || payload        (success)
 | `0x12` | SetClipboard | exactly `0x00` or `0x01` | empty (12.1) |
 | `0x13` | AddDeviceAt | `address` | empty (13.2) |
 | `0x14` | JoinGroupAt | `address \|\| JoinGroup's payload` | empty (13.2) |
+| `0x02`, `0x03` | retired (v1 sent `salt \|\| password`) | refused, so a mismatched UI and daemon fail loudly | |
 
 `address` = `0x04 (1) || IPv4 (4)`, exact length. Refused (`BadRequest`):
 unspecified, loopback, multicast, the broadcast, and every other family
 byte. `0x06` is reserved for IPv6: the listener and the salt query bind
 IPv4 only (9.2), so an IPv6 address would never be answered. The TUI takes
 an IPv4-mapped IPv6 address as its IPv4 address.
-| `0x02`, `0x03` | retired (v1 sent `salt \|\| password`) | refused, so a mismatched UI and daemon fail loudly | |
 
 Status flags: bit 0 auth key set, 1 data key set, 2 network running, 3 vault
 locked, 4 keys saved, 5 automatic login, 6 Sync switched on, 7 "Add device"
