@@ -276,7 +276,7 @@ pub(super) fn render_logs(frame: &mut Frame, area: Rect, app: &mut App) {
 /// The two-line status bar: the daemon's state and the keys of the tab.
 pub(super) fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
     let help = match app.active_tab {
-        Tab::Devices => " q:Quit  Tab:Switch  ↑↓:Select  n:Add/Join  x:Stop  d:Forget ",
+        Tab::Devices => " q:Quit  Tab:Switch  ↑↓:Select  n:Add/Join  a:By IP  x:Stop  d:Forget ",
         Tab::Settings => " q:Quit  Tab:Switch  ↑↓:Navigate  Enter:Edit ",
         Tab::Logs => " q:Quit  Tab:Switch  ↑↓:Scroll  f:Follow ",
     };
