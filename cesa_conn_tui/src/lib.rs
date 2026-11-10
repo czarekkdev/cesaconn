@@ -733,6 +733,9 @@ fn pairing_code_cells(prompt: &PairingPrompt) -> Vec<String> {
         .collect()
 }
 
+/// Typing into the password popup (Settings > Auth key / Data key): Enter
+/// sends, but a new password below the minimum keeps the popup open with
+/// what was typed and the red warning; Esc cancels and wipes the input.
 fn handle_edit_setting_input(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Esc => {
@@ -1590,6 +1593,9 @@ fn render_pairing_popup(frame: &mut Frame, area: Rect, prompt: &PairingPrompt) {
     );
 }
 
+/// The password popup: one star per typed character and, for a new
+/// password, a line counting characters against the minimum (yellow while
+/// short, green when long enough, red after Enter on a short one).
 fn render_edit_setting_popup(frame: &mut Frame, area: Rect, app: &App) {
     let Some(setting) = app.active_settings().get(app.settings_selected) else {
         return;
