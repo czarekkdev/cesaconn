@@ -268,6 +268,15 @@ pub async fn recv_handler(
         return Err(TcpNetworkerErrors::LockedOut);
     }
 
+    // the limiter is full of failing sources: a stranger's failures couldn't
+    // be counted, so no handshake; a paired device at its address still gets in
+    if context.guess_limiter.is_full_for(peer_addr.ip()).await
+        && !context.peer_book.knows_ip(peer_addr.ip()).await
+    {
+        warn!(%peer_addr, "guess limiter full, refusing a new source");
+        return Err(TcpNetworkerErrors::LockedOut);
+    }
+
     debug!(%peer_addr, "recv_handler started, authenticating peer");
 
     let context_keys = context.keys.clone();
@@ -1436,6 +1445,40 @@ mod tests {
 
         assert_eq!(server_result.err(), Some(TcpNetworkerErrors::LockedOut));
         assert!(client_result.is_err());
+    }
+
+    /// Test that a full guess limiter refuses a stranger before the
+    /// handshake, but not a paired device at its known address
+    #[tokio::test]
+    async fn test_full_guess_limiter_refuses_strangers_only() {
+        use crate::guess_limiter::MAX_TRACKED;
+
+        for paired in [false, true] {
+            let server = make_context(TEST_A_KEY, ACCEPT_ALL);
+            let client = make_context(TEST_A_KEY, ACCEPT_ALL);
+            for i in 0..u32::try_from(MAX_TRACKED).unwrap() {
+                let ip = std::net::Ipv4Addr::from(0x0A00_0000 | i);
+                server.guess_limiter.record_failure(ip.into()).await;
+            }
+            // a paired device known at the client's address, or elsewhere
+            let known_ip = if paired {
+                [127, 0, 0, 1]
+            } else {
+                [192, 168, 1, 9]
+            };
+            let known = SocketAddr::from((known_ip, 3232));
+            server.peer_book.load(vec![([7u8; 32], known)]).await;
+
+            let (server_result, client_result) =
+                exchange(server, client, ActionType::Debug, b"hi").await;
+            if paired {
+                assert!(server_result.is_ok(), "{:?}", server_result.err());
+                assert!(client_result.is_ok(), "{client_result:?}");
+            } else {
+                assert_eq!(server_result.err(), Some(TcpNetworkerErrors::LockedOut));
+                assert!(client_result.is_err());
+            }
+        }
     }
 
     /// Test that a server failing our confirmation is locked out on the client too

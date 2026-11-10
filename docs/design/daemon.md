@@ -731,8 +731,13 @@ IPv4).
 - 5 failures in a row lock the source out for 1 min, doubling with each
   further lockout up to 1 h. A successful handshake resets the source.
 - At most 4096 sources tracked; stale ones (not locked, quiet 2 h) are
-  dropped first; if it is still full, a new source is not tracked (better
-  than locking out everybody new).
+  dropped first. If it is still full, the listener refuses a new source
+  before the handshake (otherwise 4096 addresses would buy unlimited
+  guesses from every further one), except a paired device at its known
+  address. Failures that still arrive while full (those devices, our own
+  outgoing connections) are counted in 256 extra slots. Someone who fills
+  the table can keep new devices out (Add device, a moved address) until
+  their sources go stale; sync with paired devices keeps working.
 - **Server side**: a locked source gets no handshake at all; a wrong client
   confirmation counts as a failure.
 - **Client side**: a fake server learns one guess from our confirmation value,
