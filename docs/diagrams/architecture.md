@@ -8,7 +8,7 @@ flowchart LR
     subgraph user["this device, one user"]
         tui["cesa_conn_tui<br/>(terminal UI)"]
         subgraph daemon["cesa_conn_networker (daemon)"]
-            ipc["ipc_server<br/>uid + code-signature gate"]
+            ipc["ipc_server<br/>uid gate (always);<br/>code-signature gate: macOS,<br/>only if built with a requirement"]
             core["Daemon<br/>keys, vault, state"]
             net["networking<br/>listener 3232, salt query 3233,<br/>discovery 3636"]
             clip["clipboard task"]

@@ -69,5 +69,7 @@ flowchart LR
     kind -- pw2 --> d["d_key from the same d_salt<br/>re-wrap DEK, re-seal;<br/>auto-login: replace data-key"]
     a --> saved["saved first, kept second"]
     d --> saved
-    saved --> hello["hello to every paired device:<br/>those with the old password show<br/>'incorrect password' (13.1)"]
+    saved --> net{"networking running<br/>(Sync on)?"}
+    net -- yes --> hello["hello to every paired device with a<br/>known address that isn't paused: those<br/>with the old password show<br/>'incorrect password' (13.1)"]
+    net -- no --> later["no hello now: shown when<br/>the devices next connect"]
 ```

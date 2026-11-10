@@ -9,8 +9,9 @@ stateDiagram-v2
     [*] --> Fresh: no vault file
     [*] --> Locked: vault file found
     Fresh --> Joining: JoinGroup / JoinGroupAt (pw1, pw2)
-    Joining --> Fresh: cancel, 5 min, 5 attempts used up (passwords wiped)
-    Joining --> Open: paired, both salts received, vault created with Sync on
+    Joining --> Fresh: cancel, 5 min, 5 attempts used up, before a commit started (passwords wiped)
+    Joining --> Open: paired, both salts received, vault created with Sync on (a cancel or the 5 min after the commit started don't stop it)
+    Joining --> RamOnly: commit ran, but the vault couldn't be saved (keys and the member kept in RAM)
     Fresh --> Partial: SetAuth or SetData
     Partial --> Open: second key set, vault created
     Partial --> RamOnly: second key set, no storage or the save failed
@@ -29,7 +30,9 @@ stateDiagram-v2
 ```mermaid
 flowchart LR
     change["any state change<br/>(or auto-login at start)"] --> check{"vault open<br/>and both keys<br/>and Sync on?"}
-    check -- yes --> on["networking on:<br/>listener 3232, pairing bridge,<br/>clipboard task, hello round"]
+    check -- yes --> bind{"listener binds<br/>TCP 3232?"}
+    bind -- yes --> on["networking on:<br/>listener 3232, pairing bridge,<br/>clipboard task, hello round"]
+    bind -- no --> failed["stays off: Status shows Sync on but<br/>network_running false (see the daemon log)"]
     check -- no --> off["networking off:<br/>token cancelled, connections end,<br/>Add device window closes,<br/>waiting pairings rejected"]
 ```
 

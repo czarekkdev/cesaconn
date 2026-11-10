@@ -19,7 +19,7 @@ sequenceDiagram
     else Status, ListPeers, pairing, Add device, join
         D->>D: answer at once
     end
-    D->>UI: 0x00 || payload, or 0x01 || error code
+    D->>UI: frame = len (u32 LE) || (0x00 || payload, or 0x01 || error code)
     Note over UI,D: 10 s per connection, 5 s per read / write,<br/>at most 4 clients, frame <= 72 KiB
 ```
 

@@ -21,7 +21,9 @@ flowchart TB
     connected -- no --> connect["connect: ConnectNewDevice<br/>(handshake, pairing)"]
     connected -- yes --> skip
     id -- "they are lower" --> wait["they connect to us"]
-    close["2 min, x (StopAddDevice), Sync off"] --> closed["salt port closed, d_salt offer cleared,<br/>waiting pairings rejected"]
+    expire["2 min are up (end_invite)"] --> closed["salt port closed, d_salt offer cleared;<br/>prompts already waiting stay answerable<br/>until their 60 s run out"]
+    stop["x (StopAddDevice)"] --> stopped["window closed as above, and the waiting<br/>prompts are rejected (unless a join still asks)"]
+    syncoff["Sync off / shutdown"] --> netoff["networking stops: every waiting<br/>pairing is rejected"]
 ```
 
 ## A typed address (`a`, 13.2)
@@ -30,10 +32,13 @@ For a device discovery can't reach: another subnet, a VPN.
 
 ```mermaid
 flowchart TB
-    a["a on Devices: IPv4 address"] --> valid{"usable?<br/>(not loopback, multicast,<br/>broadcast, IPv6; not own)"}
-    valid -- no --> red["popup stays open, red reason<br/>(daemon: BadRequest / OwnAddress)"]
-    valid -- "yes, member" --> win["AddDeviceAt: window opens<br/>(or the open one is used)"]
-    valid -- "yes, fresh device" --> joinat["JoinGroupAt (see join.md)"]
+    a["a on Devices: IPv4 address"] --> valid{"parses as a usable IPv4?<br/>(checked in the TUI: not loopback,<br/>multicast, broadcast, IPv6, a name, a port)"}
+    valid -- no --> red["popup stays open, red reason<br/>(nothing sent; the daemon would<br/>answer BadRequest)"]
+    valid -- "yes, member" --> sent["popup closes, AddDeviceAt sent"]
+    sent --> own{"daemon: one of this<br/>machine's addresses?"}
+    own -- yes --> ownerr["OwnAddress: shown in the log,<br/>no window opened"]
+    own -- no --> win["window opens<br/>(or the open one is used)"]
+    valid -- "yes, fresh device" --> joinat["passwords, then JoinGroupAt<br/>(see join.md; OwnAddress the same way)"]
     win --> typed{"waited for in this<br/>window already?"}
     typed -- yes --> done["nothing more"]
     typed -- no --> poll["ask its salt query"]
@@ -50,11 +55,11 @@ flowchart TB
 
 ```mermaid
 sequenceDiagram
-    participant A as A (Mac, lower id)
-    participant B as B (VM)
+    participant A as A (Mac, higher id)
+    participant B as B (VM, lower id)
     Note over A,B: B's broadcast reaches A, A's never reaches B
     B-->>A: announcement
-    Note over A: found B, but B has the higher id:<br/>"B connects to us" (searched list)
+    Note over A: found B, B has the lower id:<br/>A waits for B to connect (searched list)
     Note over B: never heard A: never connects
     Note over A: user types B's address (typed list)
     A->>B: salt query, then connect (connected list)

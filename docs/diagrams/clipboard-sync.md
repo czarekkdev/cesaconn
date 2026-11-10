@@ -15,17 +15,20 @@ sequenceDiagram
         A->>CB: change counter (no content read)
     end
     Note over A: counter moved, then held still one more poll,<br/>switch on, no round running
-    A->>CB: types: concealed / transient?
-    alt marked by a password manager, or > 1 MiB
-        Note over A: never read, never sent
+    A->>CB: types only: concealed / transient?
+    alt marked by a password manager
+        Note over A: content never read, never sent
+    else over 1 MiB
+        CB->>A: text as an NSString (OS memory)
+        Note over A: length checked before any copy:<br/>not copied, not sent
     else plain text
-        CB->>A: text (Zeroizing)
+        CB->>A: text, copied once into a Zeroizing buffer
         Note over A: version || kind || epoch || seq + 1 || len || content
-        A->>B: one connection per device: handshake (never pairs),<br/>ClipboardSync through the d_key layer
+        A->>B: one connection per device: handshake (the sender<br/>refuses to pair), ClipboardSync through the d_key layer
         Note over B: bounds, d_key layer, switch on?,<br/>strict decode, newer than the last from A?
         B->>CBB: write text
         Note over B: the counter of this write is taken as seen:<br/>never sent back (no echo)
-        B->>A: 0x00 applied (or 0x01 ignored, 0x02 data passwords differ)
+        B->>A: 0x00 written (0x01 ignored or not written, 0x02 data passwords differ)
     end
 ```
 
@@ -47,9 +50,9 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-    in["update arrives"] --> p{"paired device?"}
-    p -- no --> x1["closed (sync connections never pair)"]
-    p -- yes --> len{"declared length<br/>22+1+28 .. 22+1 MiB+28?"}
+    in["connection arrives"] --> p{"handshake: a paired device,<br/>or paired just now?"}
+    p -- no --> x1["closed (a new device pairs only<br/>during an Add device window here,<br/>like any connection)"]
+    p -- yes --> len{"ClipboardSync: declared length<br/>22+1+28 .. 22+1 MiB+28?"}
     len -- no --> x2["closed"]
     len -- yes --> dk{"d_key layer opens?"}
     dk -- no --> x3["0x02: data passwords differ"]
@@ -59,5 +62,8 @@ flowchart LR
     fmt -- no --> x4
     fmt -- yes --> ord{"new epoch, or higher seq?"}
     ord -- no --> x4
-    ord -- yes --> ok["write to the clipboard: 0x00"]
+    ord -- yes --> write{"OS clipboard write"}
+    write -- ok --> ok["0x00 written"]
+    write -- refused --> x4
+    in -. "the daemon doesn't answer within 2 s" .-> late["0x01 to the sender, but the queued<br/>update may still be written later<br/>(0x01 is not proof of no write)"]
 ```

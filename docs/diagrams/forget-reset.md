@@ -26,7 +26,7 @@ keychain salts are the reason to use it).
 flowchart TB
     r["ResetDevice (CN-RESET bytes)"] --> s1["1. reset counter + 1, cancel a join,<br/>stop networking (window, salt port, prompts)"]
     s1 --> s2{"2. delete vault.bin<br/>(the decisive step)"}
-    s2 -- failed --> keep["StorageFailed: nothing else changed"]
+    s2 -- failed --> keep["StorageFailed: keys, vault and peers unchanged;<br/>the join and the window stay cancelled;<br/>networking starts again if the saved state says so"]
     s2 -- deleted --> s3["3. drop the key slots (zeroized),<br/>replace the trusted-peer list with a new one,<br/>clear prompts"]
     s3 --> s4{"4. delete keychain<br/>salts + data-key"}
     s4 -- ok --> fresh["Fresh: n joins a group again"]

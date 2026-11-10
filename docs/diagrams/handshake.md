@@ -60,12 +60,13 @@ flowchart TB
 sequenceDiagram
     participant C as Sender
     participant S as Receiver
-    C->>S: init header: ActionType (1) || length (u64), tag 0x01
-    Note over S: length bounded before allocating
-    C->>S: payload through the d_key layer, chunked
     alt Hello / ClipboardSync (answered)
+        C->>S: init header: ActionType || length (payload + 28), tag 0x01
+        Note over S: length bounded before allocating
+        C->>S: payload through the d_key layer, chunked
         S->>C: one byte through Noise only:<br/>0x00 applied, 0x01 ignored, 0x02 data passwords differ
     else GroupSalt (join only)
+        C->>S: init header: GroupSalt || length 0 (no payload)
         S->>C: d_salt (32) through Noise, only to a device paired just now
     end
 ```

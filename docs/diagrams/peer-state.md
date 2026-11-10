@@ -54,7 +54,7 @@ sequenceDiagram
     Note over A: networking starts, or a password changed here
     A->>B: handshake (never pairs)
     alt pw1 differs
-        Note over A,B: SPAKE2 confirmation fails: both mark "auth differs"
+        Note over A,B: SPAKE2 confirmation fails: each side marks "auth differs"<br/>on the paired device last seen at that address (B may<br/>mark nothing if A's address changed since)
     else pw1 same
         A->>B: Hello: "CESAHELO" through the d_key layer
         alt pw2 differs

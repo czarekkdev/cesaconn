@@ -1290,7 +1290,8 @@ sent: the pasteboard's types are checked first (types only, no content),
 and `org.nspasteboard.ConcealedType` or `org.nspasteboard.TransientType`
 (nspasteboard.org) means nothing is read. Windows (later):
 `ExcludeClipboardContentFromMonitorProcessing`; KDE/Wayland (later):
-`x-kde-passwordManagerHint`. Text over 1 MiB isn't read either.
+`x-kde-passwordManagerHint`. Text over 1 MiB isn't copied or sent: the
+OS hands it over as an `NSString`, whose length is checked first.
 
 ### 12.5 Memory and logging
 
