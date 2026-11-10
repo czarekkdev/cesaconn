@@ -268,10 +268,13 @@ pub async fn recv_handler(
         return Err(TcpNetworkerErrors::LockedOut);
     }
 
-    // the limiter is full of failing sources: a stranger's failures couldn't
-    // be counted, so no handshake; a paired device at its address still gets in
-    if context.guess_limiter.is_full_for(peer_addr.ip()).await
-        && !context.peer_book.knows_ip(peer_addr.ip()).await
+    // the limiter is full of failing sources: whoever's failures couldn't be
+    // counted gets no handshake; a paired device's address has reserve slots
+    let known = context.peer_book.knows_ip(peer_addr.ip()).await;
+    if context
+        .guess_limiter
+        .is_full_for(peer_addr.ip(), known)
+        .await
     {
         warn!(%peer_addr, "guess limiter full, refusing a new source");
         return Err(TcpNetworkerErrors::LockedOut);
