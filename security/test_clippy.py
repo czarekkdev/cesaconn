@@ -11,6 +11,7 @@ from security import run as gate
 
 
 def diagnostic(lint="unused_imports", level="warning", path="cesa_conn_crypto/src/lib.rs"):
+    """One compiler message in cargo's JSON format."""
     return json.dumps({"reason": "compiler-message", "message": {
         "level": level, "code": {"code": lint}, "message": "fixture diagnostic",
         "spans": [{"is_primary": True, "file_name": path, "line_start": 1}],
@@ -19,6 +20,7 @@ def diagnostic(lint="unused_imports", level="warning", path="cesa_conn_crypto/sr
 
 class ClippyCoverageTests(unittest.TestCase):
     def test_each_configuration_failure_blocks_independently(self):
+        """Each failed run (crate, feature set) is its own gap."""
         count = len(gate.CRATES) * 2
         for index in range(count):
             for code in (1, 101, 124, 127, -9):
@@ -36,6 +38,7 @@ class ClippyCoverageTests(unittest.TestCase):
                     self.assertIn("fixture execution failure", result.findings[0].message)
 
     def test_unreported_errors_leave_a_gap(self):
+        """Errors the report doesn't show (warnings only, outside the workspace, no span, no JSON) don't explain an exit."""
         no_span = json.dumps({"reason": "compiler-message", "message": {
             "level": "error", "message": "aborting", "spans": []}})
         for output in (diagnostic(), diagnostic("E0001", "error", "external/src/lib.rs"),
@@ -48,17 +51,32 @@ class ClippyCoverageTests(unittest.TestCase):
                 self.assertEqual(len(failed), len(gate.CRATES) * 2)
 
     def test_reported_errors_explain_the_exit(self):
-        for output in (diagnostic("clippy::mem_forget", "error"),
-                       diagnostic("E0308", "error"),
-                       diagnostic("clippy::unknown_conf", "error", "clippy.toml")):
-            with self.subTest(output=output), patch.object(
-                gate, "run", return_value=(101, output, "failed")
-            ):
+        """An error in the crate's own file, or in clippy.toml, explains its exit."""
+        for lint, own_file in (("clippy::mem_forget", True), ("E0308", True),
+                               ("clippy::unknown_conf", False)):
+            def own(cmd, **kwargs):
+                """Fake clippy: the error is in the crate being run (or clippy.toml)."""
+                crate = cmd[cmd.index("-p") + 1]
+                path = f"{crate}/src/lib.rs" if own_file else "clippy.toml"
+                return 101, diagnostic(lint, "error", path), "failed"
+            with self.subTest(lint=lint), patch.object(gate, "run", side_effect=own):
                 result = gate.check_clippy()
                 self.assertEqual([f for f in result.findings if f.rule == "invocation-failed"], [])
                 self.assertTrue(result.findings)
 
+    def test_error_in_a_dependency_is_a_gap_for_the_dependent(self):
+        """A crate whose run fails on another crate's error was never linted."""
+        error = diagnostic("clippy::mem_forget", "error", f"{gate.CRATES[0]}/src/lib.rs")
+        with patch.object(gate, "run", return_value=(101, error, "failed")):
+            result = gate.check_clippy()
+        failed = [f for f in result.findings if f.rule == "invocation-failed"]
+        self.assertEqual(len(failed), (len(gate.CRATES) - 1) * 2)
+        self.assertFalse(any(f.path == gate.CRATES[0] for f in failed))
+        self.assertEqual([f.severity for f in result.findings
+                          if f.rule != "invocation-failed"], ["critical"])
+
     def test_timeout_is_a_gap_even_with_reported_errors(self):
+        """A timed-out run printed only part of its output: always a gap."""
         with patch.object(gate, "run",
                           return_value=(124, diagnostic("clippy::mem_forget", "error"), "TIMEOUT")):
             result = gate.check_clippy()
@@ -66,6 +84,7 @@ class ClippyCoverageTests(unittest.TestCase):
         self.assertEqual(len(failed), len(gate.CRATES) * 2)
 
     def test_success_with_unused_notes_has_no_gap(self):
+        """A clean run with unused-code notes has no gap."""
         with patch.object(gate, "run", return_value=(0, diagnostic(), "")):
             result = gate.check_clippy()
         self.assertEqual(gate.coverage_gaps([result]), [])
@@ -73,6 +92,7 @@ class ClippyCoverageTests(unittest.TestCase):
         self.assertTrue(gate.is_note(result.findings[0]))
 
     def test_main_blocks_and_reports_incomplete_analysis(self):
+        """The gate exits 1 and the report says BLOCKED on a gap."""
         for code, verdict in ((0, "PASSED"), (124, "BLOCKED")):
             with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
                 output = io.StringIO()

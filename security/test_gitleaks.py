@@ -12,6 +12,7 @@ from security import run as gate
 
 class GitleaksTests(unittest.TestCase):
     def setUp(self):
+        """A temp output dir, gitleaks reported as installed."""
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.out = Path(self.directory.name)
@@ -25,7 +26,9 @@ class GitleaksTests(unittest.TestCase):
         self.addCleanup(self.patch_have.stop)
 
     def scan(self, code=0, report="[]", git_range=None):
+        """Runs check_gitleaks with a fake gitleaks writing `report`."""
         def invoke(cmd, **kwargs):
+            """The fake gitleaks: records the call, writes the report."""
             self.commands.append(cmd)
             path = Path(cmd[cmd.index("--report-path") + 1])
             self.paths.append(path)
@@ -37,20 +40,24 @@ class GitleaksTests(unittest.TestCase):
             return gate.check_gitleaks(git_range)
 
     def test_failed_scan_cannot_reuse_stale_clean_report(self):
+        """A failed scan never reads an old report."""
         (self.out / "gitleaks.json").write_text("[]")
         for code in (1, 124, 127):
             with self.subTest(code=code):
                 self.assertEqual(self.scan(code, None).status, "failed")
 
     def test_failed_scan_rejects_even_current_parseable_report(self):
+        """A failed scan is a gap even if its report parses."""
         self.assertEqual(self.scan(1).status, "failed")
 
     def test_success_requires_valid_current_report(self):
+        """A clean exit needs a valid JSON array report."""
         for report in (None, "", "{", "null", "{}", "[null]"):
             with self.subTest(report=report):
                 self.assertEqual(self.scan(report=report).status, "failed")
 
     def test_successful_scans_use_unique_paths_and_preserve_range(self):
+        """Each scan has its own report path; the git range is passed on."""
         for _ in range(2):
             result = self.scan(git_range="A..B")
             self.assertEqual(result.status, "ok")
@@ -60,6 +67,7 @@ class GitleaksTests(unittest.TestCase):
         self.assertTrue(all(not path.parent.exists() for path in self.paths))
 
     def test_successful_scan_still_reports_secrets(self):
+        """Leaks in a valid report are critical findings."""
         result = self.scan(report=json.dumps([{
             "RuleID": "test-rule", "Commit": "a" * 40,
             "Description": "synthetic fixture", "File": "fixture.txt", "StartLine": 3,
@@ -69,6 +77,7 @@ class GitleaksTests(unittest.TestCase):
         self.assertEqual(result.findings[0].path, "fixture.txt")
 
     def test_failed_scan_blocks_gate_and_reports_coverage_gap(self):
+        """A failed scan blocks the gate as a coverage gap."""
         failed = gate.ToolResult("gitleaks", "failed", "scan failed")
         with patch.object(gate, "check_gitleaks", return_value=failed), \
                 patch.object(gate.sys, "argv", ["run.py", "--only", "gitleaks"]), \

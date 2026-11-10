@@ -200,12 +200,13 @@ def check_semgrep() -> ToolResult:
 
 
 # ---- clippy -----------------------------------------------------------------
-def clippy_exit_unexplained(code: int, output: str) -> bool:
-    """A nonzero clippy exit is explained only by an error this report shows:
-    a deny-level lint or a compile error in a workspace file (or clippy.toml).
-    Anything else (a timeout, a manifest or lockfile error, a dependency
-    outside the workspace that doesn't build) left code unanalysed with no
-    finding, so it's a coverage gap."""
+def clippy_exit_unexplained(code: int, output: str, crate: str) -> bool:
+    """A nonzero clippy exit of `crate`'s run is explained only by an error
+    this report shows in `crate` itself: a deny-level lint or a compile error
+    in one of its files, or in clippy.toml. Anything else left `crate`
+    unanalysed, so it's a coverage gap: a timeout, a manifest or lockfile
+    error, or an error in a crate it depends on (that one is reported, but
+    `crate` was never linted)."""
     if code == 0:
         return False
     if code == 124:  # timed out: whatever was printed is partial
@@ -222,12 +223,14 @@ def clippy_exit_unexplained(code: int, output: str) -> bool:
             continue
         span = next((s for s in m.get("spans", []) if s.get("is_primary")), None)
         path = (span or {}).get("file_name", "")
-        if path.endswith("clippy.toml") or any(path.startswith(c) for c in CRATES):
+        if path.endswith("clippy.toml") or path.startswith(crate + "/"):
             return False
     return True
 
 
 def check_clippy() -> ToolResult:
+    """Clippy on every crate, default and all features; findings, unused-code
+    notes, and gaps for crates that weren't fully analysed."""
     r = ToolResult("clippy")
     flags = []
     for l in CLIPPY_WARN + CLIPPY_CRITICAL:
@@ -246,11 +249,12 @@ def check_clippy() -> ToolResult:
         for features in ([], ["--all-features"]):
             code, o, err = run(["cargo", "clippy", "-p", crate, "--all-targets", *features,
                                 "--message-format=json", "--", *flags], timeout=1800)
-            if clippy_exit_unexplained(code, o):
+            if clippy_exit_unexplained(code, o, crate):
                 config = "all features" if features else "default features"
                 r.findings.append(Finding("clippy", "invocation-failed", "info",
                                           f"{crate} ({config}): cargo clippy exited with {code} and "
-                                          f"no reported error explains it (incomplete analysis).\n"
+                                          f"no error reported in this crate explains it "
+                                          f"(incomplete analysis).\n"
                                           f"{err[-1500:]}", crate))
             out += o + "\n"
         build_errors = 0
@@ -339,6 +343,8 @@ def check_audit() -> ToolResult:
 
 # ---- cargo deny -------------------------------------------------------------
 def check_deny() -> ToolResult:
+    """cargo-deny sources, bans and licenses; an exit its own policy errors
+    don't explain is a gap."""
     r = ToolResult("cargo-deny")
     if not have_cargo_sub("deny"):
         r.status, r.note = "skipped", "cargo-deny not installed (cargo install cargo-deny --locked)"
@@ -347,7 +353,7 @@ def check_deny() -> ToolResult:
     # licenses=4, sources=8. Operational errors also exit 1.
     for check, sev, policy_exit in (("sources", "critical", 8), ("bans", "warning", 2),
                                     ("licenses", "warning", 4)):
-        code, out, err = run(["cargo", "deny", "--format", "json", "check", check], timeout=600)
+        code, _out, err = run(["cargo", "deny", "--format", "json", "check", check], timeout=600)
         policy_error = False
         for line in err.splitlines():
             try:
@@ -373,6 +379,8 @@ def check_deny() -> ToolResult:
 
 # ---- gitleaks ---------------------------------------------------------------
 def check_gitleaks(git_range: str | None) -> ToolResult:
+    """gitleaks over the git history (or `git_range`); a failed scan or an
+    invalid report is a gap, never an empty result."""
     r = ToolResult("gitleaks")
     if not have("gitleaks"):
         r.status, r.note = "skipped", "gitleaks not installed"
