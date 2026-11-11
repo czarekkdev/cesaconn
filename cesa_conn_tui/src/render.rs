@@ -169,13 +169,20 @@ pub(super) fn render_devices(frame: &mut Frame, area: Rect, app: &mut App) {
         Style::default().fg(color),
     )));
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  n: add device / join    a: by IP (VPN)    x: stop / cancel    d: forget",
-        Style::default().fg(Color::DarkGray),
-    )));
+    // two short lines: one long one was cut off on narrower terminals
+    for keys in [
+        "  n: add device / join    a: by IP (VPN)",
+        "  x: stop / cancel        d: forget",
+    ] {
+        lines.push(Line::from(Span::styled(
+            keys,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
 
+    // wrapped, not cut: long states and key help stay readable when narrow
     frame.render_widget(
-        Paragraph::new(lines).block(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::bordered()
                 .title(" Details ")
                 .border_type(BorderType::Rounded),
@@ -229,19 +236,61 @@ pub(super) fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// `text` in pieces of at most `width` columns (0 acts as 1), cut after the
+/// last space that fits, else mid-word. Nothing is dropped: the pieces
+/// joined are `text`.
+pub(super) fn wrap_to_width(text: &str, width: usize) -> Vec<&str> {
+    let mut pieces = Vec::new();
+    let mut rest = text;
+
+    while let Some(cut) = next_cut(rest, width) {
+        let Some((piece, tail)) = rest.split_at_checked(cut) else {
+            break;
+        };
+        pieces.push(piece);
+        rest = tail;
+    }
+    // a char wider than `width` at the very end leaves nothing over
+    if !rest.is_empty() || pieces.is_empty() {
+        pieces.push(rest);
+    }
+    pieces
+}
+
+/// Where to cut `text` so the first piece fits `width` columns: after the
+/// last space that fits, else before the first char that doesn't (always
+/// at least one char, so wrapping ends). `None` if all of it fits.
+fn next_cut(text: &str, width: usize) -> Option<usize> {
+    use unicode_width::UnicodeWidthChar;
+
+    let mut cols = 0usize;
+    let mut after_space = None;
+    for (i, c) in text.char_indices() {
+        let w = c.width().unwrap_or(0);
+        if cols.saturating_add(w) > width {
+            let hard = if i == 0 { c.len_utf8() } else { i };
+            return Some(after_space.unwrap_or(hard));
+        }
+        cols = cols.saturating_add(w);
+        if c == ' ' {
+            after_space = Some(i.saturating_add(1));
+        }
+    }
+    None
+}
+
 /// Logs: the log lines coloured by level, following the newest unless
 /// scrolled up.
 pub(super) fn render_logs(frame: &mut Frame, area: Rect, app: &mut App) {
-    let inner_height = area.height.saturating_sub(2) as usize;
+    let inner_height = usize::from(area.height.saturating_sub(2));
+    let inner_width = usize::from(area.width.saturating_sub(2));
 
-    if app.log_follow {
-        app.log_scroll = to_u16(app.logs.len().saturating_sub(inner_height));
-    }
-
+    // wrapped here, not by the Paragraph: the scroll counts screen rows, so
+    // following the newest line needs the real number of rows
     let lines: Vec<Line> = app
         .logs
         .iter()
-        .map(|entry| {
+        .flat_map(|entry| {
             let color = if entry.contains("ERROR") {
                 Color::Red
             } else if entry.contains("WARN") {
@@ -251,9 +300,16 @@ pub(super) fn render_logs(frame: &mut Frame, area: Rect, app: &mut App) {
             } else {
                 Color::Reset
             };
-            Line::from(Span::styled(entry.as_str(), Style::default().fg(color)))
+            let style = Style::default().fg(color);
+            wrap_to_width(entry, inner_width)
+                .into_iter()
+                .map(move |piece| Line::from(Span::styled(piece, style)))
         })
         .collect();
+
+    if app.log_follow {
+        app.log_scroll = to_u16(lines.len().saturating_sub(inner_height));
+    }
 
     let title = if app.log_follow {
         " Logs [follow] "
