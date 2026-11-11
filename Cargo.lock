@@ -274,6 +274,7 @@ dependencies = [
  "crossterm",
  "ratatui",
  "tokio",
+ "unicode-width",
  "zeroize",
 ]
 

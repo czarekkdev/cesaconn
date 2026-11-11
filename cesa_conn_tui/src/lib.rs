@@ -30,7 +30,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Tabs},
+    widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
 use std::{
     io,
@@ -1403,6 +1403,136 @@ mod tests {
         for key in ["q:Quit", "n:Add/Join", "a:By IP", "x:Stop", "d:Forget"] {
             assert!(keys.contains(key), "{key} missing in: {keys}");
         }
+    }
+
+    /// Test that the Details keys are never cut off (the one-line help was
+    /// cut after "d: for"): whole on one line from 80 columns, wrapped but
+    /// complete when narrower
+    #[test]
+    fn test_details_keys_not_cut() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        for width in [60, 80, 120] {
+            let mut app = App::new();
+            handle_link_event(&mut app, up_network(true, None));
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal.draw(|frame| ui(frame, &mut app)).unwrap();
+
+            // only the Details panel: from its left border to the screen edge
+            let buffer = terminal.backend().buffer();
+            let cells = |y: u16| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol());
+            let title_row = (0..buffer.area.height)
+                .find(|&y| cells(y).collect::<String>().contains("Details"))
+                .unwrap();
+            let left = (0..buffer.area.width)
+                .rfind(|&x| buffer[(x, title_row)].symbol() == "╭")
+                .unwrap();
+            let rows: Vec<String> = (0..buffer.area.height)
+                .map(|y| {
+                    (left.saturating_add(1)..buffer.area.width.saturating_sub(1))
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect()
+                })
+                .collect();
+            let words: Vec<&str> = rows.iter().flat_map(|row| row.split_whitespace()).collect();
+            for key in [
+                "n: add device / join",
+                "a: by IP (VPN)",
+                "x: stop / cancel",
+                "d: forget",
+            ] {
+                if width >= 80 {
+                    assert!(
+                        rows.iter().any(|row| row.contains(key)),
+                        "{key} not whole at width {width}"
+                    );
+                } else {
+                    let needed: Vec<&str> = key.split_whitespace().collect();
+                    assert!(
+                        words.windows(needed.len()).any(|w| w == needed.as_slice()),
+                        "{key} cut at width {width}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Test that wrapping keeps every character, fits the width, breaks at
+    /// spaces when it can, and always ends (zero width, wide chars)
+    #[test]
+    fn test_wrap_to_width() {
+        use unicode_width::UnicodeWidthStr;
+
+        assert_eq!(render::wrap_to_width("", 10), vec![""]);
+        assert_eq!(render::wrap_to_width("short", 10), vec!["short"]);
+        assert_eq!(
+            render::wrap_to_width("peer locked out after five", 12),
+            vec!["peer locked ", "out after ", "five"]
+        );
+        assert_eq!(
+            render::wrap_to_width("abcdefgh", 3),
+            vec!["abc", "def", "gh"]
+        );
+        assert_eq!(render::wrap_to_width("ab", 0), vec!["a", "b"]);
+        // a char wider than the width still moves on
+        assert_eq!(render::wrap_to_width("日本", 1), vec!["日", "本"]);
+
+        for (text, width) in [
+            (
+                "ERROR cesa_conn_networker: guess limiter full, refusing a new source peer_addr=10.0.0.7:5122",
+                17,
+            ),
+            ("x  y   z", 2),
+            ("日本語のテキスト mixed", 5),
+        ] {
+            let pieces = render::wrap_to_width(text, width);
+            assert_eq!(pieces.concat(), text);
+            for piece in &pieces {
+                assert!(
+                    piece.width() <= width.max(2),
+                    "{piece:?} wider than {width}"
+                );
+            }
+        }
+    }
+
+    /// Test that long log lines wrap instead of being cut, and following
+    /// still shows the newest line on a small terminal
+    #[test]
+    fn test_logs_wrap_and_follow() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut app = App::new();
+        app.active_tab = Tab::Logs;
+        app.push_log("WARN first: a long line that is much wider than the window END-OF-FIRST");
+        for i in 0..30 {
+            app.push_log(format!("INFO line {i} with some more words to wrap here"));
+        }
+        app.push_log("INFO the newest line, long enough to wrap too NEWEST-TAIL");
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 16)).unwrap();
+        terminal.draw(|frame| ui(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("NEWEST-TAIL"), "newest line not followed");
+
+        // scrolled to the top, the first line is complete
+        app.log_follow = false;
+        app.log_scroll = 0;
+        terminal.draw(|frame| ui(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("END-OF-FIRST"), "first line cut");
     }
 
     fn screen(app: &mut App) -> String {
