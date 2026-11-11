@@ -348,8 +348,19 @@ pub async fn udp_broadcast_presence(
 /// skipped. The address is only a hint: it is NOT authenticated, the TCP
 /// handshake decides trust.
 // only the manual test commands use it (the daemon wants every device)
-#[cfg(any(test, feature = "test-commands"))]
+#[cfg(feature = "test-commands")]
 pub async fn udp_find_broadcaster(
+    duration: u64,
+    own_id: InstanceId,
+) -> Result<SocketAddr, UdpNetworkerErrors> {
+    find_first(bind_discovery().await?, duration, own_id).await
+}
+
+/// The search of [`udp_find_broadcaster`] on an already bound `socket`
+/// (tests bind a free localhost port instead of the shared fixed one).
+#[cfg(any(test, feature = "test-commands"))]
+async fn find_first(
+    socket: UdpSocket,
     duration: u64,
     own_id: InstanceId,
 ) -> Result<SocketAddr, UdpNetworkerErrors> {
@@ -358,15 +369,6 @@ pub async fn udp_find_broadcaster(
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(duration))
         .ok_or(UdpNetworkerErrors::Timeout)?;
-
-    // Broadcasts only arrive on a wildcard bind.
-    // nosemgrep: cesa.net.bind-all-interfaces
-    let socket = UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT))
-        .await
-        .map_err(|e| {
-            error!(error = %e, port = DISCOVERY_PORT, "failed to bind UDP socket for discovery");
-            UdpNetworkerErrors::FailedToBindSocket
-        })?;
 
     info!(
         timeout_secs = duration,
@@ -425,20 +427,33 @@ pub async fn udp_find_broadcasters(
     duration: u64,
     own_id: InstanceId,
 ) -> Result<Vec<(SocketAddr, InstanceId)>, UdpNetworkerErrors> {
+    find_all(bind_discovery().await?, duration, own_id).await
+}
+
+/// Binds the discovery port on every interface: broadcasts only arrive on a
+/// wildcard bind.
+async fn bind_discovery() -> Result<UdpSocket, UdpNetworkerErrors> {
+    // nosemgrep: cesa.net.bind-all-interfaces
+    UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT))
+        .await
+        .map_err(|e| {
+            error!(error = %e, port = DISCOVERY_PORT, "failed to bind UDP socket for discovery");
+            UdpNetworkerErrors::FailedToBindSocket
+        })
+}
+
+/// The search of [`udp_find_broadcasters`] on an already bound `socket`
+/// (tests bind a free localhost port instead of the shared fixed one).
+async fn find_all(
+    socket: UdpSocket,
+    duration: u64,
+    own_id: InstanceId,
+) -> Result<Vec<(SocketAddr, InstanceId)>, UdpNetworkerErrors> {
     let duration = duration.min(MAX_BROADCAST_DURATION);
     // one deadline for the whole search, junk packets can't extend it
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(duration))
         .ok_or(UdpNetworkerErrors::Timeout)?;
-
-    // Broadcasts only arrive on a wildcard bind.
-    // nosemgrep: cesa.net.bind-all-interfaces
-    let socket = UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT))
-        .await
-        .map_err(|e| {
-            error!(error = %e, port = DISCOVERY_PORT, "failed to bind UDP socket for discovery");
-            UdpNetworkerErrors::FailedToBindSocket
-        })?;
 
     info!(
         timeout_secs = duration,
@@ -488,28 +503,30 @@ pub async fn udp_find_broadcasters(
 mod tests {
     use super::*;
 
-    /// Serialises tests that bind the fixed discovery port.
-    fn port_lock() -> &'static tokio::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-    }
-
-    /// Sends `packet` to the discovery port on localhost.
-    async fn send_local(packet: &[u8]) {
+    /// A socket on a free localhost port for one test's search: never the
+    /// shared discovery port, so parallel runs, a running daemon or a real
+    /// device on the LAN can't take it or send into it.
+    async fn test_socket() -> (UdpSocket, SocketAddr) {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        socket
-            .send_to(packet, ("127.0.0.1", DISCOVERY_PORT))
-            .await
-            .unwrap();
+        let addr = socket.local_addr().unwrap();
+        (socket, addr)
     }
 
-    /// Starts a 2 s search in the background and waits until it is listening.
+    /// Sends `packet` to the search listening on `to`.
+    async fn send_local(to: SocketAddr, packet: &[u8]) {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.send_to(packet, to).await.unwrap();
+    }
+
+    /// Starts a 2 s search in the background; returns it and where it listens.
     async fn search(
         own_id: InstanceId,
-    ) -> tokio::task::JoinHandle<Result<SocketAddr, UdpNetworkerErrors>> {
-        let handle = tokio::spawn(async move { udp_find_broadcaster(2, own_id).await });
-        sleep(Duration::from_millis(100)).await;
-        handle
+    ) -> (
+        tokio::task::JoinHandle<Result<SocketAddr, UdpNetworkerErrors>>,
+        SocketAddr,
+    ) {
+        let (socket, addr) = test_socket().await;
+        (tokio::spawn(find_first(socket, 2, own_id)), addr)
     }
 
     /// Test that an announcement round-trips through build and parse
@@ -550,10 +567,9 @@ mod tests {
     /// Test that another device's announcement is found
     #[tokio::test]
     async fn test_finds_other_device() {
-        let _guard = port_lock().lock().await;
-        let handle = search(InstanceId::generate().unwrap()).await;
+        let (handle, to) = search(InstanceId::generate().unwrap()).await;
 
-        send_local(&announcement(InstanceId::generate().unwrap())).await;
+        send_local(to, &announcement(InstanceId::generate().unwrap())).await;
 
         assert!(handle.await.unwrap().is_ok());
     }
@@ -561,30 +577,28 @@ mod tests {
     /// Test that our own announcement and junk are skipped, then a real one found
     #[tokio::test]
     async fn test_skips_own_and_junk() {
-        let _guard = port_lock().lock().await;
         let own = InstanceId::generate().unwrap();
-        let handle = search(own).await;
+        let (handle, to) = search(own).await;
 
-        send_local(&announcement(own)).await;
-        send_local(b"CesaConn Broadcast").await;
-        send_local(&[0u8; 1024]).await;
+        send_local(to, &announcement(own)).await;
+        send_local(to, b"CesaConn Broadcast").await;
+        send_local(to, &[0u8; 1024]).await;
         sleep(Duration::from_millis(100)).await;
         assert!(!handle.is_finished());
 
-        send_local(&announcement(InstanceId::generate().unwrap())).await;
+        send_local(to, &announcement(InstanceId::generate().unwrap())).await;
         assert!(handle.await.unwrap().is_ok());
     }
 
     /// Test that only junk and our own packets end in Timeout
     #[tokio::test]
     async fn test_only_junk_times_out() {
-        let _guard = port_lock().lock().await;
         let own = InstanceId::generate().unwrap();
-        let handle = tokio::spawn(async move { udp_find_broadcaster(1, own).await });
-        sleep(Duration::from_millis(100)).await;
+        let (socket, to) = test_socket().await;
+        let handle = tokio::spawn(find_first(socket, 1, own));
 
-        send_local(&announcement(own)).await;
-        send_local(b"garbage").await;
+        send_local(to, &announcement(own)).await;
+        send_local(to, b"garbage").await;
 
         assert_eq!(handle.await.unwrap(), Err(UdpNetworkerErrors::Timeout));
     }
@@ -594,18 +608,17 @@ mod tests {
     /// can't fill the list) and skips our own announcement and junk
     #[tokio::test]
     async fn test_finds_each_address_once() {
-        let _guard = port_lock().lock().await;
         let own = InstanceId::generate().unwrap();
-        let handle = tokio::spawn(async move { udp_find_broadcasters(1, own).await });
-        sleep(Duration::from_millis(100)).await;
+        let (socket, to) = test_socket().await;
+        let handle = tokio::spawn(find_all(socket, 1, own));
 
         // all from 127.0.0.1: the first real one counts, the flood doesn't
-        send_local(&announcement(own)).await;
-        send_local(b"garbage").await;
+        send_local(to, &announcement(own)).await;
+        send_local(to, b"garbage").await;
         let first = InstanceId([1; 16]);
-        send_local(&announcement(first)).await;
+        send_local(to, &announcement(first)).await;
         for byte in 2..=40u8 {
-            send_local(&announcement(InstanceId([byte; 16]))).await;
+            send_local(to, &announcement(InstanceId([byte; 16]))).await;
         }
 
         let found = handle.await.unwrap().unwrap();
@@ -616,8 +629,8 @@ mod tests {
     /// Test that a search nobody answers ends with an empty list, not an error
     #[tokio::test]
     async fn test_find_all_nobody_answers() {
-        let _guard = port_lock().lock().await;
-        let found = udp_find_broadcasters(1, InstanceId::generate().unwrap()).await;
+        let (socket, _) = test_socket().await;
+        let found = find_all(socket, 1, InstanceId::generate().unwrap()).await;
         assert_eq!(found, Ok(Vec::new()));
     }
 
