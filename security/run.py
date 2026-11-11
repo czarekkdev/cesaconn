@@ -169,6 +169,9 @@ def source_line(path: str, line: int) -> str:
 
 # ---- semgrep ----------------------------------------------------------------
 def check_semgrep() -> ToolResult:
+    """The custom rules in security/semgrep: their fixture self-test first,
+    then a scan of the repo. ERROR rules are critical, others warnings;
+    scan errors (timeouts, parse failures) are coverage gaps."""
     r = ToolResult("semgrep")
     if not have("semgrep"):
         r.status, r.note = "skipped", "semgrep not installed (pip install semgrep / brew install semgrep)"
@@ -178,7 +181,11 @@ def check_semgrep() -> ToolResult:
     if code != 0 or "All tests passed" not in out + err:
         r.findings.append(Finding("semgrep", "rule-self-test", "info",
                                   "Semgrep rule fixtures failed - rules may be broken:\n" + (out + err)[-1500:]))
+    # 30 s per rule and file (default 5): daemon.rs takes ~1.6 s per rule
+    # locally and a slow CI runner went past 5 s once; a rule that still
+    # times out is reported as NOT ANALYSED and blocks, as before
     code, out, err = run(["semgrep", "scan", "--metrics=off", "--disable-version-check", "--json", "-q",
+                          "--timeout", "30",
                           "--config", "security/semgrep",
                           "--exclude", "security", "--exclude", "target", "."], timeout=1200)
     try:
