@@ -169,6 +169,9 @@ def source_line(path: str, line: int) -> str:
 
 # ---- semgrep ----------------------------------------------------------------
 def check_semgrep() -> ToolResult:
+    """The custom rules in security/semgrep: their fixture self-test first,
+    then a scan of the repo. ERROR rules are critical, others warnings;
+    scan errors (timeouts, parse failures) are coverage gaps."""
     r = ToolResult("semgrep")
     if not have("semgrep"):
         r.status, r.note = "skipped", "semgrep not installed (pip install semgrep / brew install semgrep)"
