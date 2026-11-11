@@ -574,7 +574,8 @@ mod tests {
         assert!(handle.await.unwrap().is_ok());
     }
 
-    /// Test that our own announcement and junk are skipped, then a real one found
+    /// Test that our own announcement and junk are skipped, then the real
+    /// sender's address is returned
     #[tokio::test]
     async fn test_skips_own_and_junk() {
         let own = InstanceId::generate().unwrap();
@@ -586,8 +587,12 @@ mod tests {
         sleep(Duration::from_millis(100)).await;
         assert!(!handle.is_finished());
 
-        send_local(to, &announcement(InstanceId::generate().unwrap())).await;
-        assert!(handle.await.unwrap().is_ok());
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .send_to(&announcement(InstanceId::generate().unwrap()), to)
+            .await
+            .unwrap();
+        assert_eq!(handle.await.unwrap(), Ok(sender.local_addr().unwrap()));
     }
 
     /// Test that only junk and our own packets end in Timeout
