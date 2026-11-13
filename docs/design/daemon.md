@@ -364,7 +364,10 @@ with the sleep: one Argon2 attempt per delay.
 
 The failure counter is in RAM, so a daemon restart resets it. That is
 accepted: every attempt still costs a 64 MiB Argon2 run, and a process that
-can restart the daemon runs as the user anyway (3.3).
+can restart the daemon runs as the user anyway (3.3). It isn't listed in
+section 18: only a same-user process can send `Unlock` at all, which is out
+of scope on unsigned builds (3.3) and refused by the signature gate on
+signed ones (7.2), so the reset gives nobody in scope anything.
 
 ### 6.5 Changing a password **[built]**
 
@@ -869,6 +872,11 @@ psk = HKDF-BLAKE2s(ikm = key1 || x25519_ss || mlkem_ss || transcript_hash)
   enough.
 - The transcript hash makes any change to a pre-Noise message (a swapped key,
   a stripped confirm byte) a PSK mismatch, caught when Noise message 3 fails.
+- The transcript is used only here and wiped right after the PSK is
+  derived; nothing after Noise is added to it. The signatures (10.6) and
+  the pairing code (10.7) bind to the Noise handshake hash, which covers the
+  PSK and with it this transcript. (Earlier builds also appended the
+  signatures after Noise, where nothing read them; that was removed.)
 
 ### 10.5 Phase 4: Noise **[built]**
 
@@ -1393,7 +1401,7 @@ mistake of setting the passwords on every device, which makes one group per
 device. No answer (no window there, rate limited, an older build) changes
 nothing: the id rule decides as before. The answer is unauthenticated, so a
 forged one can at most make this device skip a real member (a DoS like a
-forged announcement, 18.11), never pair with the wrong one.
+forged announcement, 18.9), never pair with the wrong one.
 
 The window ends after 2 min (later only while its own connections finish),
 when the user stops it (`StopAddDevice`, `x` in the TUI), or with
@@ -1730,53 +1738,57 @@ Stated plainly so nobody relies on a property that isn't there.
    ciphertexts with a known handshake hash, so it can test `pw2` guesses
    offline. The `d_key` layer stops reading, not guessing, by such a peer;
    a weak pw2 is the risk.
-4. **Unsigned builds**: any process of the same user can drive the daemon
-   (set passwords, toggle automatic login). Closed only by signed macOS
-   releases.
+4. **Unsigned builds, and Linux**: any process of the same user can drive
+   the daemon (set passwords, toggle automatic login, reset, pair). On macOS
+   this is closed only by signed releases (7.2). Linux has no code-signature
+   check, only the uid gate, so there it stays open, with no fix planned.
 5. **Wiping inside dependencies**: `spake2` and libcrux ML-KEM / ML-DSA don't
    wipe all of their own secret state (upstream RustCrypto/PAKEs#307,
    celabshq/libcrux#1332, #1370, #1387); the ML-DSA seed is passed by value
    to libcrux (one unwiped stack copy); the Security framework's `CFData`
-   copy of keychain values can't be wiped.
+   copy of keychain values can't be wiped. `snow` 0.10 wipes none of its
+   state: the device's static X25519 private key (copied in by
+   `local_private_key`), the PSK, the ephemeral and chaining keys and the
+   Noise transport keys are freed without being wiped.
 6. **Protocol fingerprint**: pre-Noise traffic has fixed sizes and tags, so a
    network observer can tell that a CesaConn handshake is happening (not
    who, and nothing secret).
-7. **Unlock counter and delay reset on restart** (6.4).
-8. **Display names** are socket addresses for now, so the pairing prompt can
+7. **Display names** are socket addresses for now, so the pairing prompt can
    only show where the request comes from, not which device it claims to be.
    The code comparison is what proves it is the right device.
-9. **The pre-Noise transcript binds only the PSK.** It collects every
-   plaintext message before Noise and is wiped right after the PSK is
-   derived; the signatures and the pairing code bind to the Noise handshake
-   hash instead, which covers the PSK. (Earlier builds also appended the
-   signatures to it after Noise, where nothing read them; that was removed.)
-10. **Unsigned builds and pairing**: like every other command (4.), any
+8. **Unsigned builds and pairing**: like every other command (4.), any
     process of the same user can answer a pairing prompt over IPC, and so
-    pair a device that knows pw1 during an "Add device" window. Closed only
-    by signed macOS releases.
-11. **Discovery is a hint** (9.1): during an "Add device" window, a LAN
-    attacker can make the daemon try up to 16 connections to addresses of
-    its choice on port 3232 (16 different source addresses needed). Each
-    costs it one handshake attempt and fails without pw1. Such an attacker
-    can also jam "Add device" (forged announcements with the real devices'
-    addresses and low ids, so neither side connects); that is a denial of
-    service, never a wrong pairing. A forged salt answer can likewise make
+    pair a device that knows pw1 during an "Add device" window. On macOS
+    closed only by signed releases; on Linux open (4.).
+9. **Discovery is a hint** (9.1): during an "Add device" window, anyone on
+    the LAN can make the daemon connect to up to 16 addresses of its choice
+    (per window), on ports 3233 (salt query) and 3232. UDP source addresses
+    are forged freely, so one machine is enough, and the addresses aren't
+    checked to be on the LAN: any host the machine can route to. An address
+    that doesn't answer the salt query is still connected to on 3232 if its
+    announced id is higher. Every such connection fails without pw1; one the
+    attacker answers itself costs it a handshake attempt, counted by the
+    guess limiter on both sides. Such an attacker can also jam "Add device":
+    forged announcements with the real devices' addresses and low ids (so
+    neither side connects), or 16 forged addresses early in the window,
+    which fill its list so devices found later aren't checked in that
+    window. That is a denial of service, never a wrong pairing. A forged salt answer can likewise make
     a member skip a real member as "another group" (13). The same goes for a join: forged
     announcements or a rogue salt service can make a join fail (each fake
     salt costs the joiner one Argon2 run, at most 5 per join), never join
     the wrong group.
-12. **The group salt is readable during an invite window** (11.4): anyone on
+10. **The group salt is readable during an invite window** (11.4): anyone on
     the LAN can query `a_salt` for those 2 min. It is public by design and
     gives no offline test of pw1, but it is a stable group identifier.
-13. **No password rotation yet** (14): changing a password on one member
+11. **No password rotation yet** (14): changing a password on one member
     changes its key but not the others', so that device stops pairing with
     the group until the others change too. Both sides show it as
     "incorrect password" (13.1), so it is no longer silent.
-14. **Forgetting is not revoking** (14.1): a forgotten device still knows the
+12. **Forgetting is not revoking** (14.1): a forgotten device still knows the
     group passwords and can ask to pair again in any "Add device" window; only
     the user's `n` keeps it out. A reset (14.2) only wipes this device: the
     others keep trusting it until they forget it.
-15. **"Incorrect password" is tied to a device by address** (13.1), because
+13. **"Incorrect password" is tied to a device by address** (13.1), because
     SPAKE2 fails before anyone is identified. So it is a hint, not a proof:
     someone on the LAN who connects from a paired device's last address
     (that device is off, or shares the address) can make it show
@@ -1784,29 +1796,29 @@ Stated plainly so nobody relies on a property that isn't there.
     old address now used by a device of *another* group shows the same
     after we connect there, and pauses sync to it for 5 min; "Add device"
     or the device connecting to us puts the right address back.
-16. **Addresses are hints and can go stale**: if both devices get new
+14. **Addresses are hints and can go stale**: if both devices get new
     addresses while one is off, neither finds the other until "Add device"
     runs on both (or one connects to the other's new address). Devices
     paired before this version start without addresses (the same applies).
     IPv6 link-local addresses lose their scope id and don't work as saved
     addresses.
-17. **Every paired device gets the clipboard** (12.1): no per-device choice
+15. **Every paired device gets the clipboard** (12.1): no per-device choice
     yet. A device paired by mistake (the user accepted the code) gets every
     copied text while the switch is on.
-18. **The hello sends `d_key`-layer data to every paired device** at start
+16. **The hello sends `d_key`-layer data to every paired device** at start
     and after every key change, and its answer says whether a `d_key` layer
     opened. Both only matter for a paired device that also has `d_salt`
     (18.3): it could test `pw2` guesses offline against the hello, or one
     per connection online through the answer. That is the same exposure as
     18.3 (any `d_key` data it receives allows the offline test), now without
     the user sending anything.
-19. **The OS clipboard isn't private**: other apps of the user can read what
+17. **The OS clipboard isn't private**: other apps of the user can read what
     is synced to it (3.3), and the OS keeps copies we can't wipe (12.5).
     Apple announced alerts for apps that read the pasteboard without a
     paste action (macOS pasteboard privacy, preview since 15.4): if it
     becomes the default, the daemon will need the user's "always allow",
     or sending stops working. Receiving (writing) is not affected.
-20. **A typed address is a hint** (13.2): whoever answers there can make
+18. **A typed address is a hint** (13.2): whoever answers there can make
     the window ask the user about a device (only after a full handshake
     with the group's passwords, so only a device that knows them) or say
     "another group" (a forged salt answer, like a forged announcement).
@@ -1849,6 +1861,9 @@ Decided:
   password" when the devices connect (6.5, 13.1), instead of a warning or
   refusal before the change.
 - (2026-10-31) Clipboard sync is the first sync feature (12).
+- (2026-11-13) Section 18 lists only real weaknesses: the unlock counter
+  reset moved to 6.4 and the transcript note to 10.4 (neither is a
+  weakness); the items after them were renumbered.
 
 Proposed in the connect-by-address PR, for his review:
 - `a` on Devices for a typed IP address, as two new requests (IPC 9)
