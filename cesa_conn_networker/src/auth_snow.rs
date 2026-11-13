@@ -1655,7 +1655,7 @@ async fn handshake_server(
     let stream = &mut incoming_connection.stream;
     // every message exchanged before Noise is appended here so the
     // derived PSK is bound to the whole pre-handshake conversation;
-    // the signature exchange after Noise is appended too
+    // nothing after Noise is added (see the drop below)
     let mut transcript = Zeroizing::new(Vec::new());
 
     // 1. SPAKE2
