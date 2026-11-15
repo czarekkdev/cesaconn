@@ -639,7 +639,8 @@ pub async fn recv(
                 },
                 result = recv_handler(incoming_connection, context_clone) => {
                     match result {
-                        // TODO: hand the packet to the action handler (see TODO at the top)
+                        // TODO: hand data packets to an action handler (FOLDER SYNC, TODO NOW in
+                        // cesa_conn_networker.rs); hello, clipboard and group salt are answered in recv_handler
                         Ok(Some(packet)) => debug!(
                             %peer_addr,
                             peer = %packet.peer.name(),
