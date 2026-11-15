@@ -241,7 +241,6 @@ dependencies = [
  "libcrux-ml-dsa",
  "libcrux-ml-kem",
  "nix 0.31.3",
- "rand 0.10.3",
  "snow",
  "spake2",
  "subtle",
