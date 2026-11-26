@@ -13,8 +13,8 @@ flowchart LR
             net["networking<br/>listener 3232, salt query 3233,<br/>discovery 3636"]
             clip["clipboard task"]
         end
-        os_kc[("OS keychain<br/>d_salt, storage salt,<br/>d_key (auto-login)")]
-        vault[("vault.bin<br/>a_key, a_salt, identity,<br/>peers, config")]
+        os_kc[("OS keychain<br/>d_key (auto-login only)")]
+        vault[("vault.bin<br/>header: mode, 3 salts;<br/>encrypted: a_key (Standard),<br/>identity, peers, config")]
         pb[["OS clipboard<br/>(NSPasteboard)"]]
     end
     peer["paired device<br/>(same daemon)"]

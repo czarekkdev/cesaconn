@@ -19,8 +19,8 @@ flowchart TB
 
 ## Reset (Settings > Reset this device, type `RESET`)
 
-Works while locked and asks for no password (a forgotten pw2 or lost
-keychain salts are the reason to use it).
+Works while locked and asks for no password (a forgotten password or a
+vault of an older version are the reason to use it).
 
 ```mermaid
 flowchart TB
@@ -28,9 +28,9 @@ flowchart TB
     s1 --> s2{"2. delete vault.bin<br/>(the decisive step)"}
     s2 -- failed --> keep["StorageFailed: keys, vault and peers unchanged;<br/>the join and the window stay cancelled;<br/>networking starts again if the saved state says so"]
     s2 -- deleted --> s3["3. drop the key slots (zeroized),<br/>replace the trusted-peer list with a new one,<br/>clear prompts"]
-    s3 --> s4{"4. delete keychain<br/>salts + data-key"}
+    s3 --> s4{"4. delete the keychain<br/>data-key (auto-login;<br/>nothing without a keychain)"}
     s4 -- ok --> fresh["Fresh: n joins a group again"]
-    s4 -- failed --> fresh2["Fresh anyway (no vault = keychain ignored),<br/>StorageFailed: a second reset removes them"]
+    s4 -- failed --> fresh2["Fresh anyway (no vault = keychain ignored),<br/>StorageFailed: a second reset removes it"]
 ```
 
 ```mermaid

@@ -31,5 +31,6 @@ flowchart LR
     st --> peers["ListPeers<br/>(name, fingerprint, state)"]
     st -- "pending_pairings > 0" --> pp["PendingPairing<br/>(id, code, name)"]
     pp --> ans["AnswerPairing(id, code, y/n)"]
-    st -- "locked, no wait" --> unlock["Unlock prompt<br/>(once per locked spell)"]
+    st -- "locked, no wait" --> unlock["Unlock prompt, once per locked spell:<br/>data password (Standard) or<br/>auth then data password (Enhanced)"]
+    st -- "locked, vault outdated" --> outdated["notice: reset this device,<br/>then join again (no password field)"]
 ```

@@ -71,12 +71,17 @@ CesaConn is designed with privacy as a core principle, not an afterthought:
 
 ## Status / try it
 
-CesaConn is in development. What works today (macOS; Linux and Windows
-don't keep keys or read the clipboard yet, see `docs/design/daemon.md`):
+CesaConn is in development. What works today (macOS; Linux keeps its keys
+too but has no clipboard sync or automatic login yet, Windows isn't
+supported yet, see `docs/design/daemon.md`):
 
-- the daemon keeps both keys in an encrypted vault: after a restart the UI
-  asks for the data password right away (or turn on the optional automatic
-  login through the OS keychain);
+- the daemon keeps both keys in an encrypted vault file that doesn't depend
+  on the OS: after a restart the UI asks for the data password right away
+  (or turn on the optional automatic login through the OS keychain, macOS);
+- **Enhanced security** (recommended, off by default): Settings > Enhanced
+  security. Both passwords at every start, and the auth key is never saved,
+  so someone who learns your data password still can't add a device to
+  your group. It can't be on together with automatic login;
 - two of your devices find each other on the local network, authenticate
   (SPAKE2 + post-quantum hybrid key exchange + Noise) and pair once after
   you compare an 8-emoji code on both screens;
@@ -125,14 +130,19 @@ ready. TCP ports 3232 and 3233 must be reachable between them.
 Changing a password: set the same new password on every device. Until you
 have, the devices that still use the old one show "incorrect password".
 
+Updating from a version before the vault kept its own salts: the old saved
+keys can't be opened (the TUI says so). Reset the device (below) and join
+your group again; on macOS also remove the old keychain item once:
+`security delete-generic-password -s dev.czarekk.cesaconn -a salts`.
+
 Managing devices:
 
 - **Forget a device:** Devices, select it, `d`, then `y`. It can no longer
   connect to this device, but it still knows the group passwords: it can
   ask to pair again during Add device (press `n` on the prompt to refuse).
 - **Reset this device:** Settings > Reset this device, type `RESET`. Deletes
-  both keys, the encrypted vault, the keychain items and every paired device
-  on this device only; it also works when you forgot the data password.
+  both keys, the encrypted vault, the automatic-login key and every paired
+  device on this device only; it also works when you forgot a password.
   Forget it on the other devices too.
 
 Allow incoming connections when macOS asks (UDP 3636, TCP 3232 and 3233).
