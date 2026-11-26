@@ -53,6 +53,18 @@ pub(super) fn handle_input(app: &mut App) -> io::Result<()> {
             handle_unlock_input(app, key.code);
             return Ok(());
         }
+        ActivePopup::UnlockBoth(step) => {
+            handle_unlock_both_input(app, key.code, step);
+            return Ok(());
+        }
+        ActivePopup::ConfirmEnhanced(on) => {
+            handle_confirm_enhanced_input(app, key.code, on);
+            return Ok(());
+        }
+        ActivePopup::VaultOutdated => {
+            handle_vault_outdated_input(app, key.code);
+            return Ok(());
+        }
         ActivePopup::DeviceAddress => {
             handle_address_input(app, key.code);
             return Ok(());
@@ -102,7 +114,8 @@ pub(super) fn handle_input(app: &mut App) -> io::Result<()> {
 }
 
 /// Enter on Settings: Reset asks for `RESET`, a switch goes to the daemon
-/// (automatic login warns first), a password field opens its popup.
+/// (automatic login warns first, Enhanced security says what it means), a
+/// password field opens its popup (or the unlock prompt while locked).
 pub(super) fn handle_settings_enter(app: &mut App) {
     let idx = app.settings_selected;
 
@@ -110,6 +123,30 @@ pub(super) fn handle_settings_enter(app: &mut App) {
         clear_input(app);
         app.active_popup = ActivePopup::ConfirmReset;
         return;
+    }
+
+    let kind = app.active_settings().get(idx).map(|s| s.kind.clone());
+    match kind {
+        Some(SettingKind::Recommended(on)) => {
+            app.active_popup = ActivePopup::ConfirmEnhanced(!on);
+            return;
+        }
+        Some(SettingKind::ExcludedByEnhanced) => {
+            app.push_log(
+                "[ WARN] Automatic login can't be on with Enhanced security: turn Enhanced security off first",
+            );
+            return;
+        }
+        Some(SettingKind::Outdated) => {
+            app.active_popup = ActivePopup::VaultOutdated;
+            return;
+        }
+        Some(SettingKind::Locked) if is_enhanced(app) && unlock_wait(app) == 0 => {
+            // both passwords open it: the two-step prompt, not one field
+            open_unlock_both(app);
+            return;
+        }
+        _ => {}
     }
 
     let (is_bool, currently_on, has_warning) = app
@@ -149,7 +186,11 @@ pub(super) fn handle_settings_enter(app: &mut App) {
         app.active_settings().get(idx).map(|s| &s.kind),
         Some(SettingKind::Unavailable)
     ) {
-        app.push_log("[ WARN] Clipboard sync isn't supported on this platform yet");
+        app.push_log(if is_auto_login(app, idx) {
+            "[ WARN] Automatic login needs an OS keychain, and this platform has no backend yet"
+        } else {
+            "[ WARN] Clipboard sync isn't supported on this platform yet"
+        });
     } else if matches!(
         app.active_settings().get(idx).map(|s| &s.kind),
         Some(SettingKind::Locked)
@@ -183,7 +224,7 @@ pub(super) fn unlock_wait(app: &App) -> u16 {
 pub(super) fn log_unlock_wait(app: &mut App) {
     let secs = unlock_wait(app);
     app.push_log(format!(
-        "[ WARN] Too many wrong data passwords: try again in {secs} s"
+        "[ WARN] Too many wrong passwords: try again in {secs} s"
     ));
 }
 
@@ -203,22 +244,152 @@ pub(super) fn handle_confirm_change_input(app: &mut App, code: KeyCode) {
 
 /// Opens the unlock prompt when the daemon is locked and would take a
 /// password now, once per locked spell and never over another popup (it
-/// waits for the next refresh); closes it when the vault got unlocked some
-/// other way (automatic login, another UI).
+/// waits for the next refresh): one password, or both with Enhanced
+/// security; for an outdated vault it says why nothing can be typed.
+/// Closes it when the vault got unlocked some other way (automatic login,
+/// another UI).
 pub(super) fn ask_unlock(app: &mut App, status: &Status) {
+    let unlock_open = matches!(
+        app.active_popup,
+        ActivePopup::Unlock | ActivePopup::UnlockBoth(_)
+    );
+
     if !status.locked {
         app.unlock_asked = false;
-        if app.active_popup == ActivePopup::Unlock {
+        app.unlock_error = None;
+        if unlock_open {
             clear_input(app);
+            app.join_auth.zeroize();
+            app.active_popup = ActivePopup::None;
+        }
+        if app.active_popup == ActivePopup::VaultOutdated {
             app.active_popup = ActivePopup::None;
         }
         return;
     }
 
-    if status.unlock_wait_secs == 0 && !app.unlock_asked && app.active_popup == ActivePopup::None {
-        clear_input(app);
-        app.active_popup = ActivePopup::Unlock;
+    if app.unlock_asked || app.active_popup != ActivePopup::None {
+        return;
+    }
+    if status.vault_outdated {
+        app.active_popup = ActivePopup::VaultOutdated;
         app.unlock_asked = true;
+    } else if status.unlock_wait_secs == 0 {
+        if status.enhanced {
+            open_unlock_both(app);
+        } else {
+            clear_input(app);
+            app.active_popup = ActivePopup::Unlock;
+        }
+        app.unlock_asked = true;
+    }
+}
+
+/// Enter / Esc close the "older version" notice; nothing can be typed.
+pub(super) fn handle_vault_outdated_input(app: &mut App, code: KeyCode) {
+    if matches!(code, KeyCode::Enter | KeyCode::Esc) {
+        app.active_popup = ActivePopup::None;
+    }
+}
+
+/// The saved vault is in Enhanced mode (both passwords unlock it).
+pub(super) fn is_enhanced(app: &App) -> bool {
+    matches!(&app.daemon, DaemonState::Up(status) if status.enhanced)
+}
+
+/// Opens the two-step unlock prompt with nothing typed.
+pub(super) fn open_unlock_both(app: &mut App) {
+    clear_input(app);
+    app.join_auth.zeroize();
+    app.active_popup = ActivePopup::UnlockBoth(JoinStep::Auth);
+}
+
+/// The Enhanced unlock prompt: the auth password, Enter, the data
+/// password, Enter sends both exactly as typed; Esc leaves it for later
+/// and wipes both.
+pub(super) fn handle_unlock_both_input(app: &mut App, code: KeyCode, step: JoinStep) {
+    match code {
+        KeyCode::Esc => {
+            clear_input(app);
+            app.join_auth.zeroize();
+            app.active_popup = ActivePopup::None;
+            app.push_log("[ INFO] Unlock later: Settings > Data key");
+        }
+        KeyCode::Enter if app.input_buf.is_empty() => {}
+        KeyCode::Enter => match step {
+            JoinStep::Auth => {
+                // the buffer is pre-sized: this copy never reallocates
+                app.join_auth.zeroize();
+                app.join_auth.extend_from_slice(app.input_buf.as_bytes());
+                clear_input(app);
+                app.active_popup = ActivePopup::UnlockBoth(JoinStep::Data);
+            }
+            JoinStep::Data => {
+                app.outbox.push(Command::UnlockBoth(JoinPasswords {
+                    auth: PasswordUpdate {
+                        password: Zeroizing::new(app.join_auth.to_vec()),
+                    },
+                    data: PasswordUpdate {
+                        password: Zeroizing::new(app.input_buf.as_bytes().to_vec()),
+                    },
+                }));
+                app.join_auth.zeroize();
+                clear_input(app);
+                app.active_popup = ActivePopup::None;
+                app.push_log(
+                    "[ INFO] Unlocking the saved keys with both passwords (takes a moment)",
+                );
+            }
+        },
+        KeyCode::Backspace => {
+            app.input_buf.pop();
+        }
+        KeyCode::Char(c) => push_input(app, c),
+        _ => {}
+    }
+}
+
+/// Whether automatic login is on (the daemon says so).
+pub(super) fn auto_login_on(app: &App) -> bool {
+    matches!(&app.daemon, DaemonState::Up(status) if status.auto_login)
+}
+
+/// Why the daemon would refuse to change Enhanced security right now
+/// (shown in the popup, where the user is looking), if it would.
+pub(super) fn enhanced_blocker(app: &App) -> Option<&'static str> {
+    match &app.daemon {
+        DaemonState::Up(status) if status.locked => Some("Unlock the saved keys first."),
+        DaemonState::Up(status) if !status.saved => {
+            Some("Set both passwords first: nothing is saved yet.")
+        }
+        DaemonState::Up(_) => None,
+        _ => Some("The daemon isn't reachable."),
+    }
+}
+
+/// y: turn Enhanced security on (automatic login off first, the two
+/// can't both be on) or off, unless the daemon would refuse (the popup
+/// says why and stays open); anything that cancels: nothing changes.
+pub(super) fn handle_confirm_enhanced_input(app: &mut App, code: KeyCode, on: bool) {
+    match code {
+        KeyCode::Char('y') | KeyCode::Char('Y') if enhanced_blocker(app).is_some() => {}
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            if on && auto_login_on(app) {
+                // sent in order by the one link worker
+                app.outbox.push(Command::SetAutoLogin(false));
+            }
+            app.outbox.push(Command::SetEnhanced(on));
+            app.push_log(if on {
+                "[ INFO] Turning Enhanced security on"
+            } else {
+                "[ WARN] Turning Enhanced security off: the auth key goes back into the vault"
+            });
+            app.active_popup = ActivePopup::None;
+        }
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+            app.active_popup = ActivePopup::None;
+        }
+        _ => {}
     }
 }
 

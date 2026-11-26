@@ -1,6 +1,6 @@
 /*
 TODO:
-Linux keychain backend (Secret Service): until then Linux keeps the keys in RAM only
+Linux keychain backend (Secret Service): until then Linux has no automatic login (the vault works)
 data-protection keychain (WhenUnlockedThisDeviceOnly) together with release signing
  */
 
@@ -11,12 +11,15 @@ data-protection keychain (WhenUnlockedThisDeviceOnly) together with release sign
 //! The salts are the daemon's too: generated here, kept in zeroizing memory,
 //! never sent to the UI.
 //!
-//! Saved state (see `vault`): nothing is stored unencrypted.
-//! * `a_key`, `a_salt`, config: the encrypted vault file
-//! * `d_salt` + storage salt: the OS keychain
+//! Saved state (see `vault`): nothing secret is stored unencrypted, and
+//! the vault doesn't depend on the OS.
+//! * the three salts and the unlock mode: the vault file's header (public)
+//! * `a_key` (Standard mode only), identity, peers, config: the encrypted
+//!   vault file
 //! * `d_key`: RAM only; after a restart the vault is **locked** until the user
-//!   enters the data password. With automatic login, `d_key` is also kept in
-//!   the OS keychain and the daemon unlocks itself.
+//!   enters the data password (Enhanced mode: both passwords, and `a_key`
+//!   is RAM only too). With automatic login (Standard mode only), `d_key`
+//!   is also kept in the OS keychain and the daemon unlocks itself.
 //!
 //! Networking (off by default): with the Sync switch on and the vault open,
 //! the daemon listens for paired devices. New devices are only paired from
@@ -51,7 +54,7 @@ use cesa_conn_system::{
         DaemonError, FINGERPRINT_LEN, JoinPasswords, MAX_LISTED_PEERS, MIN_NEW_PASSWORD_LEN,
         PairingPrompt, PasswordUpdate, PeerInfo, PeerState, Request, Response, Status, socket_path,
     },
-    keychain::{Item, OsKeychain, SecretStore},
+    keychain::{Item, KeychainErrors, OsKeychain, SecretStore},
     pairing_code::PairingCode,
 };
 
@@ -74,7 +77,7 @@ use crate::{
         InstanceId, MAX_BROADCAST_DURATION, is_own_address, udp_broadcast_presence,
         udp_find_broadcasters,
     },
-    vault::{self, Salts, VaultContents, VaultErrors, WrappedDek},
+    vault::{self, Header, Mode, VaultContents, VaultErrors, WrappedDek},
 };
 
 // the daemon's parts, one job each; all of them extend `Daemon`
@@ -89,7 +92,7 @@ type Salt = Zeroizing<[u8; 32]>;
 
 /// Where the daemon saves its state. Without it the keys stay in RAM only.
 pub struct Storage {
-    /// The OS keychain (salts, and `d_key` with automatic login).
+    /// The OS keychain: only `d_key`, only with automatic login.
     pub store: Arc<dyn SecretStore>,
     /// The encrypted vault file.
     pub path: PathBuf,
@@ -293,7 +296,8 @@ struct Joined {
 struct OpenVault {
     dek: Zeroizing<[u8; 32]>,
     wrapped: WrappedDek,
-    storage_salt: Salt,
+    /// The file's header: the unlock mode and the salts.
+    header: Header,
     config: Config,
     /// This device's identity seed: made with the vault, kept for good.
     identity: Zeroizing<[u8; IDENTITY_SEED_LEN]>,
@@ -310,6 +314,13 @@ struct KeySlots {
     vault: Option<OpenVault>,
     /// A saved vault exists but isn't open yet.
     locked: bool,
+    /// While locked: the saved vault is in Enhanced mode (from its header),
+    /// so it opens only with both passwords. Once open, the mode is the
+    /// open vault's header's.
+    locked_enhanced: bool,
+    /// The saved vault is of an older version: it can't be opened, only
+    /// reset (stays locked).
+    outdated: bool,
     /// `d_key` is in the OS keychain.
     auto_login: bool,
     /// Wrong unlock passwords since the last success (see [`unlock_delay`]).
@@ -576,7 +587,9 @@ impl Daemon {
             Request::SetAuthPassword(update) => self.set_password(KeyKind::Auth, update).await,
             Request::SetDataPassword(update) => self.set_password(KeyKind::Data, update).await,
             Request::Unlock(update) => self.unlock(update).await,
+            Request::UnlockBoth(passwords) => self.unlock_both(passwords).await,
             Request::SetAutoLogin(on) => self.set_auto_login(on).await,
+            Request::SetEnhanced(on) => self.set_enhanced(on).await,
             Request::SetSync(on) => self.set_sync(on).await,
             Request::SetClipboard(on) => self.set_clipboard(on).await,
             Request::ForgetPeer(fingerprint) => self.forget_peer(&fingerprint).await,
@@ -599,8 +612,9 @@ impl Daemon {
         result
     }
 
-    /// Looks for a saved vault: if there is one the daemon starts locked, and
-    /// with automatic login it unlocks itself from the keychain (and starts
+    /// Looks for a saved vault: if there is one the daemon starts locked
+    /// (its header says which passwords open it), and with automatic login
+    /// (Standard mode only) it unlocks itself from the keychain (and starts
     /// networking if Sync is on).
     pub async fn start(self: &Arc<Self>) {
         let Some(storage) = &self.storage else {
@@ -609,32 +623,74 @@ impl Daemon {
         };
 
         let path = storage.path.clone();
-        match blocking(move || vault::read_file(&path)).await {
-            Ok(Ok(Some(_))) => {}
+        let header = match blocking(move || vault::read_file(&path)).await {
+            Ok(Ok(Some(file))) => vault::read_header(&file),
             Ok(Ok(None)) => {
                 info!("no saved vault yet");
                 return;
             }
-            Ok(Err(e)) => {
-                // stays locked: unlocking will report the same problem
-                error!(error = %e, "the saved vault can't be read");
-            }
-            Err(_) => error!("reading the saved vault failed"),
-        }
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(VaultErrors::Io),
+        };
 
-        self.keys.write().await.locked = true;
-        info!("saved vault found: locked until the data password is entered");
+        let enhanced = {
+            let mut keys = self.keys.write().await;
+            keys.locked = true;
+            match &header {
+                Ok(header) => keys.locked_enhanced = header.mode == Mode::Enhanced,
+                Err(VaultErrors::Outdated) => keys.outdated = true,
+                Err(_) => {}
+            }
+            keys.locked_enhanced
+        };
+
+        match header {
+            Ok(_) if enhanced => {
+                info!(
+                    "saved vault found (Enhanced security): locked until both passwords are entered"
+                );
+            }
+            Ok(_) => info!("saved vault found: locked until the data password is entered"),
+            Err(VaultErrors::Outdated) => {
+                error!(
+                    "the saved vault is from an older version (salts in the keychain): reset this device and join the group again"
+                );
+                return;
+            }
+            // stays locked: unlocking will report the same problem
+            Err(e) => error!(error = %e, "the saved vault can't be read"),
+        }
 
         let store = storage.store.clone();
         let d_key = match blocking(move || store.get(Item::DataKey)).await {
             Ok(Ok(Some(d_key))) => d_key,
             Ok(Ok(None)) => return,
+            Ok(Err(KeychainErrors::Unsupported)) => return,
             Ok(Err(e)) => {
                 warn!(error = %e, "keychain unavailable: no automatic login");
                 return;
             }
             Err(_) => return,
         };
+
+        if enhanced {
+            // Enhanced mode keeps no key anywhere: a leftover is removed
+            drop(d_key);
+            let store = storage.store.clone();
+            let removed = blocking(move || store.delete(Item::DataKey)).await;
+            if matches!(removed, Ok(Ok(()))) {
+                warn!(
+                    "a leftover automatic-login key was found with Enhanced security on: removed"
+                );
+            } else {
+                // shown as on, so the user can turn it off (or reset)
+                self.keys.write().await.auto_login = true;
+                error!(
+                    "a leftover automatic-login key was found with Enhanced security on, and removing it failed"
+                );
+            }
+            return;
+        }
 
         self.keys.write().await.auto_login = true;
 
@@ -647,7 +703,7 @@ impl Daemon {
         key.copy_from_slice(&d_key);
         drop(d_key);
 
-        match self.unlock_with(DataKey::new(key)).await {
+        match self.unlock_with(DataKey::new(key), None).await {
             Ok(()) => {
                 info!("vault unlocked by automatic login");
                 self.apply_network().await;
@@ -684,6 +740,12 @@ impl Daemon {
                     .as_ref()
                     .is_some_and(|open| open.config.clipboard),
                 clipboard_unavailable: self.clipboard.is_none(),
+                enhanced: match &keys.vault {
+                    Some(open) => open.header.mode == Mode::Enhanced,
+                    None => keys.locked && keys.locked_enhanced,
+                },
+                vault_outdated: keys.locked && keys.outdated,
+                keychain_unavailable: !self.storage.as_ref().is_some_and(|s| s.store.supported()),
                 ..Status::default()
             }
         };
@@ -811,18 +873,18 @@ impl Daemon {
     }
 }
 
-/// The storage this platform supports: the vault in the private data
-/// directory plus the OS keychain. `None` (RAM only) where there is no
-/// keychain backend yet.
+/// The storage: the vault in the private data directory, on every
+/// platform (it needs nothing from the OS), plus the OS keychain for
+/// automatic login where there is a backend (macOS for now).
 fn platform_storage() -> Option<Storage> {
-    if !cfg!(target_os = "macos") {
-        warn!("no OS keychain backend on this platform yet: keys stay in RAM only");
-        return None;
+    let store = OsKeychain;
+    if !store.supported() {
+        info!("no OS keychain backend on this platform yet: no automatic login");
     }
 
     match vault::data_dir() {
         Ok(dir) => Some(Storage {
-            store: Arc::new(OsKeychain),
+            store: Arc::new(store),
             path: vault::vault_path(&dir),
         }),
         Err(e) => {
@@ -929,6 +991,10 @@ mod tests {
     struct MemStore {
         items: Mutex<HashMap<Item, Zeroizing<Vec<u8>>>>,
         fail: AtomicBool,
+        /// Acts like a platform without a keychain backend (Linux today).
+        unsupported: AtomicBool,
+        /// Only deleting fails (a keychain that reads but refuses changes).
+        fail_delete: AtomicBool,
     }
 
     impl MemStore {
@@ -937,17 +1003,34 @@ mod tests {
         }
     }
 
+    impl MemStore {
+        /// The error every call gets right now, if any.
+        fn refusal(&self) -> Option<KeychainErrors> {
+            if self.unsupported.load(Ordering::SeqCst) {
+                Some(KeychainErrors::Unsupported)
+            } else if self.fail.load(Ordering::SeqCst) {
+                Some(KeychainErrors::Failed)
+            } else {
+                None
+            }
+        }
+    }
+
     impl SecretStore for MemStore {
+        fn supported(&self) -> bool {
+            !self.unsupported.load(Ordering::SeqCst)
+        }
+
         fn get(&self, item: Item) -> Result<Option<Zeroizing<Vec<u8>>>, KeychainErrors> {
-            if self.fail.load(Ordering::SeqCst) {
-                return Err(KeychainErrors::Failed);
+            if let Some(e) = self.refusal() {
+                return Err(e);
             }
             Ok(self.items.blocking_lock().get(&item).cloned())
         }
 
         fn set(&self, item: Item, secret: &[u8]) -> Result<(), KeychainErrors> {
-            if self.fail.load(Ordering::SeqCst) {
-                return Err(KeychainErrors::Failed);
+            if let Some(e) = self.refusal() {
+                return Err(e);
             }
             self.items
                 .blocking_lock()
@@ -956,7 +1039,10 @@ mod tests {
         }
 
         fn delete(&self, item: Item) -> Result<(), KeychainErrors> {
-            if self.fail.load(Ordering::SeqCst) {
+            if let Some(e) = self.refusal() {
+                return Err(e);
+            }
+            if self.fail_delete.load(Ordering::SeqCst) {
                 return Err(KeychainErrors::Failed);
             }
             self.items.blocking_lock().remove(&item);
@@ -1029,6 +1115,9 @@ mod tests {
                     0x0E => DaemonError::UnknownPeer,
                     0x0F => DaemonError::ClipboardUnavailable,
                     0x10 => DaemonError::OwnAddress,
+                    0x11 => DaemonError::NeedsBothPasswords,
+                    0x12 => DaemonError::AutoLoginConflict,
+                    0x13 => DaemonError::VaultOutdated,
                     _ => DaemonError::Internal,
                 }),
                 _ => panic!("unexpected response"),
@@ -1061,6 +1150,8 @@ mod tests {
             Daemon::default().status().await,
             Status {
                 clipboard_unavailable: true,
+                // RAM only: no keychain either
+                keychain_unavailable: true,
                 ..Status::default()
             }
         );
@@ -1165,6 +1256,8 @@ mod tests {
             daemon.status().await,
             Status {
                 clipboard_unavailable: true,
+                // RAM only: no keychain either
+                keychain_unavailable: true,
                 ..Status::default()
             }
         );
@@ -1219,8 +1312,9 @@ mod tests {
         );
     }
 
-    /// Test that nothing secret is on disk in plaintext, and the keychain
-    /// holds only the salts (no d_key without automatic login)
+    /// Test that nothing secret is on disk in plaintext and the keychain
+    /// holds nothing (no d_key without automatic login): the vault keeps its
+    /// salts in its own header, in the documented place
     #[tokio::test]
     async fn test_nothing_plaintext_on_disk() {
         let storage = TestStorage::new("plain");
@@ -1234,17 +1328,21 @@ mod tests {
         };
         let file = std::fs::read(storage.path()).unwrap();
 
-        for secret in [a_key, d_key, a_salt, d_salt] {
+        for secret in [a_key, d_key] {
             assert!(!file.windows(32).any(|w| w == secret));
         }
         for password in [AUTH_PW, DATA_PW] {
             assert!(!file.windows(password.len()).any(|w| w == password));
         }
 
-        assert!(storage.store.has(Item::Salts).await);
-        assert!(!storage.store.has(Item::DataKey).await);
-        let items = storage.store.items.lock().await;
-        assert_eq!(items.get(&Item::Salts).unwrap().get(..32).unwrap(), d_salt);
+        // public salts, in the header only: a_salt then d_salt after magic,
+        // version and mode
+        assert_eq!(file.get(10..42).unwrap(), a_salt);
+        assert_eq!(file.get(42..74).unwrap(), d_salt);
+        assert_eq!(file.windows(32).filter(|w| *w == a_salt).count(), 1);
+        assert_eq!(file.windows(32).filter(|w| *w == d_salt).count(), 1);
+
+        assert!(storage.store.items.lock().await.is_empty());
     }
 
     /// Test automatic login: on stores d_key in the keychain and a restart
@@ -1335,17 +1433,58 @@ mod tests {
         assert_eq!(key_bytes(&daemon).await, after);
     }
 
-    /// Test that a refusing keychain leaves the keys in RAM only: no file,
-    /// status says not saved, nothing half-written
+    /// Test that the vault doesn't need the keychain: a refusing keychain
+    /// still saves and unlocks; only automatic login fails, and says so
     #[tokio::test]
-    async fn test_keychain_failure_stays_in_ram() {
+    async fn test_keychain_failure_still_saves() {
         let storage = TestStorage::new("fail");
         storage.store.fail.store(true, Ordering::SeqCst);
         let daemon = storage.daemon().await;
         setup(&daemon).await;
 
         let status = daemon.status().await;
-        assert!(status.auth_key_set && status.data_key_set && !status.saved);
+        assert!(status.auth_key_set && status.data_key_set && status.saved);
+        assert!(!status.keychain_unavailable);
+        assert_eq!(
+            ask(&daemon, Request::SetAutoLogin(true)).await,
+            Err(DaemonError::StorageFailed)
+        );
+        let before = key_bytes(&daemon).await;
+        drop(daemon);
+
+        let daemon = storage.daemon().await;
+        assert!(daemon.status().await.locked);
+        ask(&daemon, Request::Unlock(update(DATA_PW)))
+            .await
+            .unwrap();
+        assert_eq!(key_bytes(&daemon).await, before);
+    }
+
+    /// Test a platform without a keychain backend (Linux today): the vault
+    /// works the same, the status says there is no automatic login, and a
+    /// reset doesn't fail on the missing keychain
+    #[tokio::test]
+    async fn test_no_keychain_platform() {
+        let storage = TestStorage::new("nokeychain");
+        storage.store.unsupported.store(true, Ordering::SeqCst);
+        let daemon = storage.daemon().await;
+        setup(&daemon).await;
+
+        let status = daemon.status().await;
+        assert!(status.saved && status.keychain_unavailable && !status.auto_login);
+        assert_eq!(
+            ask(&daemon, Request::SetAutoLogin(true)).await,
+            Err(DaemonError::StorageFailed)
+        );
+        drop(daemon);
+
+        let daemon = storage.daemon().await;
+        assert!(daemon.status().await.locked);
+        ask(&daemon, Request::Unlock(update(DATA_PW)))
+            .await
+            .unwrap();
+        ask(&daemon, Request::ResetDevice).await.unwrap();
+        assert!(daemon.is_fresh().await);
         assert!(!storage.path().exists());
     }
 
@@ -1369,6 +1508,253 @@ mod tests {
             Err(DaemonError::StorageFailed)
         );
         assert!(daemon.status().await.locked);
+    }
+
+    fn both(auth: &[u8], data: &[u8]) -> Request {
+        Request::UnlockBoth(JoinPasswords {
+            auth: update(auth),
+            data: update(data),
+        })
+    }
+
+    /// Test the Enhanced mode lifecycle: on removes a_key from the file;
+    /// a restart is locked and says it needs both passwords; one password
+    /// alone is refused without counting a guess; a wrong auth or a wrong
+    /// data password each count as one; both right bring back the same
+    /// keys and identity; off goes back to Standard (data password only)
+    #[tokio::test]
+    async fn test_enhanced_lifecycle() {
+        let storage = TestStorage::new("enhanced");
+        let daemon = storage.daemon().await;
+        setup(&daemon).await;
+        let before = key_bytes(&daemon).await;
+        let identity = identity_seed(&daemon).await;
+
+        assert!(!daemon.status().await.enhanced);
+        ask(&daemon, Request::SetEnhanced(true)).await.unwrap();
+        assert!(daemon.status().await.enhanced);
+        // on again: nothing to do
+        ask(&daemon, Request::SetEnhanced(true)).await.unwrap();
+
+        let file = std::fs::read(storage.path()).unwrap();
+        assert!(!file.windows(32).any(|w| w == before.0));
+        assert_eq!(file.get(9), Some(&1));
+        drop(daemon);
+
+        let daemon = storage.daemon().await;
+        let status = daemon.status().await;
+        assert!(status.locked && status.enhanced && !status.auth_key_set);
+
+        assert_eq!(
+            ask(&daemon, Request::Unlock(update(DATA_PW))).await,
+            Err(DaemonError::NeedsBothPasswords)
+        );
+        assert_eq!(daemon.keys.read().await.unlock_failures, 0);
+
+        assert_eq!(
+            ask(&daemon, both(b"wrong auth password", DATA_PW)).await,
+            Err(DaemonError::WrongPassword)
+        );
+        assert_eq!(
+            ask(&daemon, both(AUTH_PW, b"wrong data password")).await,
+            Err(DaemonError::WrongPassword)
+        );
+        // the two swapped: wrong as well
+        assert_eq!(
+            ask(&daemon, both(DATA_PW, AUTH_PW)).await,
+            Err(DaemonError::WrongPassword)
+        );
+        assert_eq!(daemon.keys.read().await.unlock_failures, 3);
+        assert!(daemon.status().await.locked);
+
+        ask(&daemon, both(AUTH_PW, DATA_PW)).await.unwrap();
+        let status = daemon.status().await;
+        assert!(!status.locked && status.enhanced && status.auth_key_set && status.data_key_set);
+        assert_eq!(key_bytes(&daemon).await, before);
+        assert_eq!(identity_seed(&daemon).await, identity);
+        assert_eq!(daemon.keys.read().await.unlock_failures, 0);
+
+        ask(&daemon, Request::SetEnhanced(false)).await.unwrap();
+        drop(daemon);
+
+        let daemon = storage.daemon().await;
+        assert!(!daemon.status().await.enhanced);
+        // Standard again: both passwords is the wrong request
+        assert_eq!(
+            ask(&daemon, both(AUTH_PW, DATA_PW)).await,
+            Err(DaemonError::BadRequest)
+        );
+        ask(&daemon, Request::Unlock(update(DATA_PW)))
+            .await
+            .unwrap();
+        assert_eq!(key_bytes(&daemon).await, before);
+    }
+
+    /// Test that Enhanced mode needs saved, unlocked keys
+    #[tokio::test]
+    async fn test_enhanced_needs_unlocked_vault() {
+        let daemon = Arc::new(Daemon::default());
+        setup(&daemon).await;
+        assert_eq!(
+            ask(&daemon, Request::SetEnhanced(true)).await,
+            Err(DaemonError::NotSaved)
+        );
+
+        let storage = TestStorage::new("enhanced-locked");
+        setup(&storage.daemon().await).await;
+        let locked = storage.daemon().await;
+        assert_eq!(
+            ask(&locked, Request::SetEnhanced(true)).await,
+            Err(DaemonError::Locked)
+        );
+        // not locked into Enhanced mode by anything sent while locked
+        assert!(!locked.status().await.enhanced);
+    }
+
+    /// Test that Enhanced mode and automatic login exclude each other, in
+    /// both orders, and nothing is changed by the refused request
+    #[tokio::test]
+    async fn test_enhanced_and_auto_login_conflict() {
+        let storage = TestStorage::new("enhanced-auto");
+        let daemon = storage.daemon().await;
+        setup(&daemon).await;
+
+        ask(&daemon, Request::SetAutoLogin(true)).await.unwrap();
+        assert_eq!(
+            ask(&daemon, Request::SetEnhanced(true)).await,
+            Err(DaemonError::AutoLoginConflict)
+        );
+        let status = daemon.status().await;
+        assert!(status.auto_login && !status.enhanced);
+        assert!(storage.path().exists());
+        assert_eq!(std::fs::read(storage.path()).unwrap().get(9), Some(&0));
+
+        ask(&daemon, Request::SetAutoLogin(false)).await.unwrap();
+        ask(&daemon, Request::SetEnhanced(true)).await.unwrap();
+        assert_eq!(
+            ask(&daemon, Request::SetAutoLogin(true)).await,
+            Err(DaemonError::AutoLoginConflict)
+        );
+        assert!(!daemon.status().await.auto_login);
+        assert!(!storage.store.has(Item::DataKey).await);
+        // turning it off is always fine (nothing to remove)
+        ask(&daemon, Request::SetAutoLogin(false)).await.unwrap();
+    }
+
+    /// Test that in Enhanced mode a changed auth password and a changed
+    /// data password are each saved on their own: after each change and a
+    /// restart only the new pair opens the vault
+    #[tokio::test]
+    async fn test_enhanced_password_changes() {
+        let storage = TestStorage::new("enhanced-change");
+        let daemon = storage.daemon().await;
+        setup(&daemon).await;
+        ask(&daemon, Request::SetEnhanced(true)).await.unwrap();
+
+        // the auth password alone: the KEK uses a_key, so it must re-wrap
+        let new_auth = b"a new auth password";
+        ask(&daemon, Request::SetAuthPassword(update(new_auth)))
+            .await
+            .unwrap();
+        let after_auth = key_bytes(&daemon).await;
+        drop(daemon);
+
+        let daemon = storage.daemon().await;
+        assert_eq!(
+            ask(&daemon, both(AUTH_PW, DATA_PW)).await,
+            Err(DaemonError::WrongPassword)
+        );
+        ask(&daemon, both(new_auth, DATA_PW)).await.unwrap();
+        assert_eq!(key_bytes(&daemon).await, after_auth);
+
+        // then the data password alone
+        let new_data = b"a new data password";
+        ask(&daemon, Request::SetDataPassword(update(new_data)))
+            .await
+            .unwrap();
+        let after_data = key_bytes(&daemon).await;
+        drop(daemon);
+
+        let daemon = storage.daemon().await;
+        for (auth, data) in [
+            (new_auth.as_slice(), DATA_PW),
+            (AUTH_PW, new_data.as_slice()),
+        ] {
+            assert_eq!(
+                ask(&daemon, both(auth, data)).await,
+                Err(DaemonError::WrongPassword)
+            );
+        }
+        ask(&daemon, both(new_auth, new_data)).await.unwrap();
+        assert_eq!(key_bytes(&daemon).await, after_data);
+    }
+
+    /// Test that an automatic-login key left in the keychain doesn't unlock
+    /// an Enhanced vault: it is removed, the daemon stays locked
+    #[tokio::test]
+    async fn test_enhanced_leftover_key_removed() {
+        let storage = TestStorage::new("enhanced-leftover");
+        let daemon = storage.daemon().await;
+        setup(&daemon).await;
+        let (_, d_key) = key_bytes(&daemon).await;
+        ask(&daemon, Request::SetEnhanced(true)).await.unwrap();
+        drop(daemon);
+
+        // the real d_key: even the right one must not be used
+        storage
+            .store
+            .items
+            .lock()
+            .await
+            .insert(Item::DataKey, Zeroizing::new(d_key.to_vec()));
+
+        let daemon = storage.daemon().await;
+        let status = daemon.status().await;
+        assert!(status.locked && status.enhanced && !status.auto_login);
+        assert!(!storage.store.has(Item::DataKey).await);
+        drop(daemon);
+
+        // a leftover that can't be removed: still never used, and shown as
+        // on so the user sees it and can turn it off
+        storage
+            .store
+            .items
+            .lock()
+            .await
+            .insert(Item::DataKey, Zeroizing::new(d_key.to_vec()));
+        storage.store.fail_delete.store(true, Ordering::SeqCst);
+        let daemon = storage.daemon().await;
+        let status = daemon.status().await;
+        assert!(status.locked && status.enhanced && status.auto_login);
+        assert!(storage.store.has(Item::DataKey).await);
+    }
+
+    /// Test that a vault of an older version (salts in the keychain) is
+    /// reported, refused for every unlock without a guess counted, and
+    /// that a reset is the way out
+    #[tokio::test]
+    async fn test_outdated_vault() {
+        let storage = TestStorage::new("outdated");
+        let daemon = storage.daemon().await;
+        setup(&daemon).await;
+        drop(daemon);
+
+        let mut file = std::fs::read(storage.path()).unwrap();
+        file[8] = 2;
+        vault::write_file_atomic(&storage.path(), &file).unwrap();
+
+        let daemon = storage.daemon().await;
+        let status = daemon.status().await;
+        assert!(status.locked && status.vault_outdated && !status.enhanced);
+        for request in [Request::Unlock(update(DATA_PW)), both(AUTH_PW, DATA_PW)] {
+            assert_eq!(ask(&daemon, request).await, Err(DaemonError::VaultOutdated));
+        }
+        assert_eq!(daemon.keys.read().await.unlock_failures, 0);
+
+        ask(&daemon, Request::ResetDevice).await.unwrap();
+        let status = daemon.status().await;
+        assert!(!status.locked && !status.vault_outdated);
+        assert!(daemon.is_fresh().await);
     }
 
     /// Test the unlock delay: free attempts first, then doubling, capped
@@ -2973,7 +3359,7 @@ mod tests {
         assert_eq!(fingerprints(&restarted).await, [fp_phone, fp_tablet]);
     }
 
-    /// Test that a reset wipes everything (vault file, keychain items, keys,
+    /// Test that a reset wipes everything (vault file, keychain item, keys,
     /// paired devices, networking), works while locked, and leaves a device
     /// that starts fresh and may join
     #[tokio::test]
@@ -2991,7 +3377,7 @@ mod tests {
             .push(TrustedPeer::for_test(7, "phone"));
         daemon.save_peers().await;
         assert!(daemon.status().await.network_running);
-        assert!(storage.store.has(Item::Salts).await && storage.store.has(Item::DataKey).await);
+        assert!(storage.store.has(Item::DataKey).await);
 
         ask(&daemon, Request::ResetDevice).await.unwrap();
 
@@ -3016,7 +3402,6 @@ mod tests {
         );
         assert!(daemon.is_fresh().await);
         assert!(!storage.path().exists());
-        assert!(!storage.store.has(Item::Salts).await);
         assert!(!storage.store.has(Item::DataKey).await);
 
         // a restart finds nothing either
@@ -3034,12 +3419,13 @@ mod tests {
 
     /// Test that a failed vault delete changes nothing, and that a failed
     /// keychain delete still leaves a fresh device and a second reset
-    /// removes the leftovers
+    /// removes the leftover
     #[tokio::test]
     async fn test_reset_device_failures() {
         let storage = TestStorage::new("reset-fail");
         let daemon = storage.daemon().await;
         setup(&daemon).await;
+        ask(&daemon, Request::SetAutoLogin(true)).await.unwrap();
 
         vault_dir_writable(&storage, false);
         assert_eq!(
@@ -3058,10 +3444,10 @@ mod tests {
         storage.store.fail.store(false, Ordering::SeqCst);
         assert!(daemon.is_fresh().await);
         assert!(!storage.path().exists());
-        assert!(storage.store.has(Item::Salts).await);
+        assert!(storage.store.has(Item::DataKey).await);
 
         ask(&daemon, Request::ResetDevice).await.unwrap();
-        assert!(!storage.store.has(Item::Salts).await);
+        assert!(!storage.store.has(Item::DataKey).await);
     }
 
     /// Test that nothing from before a reset comes back: a handshake of the

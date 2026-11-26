@@ -13,7 +13,7 @@
 //!   a daemon of the same user, and on macOS only to one whose signature
 //!   satisfies [`DAEMON_CODE_REQUIREMENT`].
 //!
-//! Wire format (version 9), one request and one response per connection:
+//! Wire format (version 10), one request and one response per connection:
 //! `frame = length (u32 LE, 1..=MAX_FRAME_LEN) || body`
 //!
 //! Request body: `kind (1) || payload`
@@ -23,7 +23,7 @@
 //!   picks the salt
 //! * `0x06` SetDataPassword: same
 //! * `0x07` Unlock: `password (1..=MAX_PASSWORD_LEN)`, the data password that
-//!   opens the encrypted vault after a restart
+//!   opens the encrypted vault after a restart (Standard mode)
 //! * `0x08` SetAutoLogin: `on (1)`, exactly `0x00` or `0x01`
 //! * `0x09` SetSync: `on (1)`, exactly `0x00` or `0x01`; networking on/off,
 //!   saved in the vault
@@ -41,7 +41,7 @@
 //! * `0x10` ForgetPeer: `fingerprint (8)`; removes that paired device from
 //!   this device (memory and vault)
 //! * `0x11` ResetDevice: `"CN-RESET" (8)`; wipes this device back to fresh
-//!   (vault file, keychain items, keys, paired devices). The fixed bytes make
+//!   (vault file, automatic-login key, keys, paired devices). The fixed bytes make
 //!   sure a reset is never decoded from anything sent by mistake
 //! * `0x12` SetClipboard: `on (1)`, exactly `0x00` or `0x01`; clipboard sync
 //!   on/off, saved in the vault
@@ -49,6 +49,10 @@
 //!   device at that address (another network: a VPN, a routed subnet)
 //! * `0x14` JoinGroupAt: `address || JoinGroup's payload`; JoinGroup
 //!   through the device at that address instead of searching the LAN
+//! * `0x15` UnlockBoth: JoinGroup's payload (both passwords); opens a vault
+//!   in Enhanced mode, which needs both at every start
+//! * `0x16` SetEnhanced: `on (1)`, exactly `0x00` or `0x01`; Enhanced mode
+//!   on (both passwords at every start, `a_key` no longer stored) or off
 //! * `address` = `4 (1) || IPv4 (4)`, a [`DeviceAddress`]: not unspecified,
 //!   loopback, multicast or the broadcast. Family `6` is reserved for IPv6
 //!   (the listener is IPv4 only for now) and refused, like any other
@@ -64,15 +68,19 @@
 //!   bit 6 = Sync switched on, bit 7 = "Add device" window open; flags2 bit 0
 //!   = joining a group, bit 1 = the open "Add device" window found a device
 //!   of another group, bit 2 = clipboard sync switched on, bit 3 = this
-//!   platform has no clipboard support, other bits must be 0; unlock wait = seconds until
-//!   `Unlock` is accepted again after too many wrong data passwords (0 = now).
+//!   platform has no clipboard support, bit 4 = the saved vault is in
+//!   Enhanced mode (known while locked: unlock with both passwords), bit 5
+//!   = the saved vault is of an older version (reset this device), bit 6 =
+//!   this platform has no keychain backend (no automatic login), bit 7
+//!   must be 0; unlock wait = seconds until an unlock is accepted again
+//!   after too many wrong passwords (0 = now).
 //!   Versions 2 to 4 were shorter, so a mismatched UI and daemon fail with
-//!   `Malformed`; versions 5 to 7 refuse the newer flags2 bits, so they fail
+//!   `Malformed`; versions 5 to 9 refuse the newer flags2 bits, so they fail
 //!   loudly too.
 //! * SetAuthPassword / SetDataPassword / Unlock / SetAutoLogin / SetSync /
 //!   AddDevice / AnswerPairing / JoinGroup / CancelJoin / StopAddDevice /
-//!   ForgetPeer / ResetDevice / SetClipboard / AddDeviceAt / JoinGroupAt:
-//!   empty
+//!   ForgetPeer / ResetDevice / SetClipboard / AddDeviceAt / JoinGroupAt /
+//!   UnlockBoth / SetEnhanced: empty
 //! * ListPeers: `count (u16 LE) || count * (fingerprint (8) || state (1) ||
 //!   name len (1) || name)`; state is a [`PeerState`] byte, others are refused
 //! * PendingPairing: `0x00` (none) or `0x01 || id (u32 LE) || code (8) ||
@@ -156,6 +164,8 @@ const REQ_RESET_DEVICE: u8 = 0x11;
 const REQ_SET_CLIPBOARD: u8 = 0x12;
 const REQ_ADD_DEVICE_AT: u8 = 0x13;
 const REQ_JOIN_GROUP_AT: u8 = 0x14;
+const REQ_UNLOCK_BOTH: u8 = 0x15;
+const REQ_SET_ENHANCED: u8 = 0x16;
 
 /* device address */
 /// family byte of an IPv4 address (then 4 bytes)
@@ -173,13 +183,25 @@ const STATUS2_OTHER_GROUP: u8 = 0b10;
 const STATUS2_CLIPBOARD: u8 = 0b100;
 /// flags2: this platform has no clipboard support
 const STATUS2_NO_CLIPBOARD: u8 = 0b1000;
+/// flags2: the saved vault is in Enhanced mode (both passwords to unlock)
+const STATUS2_ENHANCED: u8 = 0b1_0000;
+/// flags2: the saved vault is of an older version and can't be opened
+const STATUS2_OUTDATED: u8 = 0b10_0000;
+/// flags2: this platform has no keychain backend (no automatic login)
+const STATUS2_NO_KEYCHAIN: u8 = 0b100_0000;
 /// every flags2 bit this version knows
-const STATUS2_KNOWN: u8 =
-    STATUS2_JOINING | STATUS2_OTHER_GROUP | STATUS2_CLIPBOARD | STATUS2_NO_CLIPBOARD;
+const STATUS2_KNOWN: u8 = STATUS2_JOINING
+    | STATUS2_OTHER_GROUP
+    | STATUS2_CLIPBOARD
+    | STATUS2_NO_CLIPBOARD
+    | STATUS2_ENHANCED
+    | STATUS2_OUTDATED
+    | STATUS2_NO_KEYCHAIN;
 
-/// Shortest new password the daemon accepts (characters; bytes if not UTF-8). Anyone holding the vault
-/// file and the keychain salts can guess the data password offline, so short
-/// passwords are refused when they are set (not when unlocking).
+/// Shortest new password the daemon accepts (characters; bytes if not
+/// UTF-8). Anyone holding the vault file can guess the data password
+/// offline (the salts are in its header), so short passwords are refused
+/// when they are set (not when unlocking).
 pub const MIN_NEW_PASSWORD_LEN: usize = 12;
 
 /* response status */
@@ -247,11 +269,13 @@ pub enum DaemonError {
     KeyDerivationFailed = 0x02,
     /// Anything else went wrong inside the daemon.
     Internal = 0x03,
-    /// Unlock: the data password doesn't open the vault.
+    /// Unlock: the password (Enhanced mode: one of the two) doesn't open
+    /// the vault.
     WrongPassword = 0x04,
     /// The vault is locked: unlock it first.
     Locked = 0x05,
-    /// The keychain or the vault file failed; the change was not saved.
+    /// The vault file (or, for automatic login, the keychain) failed; the
+    /// change was not saved.
     StorageFailed = 0x06,
     /// Nothing is saved yet (no vault), so there is nothing to unlock or log into.
     NotSaved = 0x07,
@@ -277,6 +301,16 @@ pub enum DaemonError {
     ClipboardUnavailable = 0x0F,
     /// AddDeviceAt / JoinGroupAt: that address is this device's own.
     OwnAddress = 0x10,
+    /// Unlock: the vault is in Enhanced mode, it needs both passwords
+    /// (`UnlockBoth`); UnlockBoth on a Standard vault is `BadRequest`.
+    NeedsBothPasswords = 0x11,
+    /// SetEnhanced / SetAutoLogin: Enhanced mode and automatic login can't
+    /// both be on (automatic login would keep `d_key` where Enhanced mode
+    /// keeps nothing); turn the other one off first.
+    AutoLoginConflict = 0x12,
+    /// Unlock: the saved vault is of an older version and can't be opened;
+    /// reset this device and join the group again.
+    VaultOutdated = 0x13,
 }
 
 impl DaemonError {
@@ -298,6 +332,9 @@ impl DaemonError {
             0x0E => Some(Self::UnknownPeer),
             0x0F => Some(Self::ClipboardUnavailable),
             0x10 => Some(Self::OwnAddress),
+            0x11 => Some(Self::NeedsBothPasswords),
+            0x12 => Some(Self::AutoLoginConflict),
+            0x13 => Some(Self::VaultOutdated),
             _ => None,
         }
     }
@@ -309,9 +346,9 @@ impl fmt::Display for DaemonError {
             DaemonError::BadRequest => write!(f, "bad request"),
             DaemonError::KeyDerivationFailed => write!(f, "key derivation failed"),
             DaemonError::Internal => write!(f, "internal error"),
-            DaemonError::WrongPassword => write!(f, "wrong data password"),
-            DaemonError::Locked => write!(f, "locked: enter the data password first"),
-            DaemonError::StorageFailed => write!(f, "saving to the keychain / vault failed"),
+            DaemonError::WrongPassword => write!(f, "wrong password"),
+            DaemonError::Locked => write!(f, "locked: unlock the saved keys first"),
+            DaemonError::StorageFailed => write!(f, "saving to the vault / keychain failed"),
             DaemonError::NotSaved => write!(f, "nothing is saved yet"),
             DaemonError::WeakPassword => write!(
                 f,
@@ -342,6 +379,16 @@ impl fmt::Display for DaemonError {
                     "that is this device's own address: type the other device's"
                 )
             }
+            DaemonError::NeedsBothPasswords => {
+                write!(f, "Enhanced security is on: unlock with both passwords")
+            }
+            DaemonError::AutoLoginConflict => {
+                write!(f, "Enhanced security and automatic login can't both be on")
+            }
+            DaemonError::VaultOutdated => write!(
+                f,
+                "the saved keys are from an older version: reset this device, then join again"
+            ),
         }
     }
 }
@@ -399,6 +446,10 @@ pub enum Request {
     /// [`Request::JoinGroup`] through the device at this address, instead
     /// of searching the LAN.
     JoinGroupAt(DeviceAddress, JoinPasswords),
+    /// Open the saved vault in Enhanced mode, with both passwords.
+    UnlockBoth(JoinPasswords),
+    /// Turn Enhanced mode on (`true`: both passwords at every start) or off.
+    SetEnhanced(bool),
 }
 
 /// The address of another device, typed by the user: where to connect
@@ -457,8 +508,8 @@ impl fmt::Display for DeviceAddress {
     }
 }
 
-/// The two group passwords for `JoinGroup`, each in its own exact-size
-/// buffer. Wiped on drop; no `Debug` / `Clone`.
+/// The two passwords for `JoinGroup` / `UnlockBoth`, each in its own
+/// exact-size buffer. Wiped on drop; no `Debug` / `Clone`.
 pub struct JoinPasswords {
     /// The auth password (pw1).
     pub auth: PasswordUpdate,
@@ -496,6 +547,14 @@ pub struct Status {
     pub clipboard_enabled: bool,
     /// This platform has no clipboard support yet.
     pub clipboard_unavailable: bool,
+    /// The saved vault is in Enhanced mode: both passwords at every start
+    /// (known while locked, from the vault's header).
+    pub enhanced: bool,
+    /// The saved vault is of an older version: it can't be opened, the
+    /// device has to be reset.
+    pub vault_outdated: bool,
+    /// This platform has no keychain backend: no automatic login.
+    pub keychain_unavailable: bool,
 }
 
 /// A pairing waiting for the user (public data only: the handshake hash
@@ -585,11 +644,14 @@ fn short_name(name: &str) -> &[u8] {
     name.as_bytes().get(..end).unwrap_or_default()
 }
 
-/// Parses a `password` payload.
-/// `JoinGroup` / `JoinGroupAt` body: `kind || [address] || auth len (u16
-/// LE) || auth || data`. Sized up front so the buffer never reallocates
-/// (it holds both passwords).
-fn encode_join(at: Option<&DeviceAddress>, passwords: &JoinPasswords) -> Zeroizing<Vec<u8>> {
+/// `JoinGroup` / `JoinGroupAt` / `UnlockBoth` body: `kind || [address] ||
+/// auth len (u16 LE) || auth || data`. Sized up front so the buffer never
+/// reallocates (it holds both passwords).
+fn encode_two(
+    kind: u8,
+    at: Option<&DeviceAddress>,
+    passwords: &JoinPasswords,
+) -> Zeroizing<Vec<u8>> {
     let (auth, data) = (&passwords.auth.password, &passwords.data.password);
     // the encoder never cuts: a too long password goes out whole and the
     // daemon refuses it
@@ -599,12 +661,9 @@ fn encode_join(at: Option<&DeviceAddress>, passwords: &JoinPasswords) -> Zeroizi
             .saturating_add(auth.len())
             .saturating_add(data.len()),
     ));
-    match at {
-        Some(at) => {
-            body.push(REQ_JOIN_GROUP_AT);
-            at.encode_into(&mut body);
-        }
-        None => body.push(REQ_JOIN_GROUP),
+    body.push(kind);
+    if let Some(at) = at {
+        at.encode_into(&mut body);
     }
     body.extend_from_slice(&auth_len.to_le_bytes());
     body.extend_from_slice(auth);
@@ -612,7 +671,7 @@ fn encode_join(at: Option<&DeviceAddress>, passwords: &JoinPasswords) -> Zeroizi
     body
 }
 
-/// The two passwords of a join, consumed exactly.
+/// The two passwords of a join or an unlock, consumed exactly.
 fn parse_join(payload: &[u8]) -> Option<JoinPasswords> {
     let (auth_len, rest) = payload.split_first_chunk::<2>()?;
     let auth_len = usize::from(u16::from_le_bytes(*auth_len));
@@ -626,6 +685,7 @@ fn parse_join(payload: &[u8]) -> Option<JoinPasswords> {
     })
 }
 
+/// Parses a `password` payload.
 fn parse_password_update(password: &[u8]) -> Option<PasswordUpdate> {
     if password.is_empty() || password.len() > MAX_PASSWORD_LEN {
         return None;
@@ -662,8 +722,16 @@ impl Request {
             Request::ResetDevice => {
                 return Zeroizing::new([&[REQ_RESET_DEVICE][..], &RESET_CONFIRM].concat());
             }
-            Request::JoinGroup(passwords) => return encode_join(None, passwords),
-            Request::JoinGroupAt(at, passwords) => return encode_join(Some(at), passwords),
+            Request::JoinGroup(passwords) => return encode_two(REQ_JOIN_GROUP, None, passwords),
+            Request::JoinGroupAt(at, passwords) => {
+                return encode_two(REQ_JOIN_GROUP_AT, Some(at), passwords);
+            }
+            Request::UnlockBoth(passwords) => {
+                return encode_two(REQ_UNLOCK_BOTH, None, passwords);
+            }
+            Request::SetEnhanced(on) => {
+                return Zeroizing::new(vec![REQ_SET_ENHANCED, u8::from(*on)]);
+            }
             Request::AddDeviceAt(at) => {
                 let mut body = Vec::with_capacity(1 + 1 + 4);
                 body.push(REQ_ADD_DEVICE_AT);
@@ -715,6 +783,8 @@ impl Request {
             // nosemgrep: cesa.net.non-constant-time-compare
             REQ_RESET_DEVICE if payload == RESET_CONFIRM => Some(Request::ResetDevice),
             REQ_JOIN_GROUP => parse_join(payload).map(Request::JoinGroup),
+            REQ_UNLOCK_BOTH => parse_join(payload).map(Request::UnlockBoth),
+            REQ_SET_ENHANCED => parse_flag(payload).map(Request::SetEnhanced),
             REQ_JOIN_GROUP_AT => {
                 let (at, rest) = DeviceAddress::decode_from(payload)?;
                 parse_join(rest).map(|passwords| Request::JoinGroupAt(at, passwords))
@@ -762,6 +832,9 @@ impl Response {
                     (s.other_group_nearby, STATUS2_OTHER_GROUP),
                     (s.clipboard_enabled, STATUS2_CLIPBOARD),
                     (s.clipboard_unavailable, STATUS2_NO_CLIPBOARD),
+                    (s.enhanced, STATUS2_ENHANCED),
+                    (s.vault_outdated, STATUS2_OUTDATED),
+                    (s.keychain_unavailable, STATUS2_NO_KEYCHAIN),
                 ]
                 .iter()
                 .filter(|(on, _)| *on)
@@ -858,6 +931,9 @@ impl Response {
                     other_group_nearby: flags2 & STATUS2_OTHER_GROUP != 0,
                     clipboard_enabled: flags2 & STATUS2_CLIPBOARD != 0,
                     clipboard_unavailable: flags2 & STATUS2_NO_CLIPBOARD != 0,
+                    enhanced: flags2 & STATUS2_ENHANCED != 0,
+                    vault_outdated: flags2 & STATUS2_OUTDATED != 0,
+                    keychain_unavailable: flags2 & STATUS2_NO_KEYCHAIN != 0,
                 }))
             }
             Request::SetAuthPassword(_)
@@ -875,6 +951,8 @@ impl Response {
             | Request::SetClipboard(_)
             | Request::AddDeviceAt(_)
             | Request::JoinGroupAt(..)
+            | Request::UnlockBoth(_)
+            | Request::SetEnhanced(_)
                 if payload.is_empty() =>
             {
                 Ok(Response::Done)
@@ -893,7 +971,9 @@ impl Response {
             | Request::ResetDevice
             | Request::SetClipboard(_)
             | Request::AddDeviceAt(_)
-            | Request::JoinGroupAt(..) => Err(IpcErrors::Malformed),
+            | Request::JoinGroupAt(..)
+            | Request::UnlockBoth(_)
+            | Request::SetEnhanced(_) => Err(IpcErrors::Malformed),
             Request::ListPeers => decode_peers(payload).ok_or(IpcErrors::Malformed),
             Request::PendingPairing => decode_pairing(payload).ok_or(IpcErrors::Malformed),
         }
@@ -1200,6 +1280,16 @@ mod tests {
                     data: update(&vec![b'd'; MAX_PASSWORD_LEN]),
                 },
             ),
+            Request::UnlockBoth(JoinPasswords {
+                auth: update(b" auth "),
+                data: update(b"data pass"),
+            }),
+            Request::UnlockBoth(JoinPasswords {
+                auth: update(&vec![b'a'; MAX_PASSWORD_LEN]),
+                data: update(&vec![b'd'; MAX_PASSWORD_LEN]),
+            }),
+            Request::SetEnhanced(true),
+            Request::SetEnhanced(false),
         ] {
             let decoded = Request::decode(&req.encode()).unwrap();
             assert_eq!(decoded.encode().as_slice(), req.encode().as_slice());
@@ -1334,6 +1424,24 @@ mod tests {
         assert!(Request::decode(&join_at(&[4, 10, 0, 0], 2, b"ab", b"cd")).is_none());
         assert!(Request::decode(&join_at(&[4, 10, 0, 0, 1], 2, b"ab", b"")).is_none());
         assert!(Request::decode(&[REQ_JOIN_GROUP_AT]).is_none());
+
+        // unlock with both: the join's payload, consumed exactly, untrimmed
+        let both = |auth_len: u16, auth: &[u8], data: &[u8]| {
+            [&[REQ_UNLOCK_BOTH][..], &auth_len.to_le_bytes(), auth, data].concat()
+        };
+        let Some(Request::UnlockBoth(passwords)) = Request::decode(&both(3, b" a ", b"b ")) else {
+            panic!("unlock both didn't decode");
+        };
+        assert_eq!(passwords.auth.password.as_slice(), b" a ");
+        assert_eq!(passwords.data.password.as_slice(), b"b ");
+        assert!(Request::decode(&both(0, b"", b"cd")).is_none());
+        assert!(Request::decode(&both(2, b"ab", b"")).is_none());
+        assert!(Request::decode(&both(2, b"ab", &long_auth)).is_none());
+        assert!(Request::decode(&[REQ_UNLOCK_BOTH]).is_none());
+        // enhanced flag: exactly one byte, 0 or 1
+        assert!(Request::decode(&[REQ_SET_ENHANCED]).is_none());
+        assert!(Request::decode(&[REQ_SET_ENHANCED, 2]).is_none());
+        assert!(Request::decode(&[REQ_SET_ENHANCED, 1, 0]).is_none());
     }
 
     /// Test what a typed address may be: an IPv4 address only, trimmed, and
@@ -1398,6 +1506,9 @@ mod tests {
             DaemonError::UnknownPeer,
             DaemonError::ClipboardUnavailable,
             DaemonError::OwnAddress,
+            DaemonError::NeedsBothPasswords,
+            DaemonError::AutoLoginConflict,
+            DaemonError::VaultOutdated,
         ] {
             assert_eq!(
                 Response::decode(&Request::Status, &Response::encode_error(e)),
@@ -1407,7 +1518,7 @@ mod tests {
 
         // unknown error codes are refused
         assert_eq!(
-            Response::decode(&Request::Status, &[RESP_ERR, 0x11]),
+            Response::decode(&Request::Status, &[RESP_ERR, 0x14]),
             Err(IpcErrors::Malformed)
         );
 
@@ -1426,7 +1537,7 @@ mod tests {
             Response::decode(&Request::Status, &[RESP_OK, 0, 0, 0, 0, 0, 0, 0, 0]),
             Err(IpcErrors::Malformed)
         );
-        for flags2 in [0b1_0000u8, 0x80] {
+        for flags2 in [0x80u8, 0xFF] {
             assert_eq!(
                 Response::decode(&Request::Status, &[RESP_OK, 0, flags2, 0, 0, 0, 0, 0, 0, 0]),
                 Err(IpcErrors::Malformed)
@@ -1444,6 +1555,23 @@ mod tests {
         assert!(
             matches!(missing, Ok(Response::Status(s)) if s.clipboard_unavailable && !s.clipboard_enabled)
         );
+        // each new bit sets exactly its own field
+        for (bit, check) in [
+            (0x10u8, (true, false, false)),
+            (0x20, (false, true, false)),
+            (0x40, (false, false, true)),
+        ] {
+            let Ok(Response::Status(s)) =
+                Response::decode(&Request::Status, &[RESP_OK, 0, bit, 0, 0, 0, 0, 0, 0, 0])
+            else {
+                panic!("bit {bit:#x} didn't decode");
+            };
+            assert_eq!(
+                (s.enhanced, s.vault_outdated, s.keychain_unavailable),
+                check
+            );
+            assert!(!s.clipboard_enabled && !s.joining);
+        }
     }
 
     /// Test that the pairing answer round-trips and its decoding is strict
@@ -1539,6 +1667,9 @@ mod tests {
             other_group_nearby: true,
             clipboard_enabled: true,
             clipboard_unavailable: true,
+            enhanced: true,
+            vault_outdated: true,
+            keychain_unavailable: true,
         });
         assert_eq!(
             Response::decode(&Request::Status, &status.encode()),
