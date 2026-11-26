@@ -10,10 +10,13 @@
 //! * Standard mode: `KEK = HKDF-BLAKE2s(ikm = d_key, salt = storage salt,
 //!   info = KEK_LABEL)`; the vault holds `a_key`, so the data password
 //!   alone opens it.
-//! * Enhanced mode: `KEK = HKDF-BLAKE2s(ikm = d_key || a_key, salt = storage
-//!   salt, info = KEK_BOTH_LABEL)`; `a_key` is never stored, so both
-//!   passwords are needed at every start, and an offline guess has to get
-//!   both right at once.
+//! * Enhanced mode: `KEK = HKDF-BLAKE2s(ikm = Argon2id(d_key || a_key,
+//!   storage salt), salt = storage salt, info = KEK_BOTH_LABEL)`; `a_key`
+//!   is never stored, so both passwords are needed at every start. The
+//!   extra Argon2 makes every pairing of a guessed auth password with a
+//!   guessed data password cost a full Argon2 run: without it an attacker
+//!   would derive each candidate key once and test the pairings with a
+//!   cheap HKDF (N + M Argon2 runs for N x M pairs instead of N x M).
 //! * The KEK never uses a key directly, and it is useless on the network.
 //! * A random DEK encrypts the payload. The KEK only wraps the DEK, so a
 //!   password or mode change re-wraps 32 bytes.
@@ -27,7 +30,8 @@
 //! ```
 //! The salts aren't secret (`a_salt` is even sent to joining devices), but
 //! with them in the file, anyone holding the file can guess passwords
-//! offline: each guess costs a full Argon2 run (daemon.md 8.3).
+//! offline: each guess costs a full Argon2 run, each guessed pair in
+//! Enhanced mode (daemon.md 8.3).
 //!
 //! The plaintext of the data layer is `contents len (u32 LE) || contents ||
 //! zeros`, padded to whole [`PAD_BLOCK`]s, so the file size doesn't tell how
@@ -39,11 +43,13 @@ use std::path::{Path, PathBuf};
 
 use blake2::Blake2s256;
 use hkdf::SimpleHkdf;
+use tracing::warn;
 use zeroize::Zeroizing;
 
 use cesa_conn_crypto::{
     aes::{decrypt_with_aad, encrypt_with_aad},
     crand::random_array,
+    pswd_manager::derive_key,
 };
 use cesa_conn_system::ipc::check_private_dir;
 
@@ -54,6 +60,9 @@ use crate::auth_snow::{AuthKey, DataKey, IDENTITY_SEED_LEN};
 const MAGIC: &[u8; 8] = b"CESAVLT\0";
 /// Format version (3: salts and the unlock mode in the header).
 const VERSION: u8 = 3;
+/// Versions of earlier builds (salts in the keychain): reported as
+/// outdated, so the user is told to reset. Any other version is unknown.
+const OUTDATED_VERSIONS: [u8; 2] = [1, 2];
 /// -> magic (8) + version (1) + mode (1) + three salts (3 * 32)
 const HEADER_LEN: usize = 8 + 1 + 1 + 3 * 32;
 /// AES-GCM nonce (12) and tag (16)
@@ -101,9 +110,12 @@ const FILE_NAME: &str = "vault.bin";
 pub enum VaultErrors {
     /// The file is not a vault, or its layout is wrong.
     Malformed,
-    /// The file is a vault of an older format version: this version can't
-    /// open it (reset the device and join again).
+    /// The file is a vault of an older format version (1 or 2): this
+    /// version can't open it (reset the device and join again).
     Outdated,
+    /// The file is a vault of a version this build doesn't know (a newer
+    /// build, or damage): left alone, never reported as outdated.
+    UnknownVersion,
     /// The DEK didn't unwrap: wrong password(s) (or a swapped header).
     WrongKey,
     /// The DEK unwrapped but the contents didn't decrypt or parse: damaged.
@@ -126,6 +138,7 @@ impl fmt::Display for VaultErrors {
         match self {
             VaultErrors::Malformed => write!(f, "not a vault file"),
             VaultErrors::Outdated => write!(f, "vault of an older version"),
+            VaultErrors::UnknownVersion => write!(f, "vault of an unknown version"),
             VaultErrors::WrongKey => write!(f, "wrong password"),
             VaultErrors::Corrupt => write!(f, "vault contents are damaged"),
             VaultErrors::WrongMode => write!(f, "vault contents don't fit its unlock mode"),
@@ -194,8 +207,9 @@ impl Header {
         out
     }
 
-    /// Parses the header at the start of `file`. A vault of another version
-    /// is [`VaultErrors::Outdated`] (older) or `Malformed` (newer, unknown).
+    /// Parses the header at the start of `file`. A vault of an earlier
+    /// build's version is [`VaultErrors::Outdated`]; any other version is
+    /// `UnknownVersion`.
     fn parse(file: &[u8]) -> Result<Self, VaultErrors> {
         let (magic, rest) = file
             .split_first_chunk::<8>()
@@ -204,11 +218,11 @@ impl Header {
             return Err(VaultErrors::Malformed);
         }
         let (&version, rest) = rest.split_first().ok_or(VaultErrors::Malformed)?;
-        if version < VERSION {
+        if OUTDATED_VERSIONS.contains(&version) {
             return Err(VaultErrors::Outdated);
         }
         if version != VERSION {
-            return Err(VaultErrors::Malformed);
+            return Err(VaultErrors::UnknownVersion);
         }
         let (&mode, rest) = rest.split_first().ok_or(VaultErrors::Malformed)?;
         let mode = Mode::from_byte(mode).ok_or(VaultErrors::Malformed)?;
@@ -256,7 +270,9 @@ pub fn read_header(file: &[u8]) -> Result<Header, VaultErrors> {
 }
 
 /// The KEK for `header`'s mode: `a_key` must be given exactly in Enhanced
-/// mode (`HKDF(d_key || a_key)`), and not in Standard mode (`HKDF(d_key)`).
+/// mode (`HKDF(Argon2id(d_key || a_key))`), and not in Standard mode
+/// (`HKDF(d_key)`). Enhanced mode runs Argon2: call it off the async
+/// workers.
 pub fn derive_kek(
     header: &Header,
     d_key: &DataKey,
@@ -277,7 +293,11 @@ pub fn derive_kek(
             let (d, a) = ikm.split_at_mut(32);
             d.copy_from_slice(d_key.expose().as_slice());
             a.copy_from_slice(a_key.expose().as_slice());
-            SimpleHkdf::<Blake2s256>::new(salt, ikm.as_slice())
+            // one more Argon2 over both keys: a guessed pair costs a full run
+            let both = derive_key(ikm.as_slice(), &header.storage_salt)
+                .map_err(|_| VaultErrors::Crypto)?;
+            drop(ikm);
+            SimpleHkdf::<Blake2s256>::new(salt, both.as_slice())
                 .expand(KEK_BOTH_LABEL, kek.as_mut_slice())
                 .map_err(|_| VaultErrors::Crypto)?;
         }
@@ -618,6 +638,9 @@ pub fn read_file(path: &Path) -> Result<Option<Vec<u8>>, VaultErrors> {
 
 /// Writes the vault atomically: a new `0600` temp file in the same private
 /// directory, fsynced, renamed over the old one, then the directory fsynced.
+/// An error means the old file is still in place. Once the rename is done
+/// the new file IS the vault, so a failed directory fsync only logs (see
+/// [`after_replace`]): the caller must not keep its old state.
 pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), VaultErrors> {
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -637,18 +660,27 @@ pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), VaultErrors> {
             .map_err(|_| VaultErrors::Io)?;
         file.write_all(bytes).map_err(|_| VaultErrors::Io)?;
         file.sync_all().map_err(|_| VaultErrors::Io)?;
-        std::fs::rename(&tmp, path).map_err(|_| VaultErrors::Io)?;
-        std::fs::File::open(dir)
-            .and_then(|d| d.sync_all())
-            .map_err(|_| VaultErrors::Io)
+        std::fs::rename(&tmp, path).map_err(|_| VaultErrors::Io)
     })();
 
     if result.is_err() {
         // best effort: never leave a half-written temp file behind
         let _ = std::fs::remove_file(&tmp);
+        return result;
     }
 
-    result
+    after_replace(std::fs::File::open(dir).and_then(|d| d.sync_all()))
+}
+
+/// The outcome of a write or delete once the file was already replaced
+/// (or removed): a failed directory fsync means only that a power cut
+/// might still undo the change. Not an error: the change is on disk and
+/// the daemon's state must follow it.
+fn after_replace(dir_sync: std::io::Result<()>) -> Result<(), VaultErrors> {
+    if dir_sync.is_err() {
+        warn!("vault changed, but syncing its directory failed: a power cut might undo the change");
+    }
+    Ok(())
 }
 
 /// Deletes the vault file (a device reset); a missing file is not an error.
@@ -663,9 +695,7 @@ pub fn delete_file(path: &Path) -> Result<(), VaultErrors> {
         Err(_) => return Err(VaultErrors::Io),
     }
 
-    std::fs::File::open(dir)
-        .and_then(|d| d.sync_all())
-        .map_err(|_| VaultErrors::Io)
+    after_replace(std::fs::File::open(dir).and_then(|d| d.sync_all()))
 }
 
 #[cfg(test)]
@@ -737,8 +767,9 @@ mod tests {
         );
     }
 
-    /// Test that vaults of the earlier versions (salts in the keychain) are
-    /// reported as outdated, a newer version or another magic as malformed
+    /// Test that only vaults of the earlier versions 1 and 2 (salts in the
+    /// keychain) are reported as outdated: any other version is unknown
+    /// (never "reset this device"), another magic malformed
     #[test]
     fn test_other_versions() {
         let kek = [3u8; 32];
@@ -749,9 +780,15 @@ mod tests {
             assert_eq!(open(&kek, &file).err(), Some(VaultErrors::Outdated));
         }
 
-        let mut newer = sealed(&kek, b"");
-        newer[8] = VERSION + 1;
-        assert_eq!(read_header(&newer).err(), Some(VaultErrors::Malformed));
+        for other in [0u8, VERSION + 1, u8::MAX] {
+            let mut file = sealed(&kek, b"");
+            file[8] = other;
+            assert_eq!(read_header(&file).err(), Some(VaultErrors::UnknownVersion));
+            assert_eq!(open(&kek, &file).err(), Some(VaultErrors::UnknownVersion));
+        }
+        // a truncated file of an unknown version isn't "outdated" either
+        let short = [MAGIC.as_slice(), &[0u8]].concat();
+        assert_eq!(read_header(&short).err(), Some(VaultErrors::UnknownVersion));
 
         let mut not_ours = sealed(&kek, b"");
         not_ours[0] ^= 1;
@@ -1021,6 +1058,41 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    /// Test that the Enhanced KEK runs Argon2 over both keys before HKDF, so
+    /// a guessed pair can't be tested with a cheap HKDF of two keys derived
+    /// once each (the reference is built by hand from the documented steps)
+    #[test]
+    fn test_enhanced_kek_runs_argon2() {
+        let enhanced = header(Mode::Enhanced);
+        let d_key = DataKey::from_bytes(&[9; 32]);
+        let a_key = AuthKey::from_bytes(&[7; 32]);
+        let kek = derive_kek(&enhanced, &d_key, Some(&a_key)).unwrap();
+
+        let ikm = [[9u8; 32], [7u8; 32]].concat();
+        let salt = Some(enhanced.storage_salt.as_slice());
+        let mut cheap = [0u8; 32];
+        SimpleHkdf::<Blake2s256>::new(salt, &ikm)
+            .expand(KEK_BOTH_LABEL, &mut cheap)
+            .unwrap();
+        assert_ne!(*kek, cheap, "the pair must not be testable with HKDF alone");
+
+        let both = derive_key(&ikm, &enhanced.storage_salt).unwrap();
+        let mut expected = [0u8; 32];
+        SimpleHkdf::<Blake2s256>::new(salt, both.as_slice())
+            .expand(KEK_BOTH_LABEL, &mut expected)
+            .unwrap();
+        assert_eq!(*kek, expected);
+    }
+
+    /// Test that a failed directory fsync after the file was replaced isn't
+    /// reported as a failed save (the new file is the vault already)
+    #[test]
+    fn test_after_replace_is_saved() {
+        assert_eq!(after_replace(Ok(())), Ok(()));
+        let failed = std::io::Error::other("fsync failed");
+        assert_eq!(after_replace(Err(failed)), Ok(()));
     }
 
     /// Test that unpadding is strict: length must fit, padding must be zeros

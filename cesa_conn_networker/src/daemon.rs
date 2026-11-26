@@ -657,6 +657,12 @@ impl Daemon {
                 );
                 return;
             }
+            Err(VaultErrors::UnknownVersion) => {
+                // not "outdated": a newer build's vault is never reset for it
+                error!(
+                    "the saved vault is of a version this build doesn't know (made by a newer cesaconn?): it stays locked and is left as is"
+                );
+            }
             // stays locked: unlocking will report the same problem
             Err(e) => error!(error = %e, "the saved vault can't be read"),
         }
@@ -703,7 +709,7 @@ impl Daemon {
         key.copy_from_slice(&d_key);
         drop(d_key);
 
-        match self.unlock_with(DataKey::new(key), None).await {
+        match self.unlock_with(DataKey::new(key)).await {
             Ok(()) => {
                 info!("vault unlocked by automatic login");
                 self.apply_network().await;
@@ -1727,6 +1733,79 @@ mod tests {
         let status = daemon.status().await;
         assert!(status.locked && status.enhanced && status.auto_login);
         assert!(storage.store.has(Item::DataKey).await);
+    }
+
+    /// Test that turning Enhanced on removes an automatic-login key the
+    /// daemon doesn't know about (a keychain read refused at start), and
+    /// that a failed removal refuses the switch and changes nothing
+    #[tokio::test]
+    async fn test_enhanced_removes_unknown_auto_login_key() {
+        let storage = TestStorage::new("enhanced-unknown-key");
+        let daemon = storage.daemon().await;
+        setup(&daemon).await;
+        let (_, d_key) = key_bytes(&daemon).await;
+        storage
+            .store
+            .items
+            .lock()
+            .await
+            .insert(Item::DataKey, Zeroizing::new(d_key.to_vec()));
+        assert!(!daemon.status().await.auto_login);
+
+        storage.store.fail_delete.store(true, Ordering::SeqCst);
+        assert_eq!(
+            ask(&daemon, Request::SetEnhanced(true)).await,
+            Err(DaemonError::StorageFailed)
+        );
+        assert!(!daemon.status().await.enhanced);
+        assert_eq!(std::fs::read(storage.path()).unwrap().get(9), Some(&0));
+        assert!(storage.store.has(Item::DataKey).await);
+
+        storage.store.fail_delete.store(false, Ordering::SeqCst);
+        ask(&daemon, Request::SetEnhanced(true)).await.unwrap();
+        assert!(daemon.status().await.enhanced);
+        assert!(!storage.store.has(Item::DataKey).await);
+
+        // without a keychain backend there is nothing to remove: allowed
+        let other = TestStorage::new("enhanced-no-keychain");
+        other.store.unsupported.store(true, Ordering::SeqCst);
+        let daemon = other.daemon().await;
+        setup(&daemon).await;
+        ask(&daemon, Request::SetEnhanced(true)).await.unwrap();
+        assert!(daemon.status().await.enhanced);
+    }
+
+    /// Test that every mode switch makes a new DEK, so the DEK of an older
+    /// copy of the file (recoverable with fewer passwords) doesn't open
+    /// what is saved after the switch, and the vault still opens
+    #[tokio::test]
+    async fn test_mode_switch_new_dek() {
+        let storage = TestStorage::new("enhanced-new-dek");
+        let daemon = storage.daemon().await;
+        setup(&daemon).await;
+        let dek =
+            async |daemon: &Arc<Daemon>| *daemon.keys.read().await.vault.as_ref().unwrap().dek;
+
+        let standard = dek(&daemon).await;
+        ask(&daemon, Request::SetEnhanced(true)).await.unwrap();
+        let enhanced = dek(&daemon).await;
+        assert_ne!(standard, enhanced);
+        drop(daemon);
+
+        let daemon = storage.daemon().await;
+        ask(&daemon, both(AUTH_PW, DATA_PW)).await.unwrap();
+        assert_eq!(dek(&daemon).await, enhanced);
+
+        ask(&daemon, Request::SetEnhanced(false)).await.unwrap();
+        let back = dek(&daemon).await;
+        assert!(back != enhanced && back != standard);
+        drop(daemon);
+
+        let daemon = storage.daemon().await;
+        ask(&daemon, Request::Unlock(update(DATA_PW)))
+            .await
+            .unwrap();
+        assert_eq!(dek(&daemon).await, back);
     }
 
     /// Test that a vault of an older version (salts in the keychain) is

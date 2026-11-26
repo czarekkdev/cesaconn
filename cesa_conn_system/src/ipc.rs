@@ -75,8 +75,12 @@
 //!   must be 0; unlock wait = seconds until an unlock is accepted again
 //!   after too many wrong passwords (0 = now).
 //!   Versions 2 to 4 were shorter, so a mismatched UI and daemon fail with
-//!   `Malformed`; versions 5 to 9 refuse the newer flags2 bits, so they fail
-//!   loudly too.
+//!   `Malformed`. The format has no version field: versions 5 to 9 refuse
+//!   a newer flags2 bit only when it is set. A v9 UI reading a v10 status
+//!   with bits 4 to 6 all 0 (Standard, not outdated, keychain present)
+//!   accepts it, and a v10 UI reading a v9 status offers Enhanced security,
+//!   which that daemon doesn't know and refuses. UI and
+//!   daemon are one build, so this only happens mid-update.
 //! * SetAuthPassword / SetDataPassword / Unlock / SetAutoLogin / SetSync /
 //!   AddDevice / AnswerPairing / JoinGroup / CancelJoin / StopAddDevice /
 //!   ForgetPeer / ResetDevice / SetClipboard / AddDeviceAt / JoinGroupAt /
@@ -274,8 +278,11 @@ pub enum DaemonError {
     WrongPassword = 0x04,
     /// The vault is locked: unlock it first.
     Locked = 0x05,
-    /// The vault file (or, for automatic login, the keychain) failed; the
-    /// change was not saved.
+    /// The vault file (or, for automatic login, the keychain) failed. Mostly
+    /// nothing was changed, but it can follow partial progress: a reset that
+    /// deleted the vault and cleared the keys but couldn't remove the
+    /// automatic-login key reports this too (sending the reset again
+    /// finishes the keychain cleanup).
     StorageFailed = 0x06,
     /// Nothing is saved yet (no vault), so there is nothing to unlock or log into.
     NotSaved = 0x07,

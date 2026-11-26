@@ -80,7 +80,9 @@ impl Daemon {
         let peers = self.encoded_peers().await?;
         let addresses = self.encoded_addresses().await;
 
-        let (file, new_wrap, auto_login) = {
+        // copies taken under the guard: the KEK may need Argon2 (Enhanced),
+        // which never runs while the key lock is held
+        let (header, dek, old_wrap, a_key, d_key, contents, auto_login) = {
             let keys = self.keys.read().await;
             let (Some(open), Some(a_key), Some(d_key)) = (&keys.vault, &keys.a_key, &keys.d_key)
             else {
@@ -92,25 +94,35 @@ impl Daemon {
                 KeyKind::Auth => (AuthKey::from_bytes(key), d_key.clone()),
                 KeyKind::Data => (a_key.clone(), DataKey::from_bytes(key)),
             };
-            let rewrap = matches!(kind, KeyKind::Data) || open.header.mode == Mode::Enhanced;
-            let wrapped = if rewrap {
-                let kek = kek_for(&open.header, &d_key, &a_key)?;
-                vault::wrap_dek(&open.header, &kek, &open.dek).map_err(storage_error)?
-            } else {
-                open.wrapped.clone()
-            };
-
             let contents = VaultContents {
                 a_key: stored_a_key(&open.header, &a_key),
                 config: open.config.encode(&addresses),
                 identity: open.identity.clone(),
                 peers,
             };
-            let file =
-                vault::seal(&open.header, &wrapped, &open.dek, &contents).map_err(storage_error)?;
-
-            (file, wrapped, keys.auto_login)
+            (
+                open.header.with_mode(open.header.mode),
+                open.dek.clone(),
+                open.wrapped.clone(),
+                a_key,
+                d_key,
+                contents,
+                keys.auto_login,
+            )
         };
+
+        let rewrap = matches!(kind, KeyKind::Data) || header.mode == Mode::Enhanced;
+        let new_wrap = if rewrap {
+            let kek = self
+                .kek(&header, &d_key, kek_a_key(&header, &a_key))
+                .await?
+                .map_err(storage_error)?;
+            vault::wrap_dek(&header, &kek, &dek).map_err(storage_error)?
+        } else {
+            old_wrap
+        };
+        let file = vault::seal(&header, &new_wrap, &dek, &contents).map_err(storage_error)?;
+        drop(contents);
 
         let path = storage.path.clone();
         blocking(move || vault::write_file_atomic(&path, &file))
@@ -238,11 +250,13 @@ impl Daemon {
         info!("keys saved in the encrypted vault");
     }
 
-    /// The saved vault's header (its mode and salts), for an unlock.
-    /// Refused at once when the daemon isn't locked, the vault is outdated,
-    /// or the unlock delay runs (before any Argon2, and not counted as
-    /// another guess).
-    async fn locked_header(&self) -> Result<Header, DaemonError> {
+    /// The saved vault file and its header (its mode and salts), for an
+    /// unlock: the keys are derived from this header and this same file is
+    /// opened, so a file replaced meanwhile can't turn a right password into
+    /// a counted wrong one. Refused at once when the daemon isn't locked,
+    /// the vault is outdated, or the unlock delay runs (before any Argon2,
+    /// and not counted as another guess).
+    async fn locked_file(&self) -> Result<(Header, Vec<u8>), DaemonError> {
         let Some(storage) = &self.storage else {
             return Err(DaemonError::NotSaved);
         };
@@ -272,28 +286,30 @@ impl Daemon {
             .await?
             .map_err(storage_error)?
             .ok_or(DaemonError::NotSaved)?;
-        vault::read_header(&file).map_err(storage_error)
+        let header = vault::read_header(&file).map_err(storage_error)?;
+        Ok((header, file))
     }
 
     /// Opens the saved vault with the data password (Standard mode).
     pub(super) async fn unlock(&self, update: PasswordUpdate) -> Result<(), DaemonError> {
-        let header = self.locked_header().await?;
+        let (header, file) = self.locked_file().await?;
         if header.mode == Mode::Enhanced {
             // the UI asks for both passwords; nothing is derived, no guess counted
             return Err(DaemonError::NeedsBothPasswords);
         }
 
         let d_key = self.derive(update, header.d_salt.clone()).await?;
-        let result = self.unlock_with(DataKey::new(d_key), None).await;
+        let result = self.open_file(&file, DataKey::new(d_key), None).await;
         self.count_unlock(&result).await;
         result
     }
 
     /// Opens the saved vault with both passwords (Enhanced mode). Both are
     /// derived before anything is tried, so a wrong one doesn't show which
-    /// of the two was wrong, and every attempt costs two Argon2 runs.
+    /// of the two was wrong, and every attempt costs three Argon2 runs (one
+    /// per password, one for the KEK over both keys).
     pub(super) async fn unlock_both(&self, passwords: JoinPasswords) -> Result<(), DaemonError> {
-        let header = self.locked_header().await?;
+        let (header, file) = self.locked_file().await?;
         if header.mode != Mode::Enhanced {
             return Err(DaemonError::BadRequest);
         }
@@ -302,7 +318,7 @@ impl Daemon {
         let a_key = self.derive(auth, header.a_salt.clone()).await?;
         let d_key = self.derive(data, header.d_salt.clone()).await?;
         let result = self
-            .unlock_with(DataKey::new(d_key), Some(AuthKey::new(a_key)))
+            .open_file(&file, DataKey::new(d_key), Some(AuthKey::new(a_key)))
             .await;
         self.count_unlock(&result).await;
         result
@@ -333,14 +349,8 @@ impl Daemon {
         }
     }
 
-    /// Opens the vault with `d_key` (typed password or automatic login),
-    /// and `a_key` in Enhanced mode. The file is read again here, so what
-    /// is opened is what is on disk now.
-    pub(super) async fn unlock_with(
-        &self,
-        d_key: DataKey,
-        a_key: Option<AuthKey>,
-    ) -> Result<(), DaemonError> {
+    /// Opens the vault on disk now with `d_key` (automatic login).
+    pub(super) async fn unlock_with(&self, d_key: DataKey) -> Result<(), DaemonError> {
         let Some(storage) = &self.storage else {
             return Err(DaemonError::NotSaved);
         };
@@ -350,14 +360,28 @@ impl Daemon {
             .await?
             .map_err(storage_error)?
             .ok_or(DaemonError::NotSaved)?;
-        let header = vault::read_header(&file).map_err(storage_error)?;
+        self.open_file(&file, d_key, None).await
+    }
 
-        let kek = vault::derive_kek(&header, &d_key, a_key.as_ref()).map_err(|e| match e {
-            // a Standard key for an Enhanced vault or the other way round
-            VaultErrors::WrongMode => DaemonError::NeedsBothPasswords,
-            other => storage_error(other),
-        })?;
-        let opened = vault::open(&kek, &file).map_err(storage_error)?;
+    /// Opens the vault `file` with `d_key`, and `a_key` in Enhanced mode,
+    /// and takes its keys and contents.
+    async fn open_file(
+        &self,
+        file: &[u8],
+        d_key: DataKey,
+        a_key: Option<AuthKey>,
+    ) -> Result<(), DaemonError> {
+        let header = vault::read_header(file).map_err(storage_error)?;
+
+        let kek = self
+            .kek(&header, &d_key, a_key.as_ref())
+            .await?
+            .map_err(|e| match e {
+                // a Standard key for an Enhanced vault or the other way round
+                VaultErrors::WrongMode => DaemonError::NeedsBothPasswords,
+                other => storage_error(other),
+            })?;
+        let opened = vault::open(&kek, file).map_err(storage_error)?;
         let peers = decode_peers(&opened.contents.peers).ok_or_else(|| {
             error!("saved trusted peers are damaged");
             DaemonError::StorageFailed
@@ -395,6 +419,33 @@ impl Daemon {
 
         info!("vault unlocked");
         Ok(())
+    }
+
+    /// The KEK of `header`'s mode, off the async workers. Enhanced mode runs
+    /// Argon2 (over both keys), so it takes the derive slot like every
+    /// Argon2: one at a time, even if this future is dropped.
+    async fn kek(
+        &self,
+        header: &Header,
+        d_key: &DataKey,
+        a_key: Option<&AuthKey>,
+    ) -> Result<Result<Zeroizing<[u8; 32]>, VaultErrors>, DaemonError> {
+        let slot = self
+            .derive_slot
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| DaemonError::Internal)?;
+
+        let header = header.with_mode(header.mode);
+        let d_key = d_key.clone();
+        let a_key = a_key.cloned();
+        blocking(move || {
+            let kek = vault::derive_kek(&header, &d_key, a_key.as_ref());
+            drop(slot);
+            kek
+        })
+        .await
     }
 
     /// Keeps `d_key` in the OS keychain (or removes it from there). Not in
@@ -446,9 +497,12 @@ impl Daemon {
     }
 
     /// Turns Enhanced mode on (both passwords at every start, `a_key` no
-    /// longer stored) or off. The DEK is re-wrapped under the new KEK and
-    /// the whole file re-sealed with the new header, so the file on disk is
-    /// always in exactly one mode. Refused while automatic login is on.
+    /// longer stored) or off. A new DEK is made, wrapped under the new KEK,
+    /// and the whole file re-sealed with the new header, so the file on
+    /// disk is always in exactly one mode, and the DEK of an older copy of
+    /// the file doesn't open the new one. Refused while automatic login is
+    /// on; turning it on first removes any automatic-login key the daemon
+    /// may not know about (refused if that removal fails).
     pub(super) async fn set_enhanced(&self, on: bool) -> Result<(), DaemonError> {
         let Some(storage) = &self.storage else {
             return Err(DaemonError::NotSaved);
@@ -458,7 +512,9 @@ impl Daemon {
         let peers = self.encoded_peers().await?;
         let addresses = self.encoded_addresses().await;
 
-        let (file, header, wrapped) = {
+        // copies taken under the guard: the Enhanced KEK needs Argon2, which
+        // never runs while the key lock is held
+        let (header, a_key, d_key, contents) = {
             let keys = self.keys.read().await;
             if keys.locked {
                 return Err(DaemonError::Locked);
@@ -475,19 +531,39 @@ impl Daemon {
             }
 
             let header = open.header.with_mode(mode);
-            let kek = kek_for(&header, d_key, a_key)?;
-            let wrapped = vault::wrap_dek(&header, &kek, &open.dek).map_err(storage_error)?;
             let contents = VaultContents {
                 a_key: stored_a_key(&header, a_key),
                 config: open.config.encode(&addresses),
                 identity: open.identity.clone(),
                 peers,
             };
-            let file =
-                vault::seal(&header, &wrapped, &open.dek, &contents).map_err(storage_error)?;
+            let copies = (header, a_key.clone(), d_key.clone(), contents);
             drop(keys);
-            (file, header, wrapped)
+            copies
         };
+
+        // a keychain read refused at start leaves `auto_login` off even if
+        // a key is still there: Enhanced keeps no key anywhere, so remove
+        // it now (removing a missing key is not an error)
+        if on && storage.store.supported() {
+            let store = storage.store.clone();
+            if let Err(e) = blocking(move || store.delete(Item::DataKey)).await? {
+                error!(error = %e, "Enhanced security not turned on: removing a possible automatic-login key failed");
+                return Err(DaemonError::StorageFailed);
+            }
+        }
+
+        let kek = self
+            .kek(&header, &d_key, kek_a_key(&header, &a_key))
+            .await?
+            .map_err(storage_error)?;
+        drop((a_key, d_key));
+        // a new DEK: an older copy of the file (and its DEK) doesn't open
+        // what is saved from now on
+        let dek = vault::generate_dek().map_err(storage_error)?;
+        let wrapped = vault::wrap_dek(&header, &kek, &dek).map_err(storage_error)?;
+        let file = vault::seal(&header, &wrapped, &dek, &contents).map_err(storage_error)?;
+        drop(contents);
 
         // saved first, kept second: a failed save changes nothing
         let path = storage.path.clone();
@@ -499,6 +575,7 @@ impl Daemon {
         if let Some(open) = keys.vault.as_mut() {
             open.header = header;
             open.wrapped = wrapped;
+            open.dek = dek;
         }
         drop(keys);
 
@@ -741,15 +818,10 @@ impl Daemon {
     }
 }
 
-/// The KEK of `header`'s mode from the keys in RAM: `d_key` alone
-/// (Standard) or both (Enhanced).
-fn kek_for(
-    header: &Header,
-    d_key: &DataKey,
-    a_key: &AuthKey,
-) -> Result<Zeroizing<[u8; 32]>, DaemonError> {
-    let a_key = (header.mode == Mode::Enhanced).then_some(a_key);
-    vault::derive_kek(header, d_key, a_key).map_err(storage_error)
+/// What the KEK of `header`'s mode takes of `a_key`: nothing (Standard)
+/// or all of it (Enhanced).
+fn kek_a_key<'a>(header: &Header, a_key: &'a AuthKey) -> Option<&'a AuthKey> {
+    (header.mode == Mode::Enhanced).then_some(a_key)
 }
 
 /// What the vault stores of `a_key`: all of it in Standard mode, nothing

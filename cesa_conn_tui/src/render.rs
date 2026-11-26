@@ -495,7 +495,7 @@ pub(super) fn render_edit_setting_popup(frame: &mut Frame, area: Rect, app: &App
         setting.kind,
         SettingKind::Secret { .. } | SettingKind::Locked
     );
-    let display_input = if is_secret {
+    let full_input = if is_secret {
         // one star per character, the byte length would leak more than the length
         "*".repeat(app.input_buf.chars().count())
     } else {
@@ -536,6 +536,8 @@ pub(super) fn render_edit_setting_popup(frame: &mut Frame, area: Rect, app: &App
         .min(area.width);
     let h = if hint.is_some() { 6u16 } else { 5u16 }.min(area.height);
     let popup = centered_rect(area, w, h);
+    // borders, the space before it and the cursor cell
+    let display_input = fit_tail(&full_input, w.saturating_sub(4));
 
     let mut lines = vec![Line::from(format!(" {display_input}"))];
     lines.extend(hint);
@@ -556,7 +558,7 @@ pub(super) fn render_edit_setting_popup(frame: &mut Frame, area: Rect, app: &App
         popup
             .x
             .saturating_add(2)
-            .saturating_add(to_u16(display_input.len())),
+            .saturating_add(to_u16(display_input.chars().count())),
         popup.y.saturating_add(1),
     ));
 }
@@ -624,12 +626,12 @@ pub(super) fn render_join_popup(frame: &mut Frame, area: Rect, step: JoinStep, a
         JoinStep::Auth => (" Join a group (1/2) ", "auth"),
         JoinStep::Data => (" Join a group (2/2) ", "data"),
     };
-    // one star per character, the byte length would leak more than the length
-    let stars = "*".repeat(app.input_buf.chars().count());
 
     let w = 64u16.min(area.width);
     let h = 8u16.min(area.height);
     let popup = centered_rect(area, w, h);
+    // borders, the indent and the cursor cell
+    let stars = stars_in(app, w.saturating_sub(5));
 
     let first = match app.join_at {
         Some(at) => format!("  Through {at}: Devices > n (Add device) there."),
@@ -727,12 +729,11 @@ pub(super) fn render_confirm_change_popup(frame: &mut Frame, area: Rect, kind: K
 
 /// The data password that unlocks the saved keys after a daemon restart.
 pub(super) fn render_unlock_popup(frame: &mut Frame, area: Rect, app: &App) {
-    // one star per character, the byte length would leak more than the length
-    let stars = "*".repeat(app.input_buf.chars().count());
-
     let w = 60u16.min(area.width);
     let h = 8u16.min(area.height);
     let popup = centered_rect(area, w, h);
+    // borders, the indent and the cursor cell
+    let stars = stars_in(app, w.saturating_sub(5));
 
     let lines = vec![
         Line::from(Span::styled(
@@ -938,6 +939,30 @@ pub(super) fn render_security_warning_popup(frame: &mut Frame, area: Rect, idx: 
     );
 }
 
+/// The end of `typed` that fits in `room` cells, so a long input stays on
+/// its one line and the cursor inside the popup: a leading `<` shows that
+/// the start scrolled out. The whole input is still what gets sent.
+pub(super) fn fit_tail(typed: &str, room: u16) -> String {
+    let room = usize::from(room);
+    let count = typed.chars().count();
+    if count <= room {
+        return typed.to_owned();
+    }
+    let keep = room.saturating_sub(1);
+    let tail: String = typed.chars().skip(count.saturating_sub(keep)).collect();
+    if room == 0 {
+        String::new()
+    } else {
+        format!("<{tail}")
+    }
+}
+
+/// One star per typed character (the byte length would leak more than the
+/// length), cut to `room` cells like [`fit_tail`].
+fn stars_in(app: &App, room: u16) -> String {
+    fit_tail(&"*".repeat(app.input_buf.chars().count()), room)
+}
+
 /// The red reason line of an unlock prompt: why the last try failed (an
 /// empty line when it didn't).
 fn unlock_error_line(app: &App) -> Line<'static> {
@@ -957,12 +982,11 @@ pub(super) fn render_unlock_both_popup(frame: &mut Frame, area: Rect, step: Join
         JoinStep::Auth => (" Unlock (1/2) ", "  Auth password:"),
         JoinStep::Data => (" Unlock (2/2) ", "  Data password:"),
     };
-    // one star per character, the byte length would leak more than the length
-    let stars = "*".repeat(app.input_buf.chars().count());
-
     let w = 60u16.min(area.width);
     let h = 9u16.min(area.height);
     let popup = centered_rect(area, w, h);
+    // borders, the indent and the cursor cell
+    let stars = stars_in(app, w.saturating_sub(5));
 
     let lines = vec![
         Line::from(Span::styled(
@@ -1020,6 +1044,12 @@ pub(super) fn render_confirm_enhanced_popup(frame: &mut Frame, area: Rect, on: b
             "  can't add a device to your group.",
         ] {
             lines.push(Line::from(Span::styled(text, yellow)));
+        }
+        for text in [
+            "  Older copies of the vault (backups) keep the old auth",
+            "  key: if there are any, change the auth password after.",
+        ] {
+            lines.push(Line::from(Span::styled(text, gray)));
         }
         if auto_login_on(app) {
             lines.push(Line::from(Span::styled(

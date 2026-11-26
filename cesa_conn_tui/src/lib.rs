@@ -2116,9 +2116,10 @@ mod tests {
 
         handle_settings_enter(&mut app);
         handle_confirm_enhanced_input(&mut app, KeyCode::Char('y'), true);
+        // automatic login off first even when the status says it is off
         assert!(matches!(
             app.outbox.as_slice(),
-            [Command::SetEnhanced(true)]
+            [Command::SetAutoLogin(false), Command::SetEnhanced(true)]
         ));
         // not shown on before the daemon says so
         assert_eq!(
@@ -2495,5 +2496,185 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Test that turning Enhanced on wins over a "turn automatic login on"
+    /// that isn't in the status yet (off is always sent first where there
+    /// is a keychain), and that nothing extra is sent without a keychain
+    #[test]
+    fn test_enhanced_wins_over_pending_auto_login() {
+        let mut app = App::new();
+        handle_link_event(&mut app, status_event(unlocked_saved()));
+        select(&mut app, AUTO_LOGIN_LABEL);
+        handle_settings_enter(&mut app);
+        let ActivePopup::SecurityWarning { idx } = app.active_popup.clone() else {
+            panic!("no automatic-login warning");
+        };
+        handle_security_warning_input(&mut app, KeyCode::Char('y'), idx);
+        assert!(matches!(
+            app.outbox.as_slice(),
+            [Command::SetAutoLogin(true)]
+        ));
+
+        // confirmed before the next refresh: the status still says off
+        select(&mut app, ENHANCED_LABEL);
+        handle_settings_enter(&mut app);
+        handle_confirm_enhanced_input(&mut app, KeyCode::Char('y'), true);
+        assert!(matches!(
+            app.outbox.as_slice(),
+            [
+                Command::SetAutoLogin(true),
+                Command::SetAutoLogin(false),
+                Command::SetEnhanced(true)
+            ]
+        ));
+
+        let mut app = App::new();
+        handle_link_event(
+            &mut app,
+            status_event(Status {
+                keychain_unavailable: true,
+                ..unlocked_saved()
+            }),
+        );
+        select(&mut app, ENHANCED_LABEL);
+        handle_settings_enter(&mut app);
+        handle_confirm_enhanced_input(&mut app, KeyCode::Char('y'), true);
+        assert!(matches!(
+            app.outbox.as_slice(),
+            [Command::SetEnhanced(true)]
+        ));
+    }
+
+    /// Test that an open unlock prompt follows the vault's mode: when a
+    /// locked status says the other mode (or an outdated vault), the prompt
+    /// is swapped and everything typed so far is wiped
+    #[test]
+    fn test_unlock_prompt_follows_mode() {
+        let mut app = App::new();
+        handle_link_event(&mut app, status_event(locked_enhanced()));
+        for c in "first auth".chars() {
+            press_both(&mut app, KeyCode::Char(c));
+        }
+        press_both(&mut app, KeyCode::Enter);
+        for c in "half".chars() {
+            press_both(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.active_popup, ActivePopup::UnlockBoth(JoinStep::Data));
+
+        let standard = Status {
+            enhanced: false,
+            ..locked_enhanced()
+        };
+        handle_link_event(&mut app, status_event(standard));
+        assert_eq!(app.active_popup, ActivePopup::Unlock);
+        assert!(app.join_auth.is_empty() && app.input_buf.is_empty());
+
+        for c in "typed".chars() {
+            handle_unlock_input(&mut app, KeyCode::Char(c));
+        }
+        handle_link_event(&mut app, status_event(locked_enhanced()));
+        assert_eq!(app.active_popup, ActivePopup::UnlockBoth(JoinStep::Auth));
+        assert!(app.input_buf.is_empty());
+
+        // the same mode again: left alone, nothing wiped
+        press_both(&mut app, KeyCode::Char('x'));
+        handle_link_event(&mut app, status_event(locked_enhanced()));
+        assert_eq!(app.input_buf.as_str(), "x");
+
+        handle_link_event(
+            &mut app,
+            status_event(Status {
+                vault_outdated: true,
+                ..locked_enhanced()
+            }),
+        );
+        assert_eq!(app.active_popup, ActivePopup::VaultOutdated);
+        assert!(app.input_buf.is_empty());
+    }
+
+    /// Test that the Enhanced popup tells keys that couldn't be saved apart
+    /// from passwords that aren't set yet
+    #[test]
+    fn test_enhanced_blocker_unsaved_keys() {
+        let mut app = App::new();
+        handle_link_event(
+            &mut app,
+            status_event(Status {
+                saved: false,
+                ..unlocked_saved()
+            }),
+        );
+        assert_eq!(
+            enhanced_blocker(&app),
+            Some("The keys couldn't be saved: see the daemon log.")
+        );
+
+        let mut app = App::new();
+        handle_link_event(
+            &mut app,
+            status_event(Status {
+                auth_key_set: true,
+                ..Status::default()
+            }),
+        );
+        assert_eq!(
+            enhanced_blocker(&app),
+            Some("Set both passwords first: nothing is saved yet.")
+        );
+    }
+
+    /// Test that a long password stays on its line in every password popup:
+    /// the key help is still there, the cursor inside the popup, the stars
+    /// end where the cursor is; the whole password is still what is sent
+    #[test]
+    fn test_long_password_stays_in_popup() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let long = "p".repeat(200);
+        for width in [60u16, 80, 120] {
+            for (status, help) in [
+                (locked_enhanced(), "Enter: next"),
+                (
+                    Status {
+                        enhanced: false,
+                        ..locked_enhanced()
+                    },
+                    "Enter: unlock",
+                ),
+            ] {
+                let mut app = App::new();
+                handle_link_event(&mut app, status_event(status));
+                for c in long.chars() {
+                    push_input(&mut app, c);
+                }
+                let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+                terminal.draw(|frame| ui(frame, &mut app)).unwrap();
+
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                assert!(text.contains(help), "{help} cut at width {width}");
+
+                let cursor = terminal.get_cursor_position().unwrap();
+                let buffer = terminal.backend().buffer();
+                let row: String = (0..width).map(|x| buffer[(x, cursor.y)].symbol()).collect();
+                assert!(row.contains("<*"), "no scroll mark at width {width}: {row}");
+                // the cell before the cursor is the last star, the cursor
+                // cell itself is inside the border
+                assert_eq!(buffer[(cursor.x.saturating_sub(1), cursor.y)].symbol(), "*");
+                assert_ne!(buffer[(cursor.x, cursor.y)].symbol(), "║");
+                assert!(row.chars().skip(usize::from(cursor.x)).any(|c| c == '║'));
+                assert_eq!(app.input_buf.chars().count(), 200);
+            }
+        }
+
+        assert_eq!(render::fit_tail("abc", 3), "abc");
+        assert_eq!(render::fit_tail("abcdef", 4), "<def");
+        assert_eq!(render::fit_tail("abcdef", 0), "");
     }
 }

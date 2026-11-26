@@ -142,7 +142,7 @@ These are Czarek's decisions. Every design and every PR must keep them.
 | Attacker who knows `pw1`, paired by a user who accepted the code | everything a paired device gets | plaintext data without `pw2` (see the offline-guess caveat in 18) |
 | Other local user | connect to sockets, read world-readable files | the IPC (uid gate), the vault (0700 dir, 0600 file), the keychain item |
 | Same-user local process | everything the user can do | **only stopped on macOS signed builds** (code-requirement gate); otherwise out of scope, see 3.3 |
-| Thief of the disk / backups | the vault file (its salts are in it) | contents without `pw2`; each offline guess costs a full Argon2 run (64 MiB), so a 12+ character pw2 is the defence. Standard mode: cracking pw2 also gives `a_key`. Enhanced mode: only a guess of **both** passwords at once opens it, and `a_key` is never in the file (18.2) |
+| Thief of the disk / backups | the vault file (its salts are in it) | contents without `pw2`; each offline guess costs a full Argon2 run (64 MiB), so a 12+ character pw2 is the defence. Standard mode: cracking pw2 also gives `a_key`. Enhanced mode: only a guess of **both** passwords together opens it, each guessed pair costing a full Argon2 run of its own (6.7), and `a_key` is never in the file (18.2). An older copy of the file (from before Enhanced was turned on) still holds the old `a_key`: change pw1 after turning Enhanced on (6.7) |
 | Quantum attacker recording traffic today ("harvest now") | break X25519 / Ed25519 later | session keys and data (protected by ML-KEM-1024 in the PSK); **not** the SPAKE2 password-guess resistance, see 18 |
 
 ### 3.3 Out of scope
@@ -368,12 +368,15 @@ no vault):
    `BadRequest`;
 3. `d_key = Argon2id(pw2, d_salt)` (Enhanced: also `a_key = Argon2id(pw1,
    a_salt)`, both derived before anything is tried), `KEK = HKDF(...)`
-   (8.3), open the vault;
+   (Enhanced: over a third Argon2 of both keys, 8.3), open the vault. The
+   keys are derived from the header of the file read in step 2 and that
+   same copy is opened, so a vault replaced on disk meanwhile can't turn a
+   right password into a counted wrong one;
 4. wrong password = the DEK wrap fails its GCM tag -> `WrongPassword`, the
    counter goes up and the next attempt is refused for `unlock_delay(failures)`:
    the first 5 attempts run back to back, after the 5th wrong password it is
    1 s, doubling to 60 s. In Enhanced mode one attempt is one count (and
-   costs two Argon2 runs), and the answer doesn't say which of the two
+   costs three Argon2 runs), and the answer doesn't say which of the two
    passwords was wrong: the KEK mixes both. A damaged file is
    `StorageFailed`, never `WrongPassword`;
 5. success: load `a_key` (Standard: from the vault; Enhanced: the derived
@@ -455,20 +458,41 @@ decision: Standard by default, Enhanced offered as recommended).
   stored inside it.
 - **Enhanced**: both passwords at every daemon start. `a_key` is never
   stored: it is derived from `pw1` at unlock and lives in RAM only, like
-  `d_key`. The KEK is `HKDF(d_key || a_key, storage salt,
-  "cesaconn-storage-both-v1")`, so the vault opens only with both, and an
-  offline attack on a stolen file has to guess both passwords **at once**
-  (the cost multiplies; there is no check for one of them alone). Learning
-  `pw2` alone no longer gives the auth key: the two-key independence holds
-  at rest (18.2).
+  `d_key`. The KEK is `HKDF(Argon2id(d_key || a_key, storage salt),
+  storage salt, "cesaconn-storage-both-v1")`, so the vault opens only with
+  both, and there is no check for one of them alone. The extra Argon2 is
+  what makes the cost multiply: without it an attacker with N candidates
+  for pw1 and M for pw2 would run Argon2 only N + M times and test the
+  N x M pairs with a cheap HKDF and a GCM tag. With it every pair costs a
+  full Argon2 run (64 MiB) of its own. An unlock costs three Argon2 runs
+  (pw1, pw2, the pair); so does a password change in Enhanced mode (one
+  for the new password, one for the new pair). Learning `pw2` alone no
+  longer gives the auth key: the two-key independence holds at rest
+  (18.2).
 
 `SetEnhanced(on)` needs an open, saved vault (`Locked` / `NotSaved`
-otherwise). It re-wraps the DEK under the new mode's KEK and re-seals the
-whole file with the new header (with or without `a_key`), saved first and
-kept second, so the file on disk is always in exactly one mode. Setting the
-mode it already has does nothing. Turning it on while automatic login is on
-is `AutoLoginConflict`: Enhanced keeps no key anywhere, and the two can't
-both be on (the TUI turns automatic login off first when the user confirms).
+otherwise). It makes a **new DEK**, wraps it under the new mode's KEK and
+re-seals the whole file with the new header (with or without `a_key`),
+saved first and kept second, so the file on disk is always in exactly one
+mode. Setting the mode it already has does nothing. Turning it on while
+automatic login is on is `AutoLoginConflict`: Enhanced keeps no key
+anywhere, and the two can't both be on. The TUI always sends "automatic
+login off" first when the user confirms (where there is a keychain), so
+it also wins over a "turn automatic login on" sent a moment ago and not in
+the status yet. Turning it on also removes the automatic-login key from
+the keychain before saving, even when the daemon thinks there is none (a
+keychain read refused at start leaves `auto_login` off while a key may
+still be there); removing a missing key is not an error, and if the
+removal fails the switch is refused with `StorageFailed` and nothing
+changes. Without a keychain backend there is nothing to remove.
+
+Older copies of the vault file (a backup, a disk image) are not touched by
+the switch. A Standard-mode copy still holds `a_key`, so with it and `pw2`
+someone gets `a_key` and the old DEK. The new DEK means that old DEK
+doesn't open anything saved after the switch, but the old `a_key` is still
+the auth key until pw1 changes. **After turning Enhanced on, change the
+auth password (on every device of the group) if older copies of the vault
+may exist.** The TUI's confirm popup says so.
 
 The TUI asks first in both directions: on says what it gives, off says
 that the data password alone then unlocks the device again and can add a
@@ -721,8 +745,10 @@ data nonce (12) || AES-256-GCM(DEK, plaintext) (n*4096 + 16)  AAD = header || "c
 
 - mode: `0x00` Standard (KEK = `HKDF-BLAKE2s(ikm = d_key, salt = storage
   salt, info = "cesaconn-storage-v1")`), `0x01` Enhanced (KEK =
-  `HKDF-BLAKE2s(ikm = d_key || a_key, salt = storage salt, info =
-  "cesaconn-storage-both-v1")`); anything else is `Malformed`.
+  `HKDF-BLAKE2s(ikm = Argon2id(d_key || a_key, storage salt), salt =
+  storage salt, info = "cesaconn-storage-both-v1")`, with the protocol's
+  Argon2 parameters, so a guessed pair costs a full Argon2 run, 6.7);
+  anything else is `Malformed`.
 - The header is readable without any key (`read_header`): the daemon needs
   the mode and the salts before it can derive anything. It is
   authenticated: it is the AAD of both layers, and the wrapped DEK is bound
@@ -758,15 +784,26 @@ data nonce (12) || AES-256-GCM(DEK, plaintext) (n*4096 + 16)  AAD = header || "c
 - The only plaintext on disk is the header (format metadata, the mode, the
   three salts), nonces and ciphertexts. No key, config value or content
   length.
-- Versions 1 and 2 are `Outdated` (the daemon reports `vault_outdated`, 6.2);
-  a newer version is `Malformed`. There is no migration (his decision: the
-  app is in testing, he resets his devices).
+- Versions 1 and 2 are `Outdated` (the daemon reports `vault_outdated`, 6.2,
+  and the UI says to reset). Every other version (0, 4 and up) is
+  `UnknownVersion`: the daemon stays locked, logs that it doesn't know the
+  version (made by a newer build?) and never says "outdated" or deletes
+  anything; unlocking it is `StorageFailed`. There is no migration (his
+  decision: the app is in testing, he resets his devices).
 
 Reading: the directory is re-checked; the file must be a regular file of ours
 with no group/other bits and at most 4 MiB, checked before reading and bounded
 while reading. Writing: a new `0600` temp file with a random name in the same
 directory (`create_new`), written, fsynced, renamed over the old file, then
-the directory is fsynced; a failed write removes the temp file.
+the directory is fsynced; a failed write removes the temp file. An error
+before the rename means the old file is still the vault and nothing
+changed. Once the rename is done the new file is the vault: a failed
+directory fsync after it only logs a warning (a power cut might still undo
+the change) and counts as saved, so the daemon's keys, header and wrap in
+RAM always follow what is on disk (a mode switch reported as failed while
+its file was in place would have left RAM in the old mode, and the next
+save would have written that back). Deleting the file (a reset) works the
+same way.
 
 Errors: a failed DEK unwrap is `WrongKey` (the only place a wrong password
 shows); a DEK that unwraps but contents that don't decrypt or parse is
@@ -780,10 +817,15 @@ with details only in the daemon log.
   speed (64 MiB per guess): the salts are in the file now, the keychain is
   no longer a second thing to steal (his decision, 2026-11-26). Hence the
   12-character minimum; a strength hint in the UI is **[planned]**. Enhanced
-  mode raises this to guessing both passwords at once.
+  mode raises this to guessing both passwords together, a full Argon2 run
+  per guessed pair (6.7).
+- Turning Enhanced on doesn't reach older copies of the file: a Standard
+  copy and `pw2` still give the `a_key` of that time (the DEK is new, so it
+  opens nothing saved later). Changing pw1 afterwards closes this (6.7).
 - Standard mode: cracking `pw2` from the vault also yields `a_key` (it is
   inside), so at rest the two passwords are not independent: see section
-  18. Enhanced mode closes this.
+  18. Enhanced mode closes this (for older copies of the file only once pw1
+  is changed, 6.7).
 - The salts identify the group: whoever has the file can tell which group
   it belongs to (`a_salt` is the group identifier, 11.4). It gives no
   offline test of pw1.
@@ -1816,9 +1858,12 @@ Tests (`cargo test --workspace --all-features`):
 - IPC: framing bounds, strict decoding, decoders on random input, peer gates
   and code requirements over real sockets, socket permissions, stale and
   foreign socket files;
-- vault: format, the header readable without a key, older versions
-  `Outdated`, both modes (the Enhanced KEK needs both keys, either one alone
-  or the Standard KEK fails, `a_key` never in an Enhanced file), contents
+- vault: format, the header readable without a key, only versions 1 and 2
+  `Outdated` (0, newer and truncated ones `UnknownVersion`), both modes (the
+  Enhanced KEK needs both keys, either one alone or the Standard KEK fails,
+  it runs Argon2 over the pair and isn't a plain HKDF of the two keys,
+  `a_key` never in an Enhanced file), a failed directory fsync after the
+  rename counts as saved, contents
   that don't fit the mode refused both ways, the wrap bound to the header,
   padding, tampering (every byte, the salts and the mode included), sizes,
   atomic writes, deletion, directory checks;
@@ -1827,7 +1872,12 @@ Tests (`cargo test --workspace --all-features`):
   popup why the daemon would refuse), automatic login shown as excluded or
   unsupported, the two-step unlock prompt (exact passwords, wiped, never
   logged, Esc wipes both, the red reason after a wrong password), the
-  outdated-vault notice, every new popup whole at 60, 80 and 120 columns.
+  outdated-vault notice, every new popup whole at 60, 80 and 120 columns;
+  an open unlock prompt swapped (and wiped) when the vault's mode changes,
+  automatic login off sent first even when the status still says off
+  (and not at all without a keychain), keys that couldn't be saved told
+  apart from passwords not set yet, a 200-character password on one line
+  in the unlock prompts (help visible, cursor inside the popup).
 
 Every new protection gets a test that fails without it.
 
@@ -1886,7 +1936,9 @@ Stated plainly so nobody relies on a property that isn't there.
    enough, its salts are in it) also yields `a_key`. Enhanced security
    (6.7) closes this: `a_key` isn't stored and the vault opens only with
    both passwords, guessed together. It is off by default (his decision),
-   so a device is in Standard mode until the user turns it on.
+   so a device is in Standard mode until the user turns it on. Older
+   Standard copies of the file still hold the `a_key` of their time until
+   pw1 is changed (6.7).
 3. **Two-key independence and offline guesses on the wire.** A device that
    knows `pw1`, was paired by a user who accepted the code, and has `d_salt`
    (a joining device gets it, 11.5) receives `d_key`-layer
@@ -2026,11 +2078,18 @@ Decided:
   weakness); the items after them were renumbered.
 
 Proposed in the own-vault-salts / Enhanced security PR, for his review:
-- Enhanced mode makes the KEK from both keys (`HKDF(d_key || a_key)`)
-  instead of storing a check value of `a_key` (what was discussed first):
-  no check value means no offline test of pw1 for someone who already
-  cracked pw2, and an offline attack must guess both at once. The cost: a
+- Enhanced mode makes the KEK from both keys instead of storing a check
+  value of `a_key` (what was discussed first): no check value means no
+  offline test of pw1 for someone who already cracked pw2. The cost: a
   wrong unlock can't say which of the two passwords was wrong (6.4);
+- after CodeRabbit's review (his decision): the Enhanced KEK runs one more
+  Argon2 over both keys (`HKDF(Argon2id(d_key || a_key))`), because a plain
+  `HKDF(d_key || a_key)` let an attacker test N x M guessed pairs with only
+  N + M Argon2 runs. Unlock now costs three Argon2 runs (6.7);
+- every mode switch makes a new DEK, and turning Enhanced on removes a
+  possible automatic-login key first (refused if that fails); older copies
+  of the file are documented, with "change pw1 afterwards" as the way to
+  close them (6.7);
 - `a_salt` moves into the header too (not only `d_salt` and the storage
   salt): Enhanced mode needs it before the vault is open, and it is public
   anyway (a joining device fetches it, 11.4). One header layout for both

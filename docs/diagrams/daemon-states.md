@@ -46,7 +46,7 @@ flowchart TB
     wait -- yes --> delayed["UnlockDelayed at once<br/>(no file read, no Argon2, not counted)"]
     wait -- no --> mode{"request fits the<br/>header's mode?"}
     mode -- no --> wrongreq["Unlock on Enhanced: NeedsBothPasswords<br/>UnlockBoth on Standard: BadRequest<br/>(no Argon2, not counted)"]
-    mode -- yes --> derive["d_key = Argon2id(pw2, d_salt)<br/>Enhanced: also a_key = Argon2id(pw1, a_salt)<br/>KEK = HKDF(d_key [|| a_key], storage salt)"]
+    mode -- yes --> derive["d_key = Argon2id(pw2, d_salt)<br/>Enhanced: also a_key = Argon2id(pw1, a_salt)<br/>Standard: KEK = HKDF(d_key, storage salt)<br/>Enhanced: KEK = HKDF(Argon2id(d_key || a_key))"]
     derive --> open{"DEK unwraps?"}
     open -- yes --> ok["Open: counter and delay reset"]
     open -- no --> wrong["WrongPassword, failures + 1 (one per attempt,<br/>never says which password)<br/>after 5: next not before 1 s,<br/>doubling up to 60 s"]

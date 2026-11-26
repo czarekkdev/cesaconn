@@ -81,7 +81,9 @@ supported yet, see `docs/design/daemon.md`):
 - **Enhanced security** (recommended, off by default): Settings > Enhanced
   security. Both passwords at every start, and the auth key is never saved,
   so someone who learns your data password still can't add a device to
-  your group. It can't be on together with automatic login;
+  your group. It can't be on together with automatic login. If older
+  copies of the vault may exist (backups, disk images), change the auth
+  password afterwards: those copies still hold the old auth key;
 - two of your devices find each other on the local network, authenticate
   (SPAKE2 + post-quantum hybrid key exchange + Noise) and pair once after
   you compare an 8-emoji code on both screens;
@@ -134,6 +136,12 @@ Updating from a version before the vault kept its own salts: the old saved
 keys can't be opened (the TUI says so). Reset the device (below) and join
 your group again; on macOS also remove the old keychain item once:
 `security delete-generic-password -s dev.czarekk.cesaconn -a salts`.
+Joining needs a device that is already in the group, so update one device
+first, reset it and set both passwords again (that starts a new group with
+new salts), then reset each other device and join it to that one, pairing
+again. If every device was updated and reset before any rejoined, there is
+no member of the old group left: do the same, the first device starts the
+new group.
 
 Managing devices:
 

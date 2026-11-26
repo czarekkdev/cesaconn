@@ -16,16 +16,21 @@ flowchart LR
     d_argon --> d_key["d_key<br/>data layer + vault"]
 
     d_key --> hkdf["HKDF-BLAKE2s"]
-    a_key -. "Enhanced mode only:<br/>ikm = d_key || a_key" .-> hkdf
+    d_key -. "Enhanced mode only" .-> both_argon["Argon2id 64 MiB<br/>over d_key || a_key"]
+    a_key -. "Enhanced mode only" .-> both_argon
+    both_argon -. "ikm instead of d_key" .-> hkdf
     s_salt["storage salt<br/>(this device)"] --> hkdf
+    s_salt --> both_argon
     hkdf --> kek["KEK"]
     kek -- "AES-256-GCM wraps" --> dek["DEK (random)"]
     dek -- "AES-256-GCM seals" --> contents["vault contents"]
 ```
 
 Standard mode: `KEK = HKDF(d_key, storage salt, "cesaconn-storage-v1")`.
-Enhanced mode: `KEK = HKDF(d_key || a_key, storage salt,
-"cesaconn-storage-both-v1")`, so only both passwords together open it.
+Enhanced mode: `KEK = HKDF(Argon2id(d_key || a_key, storage salt), storage
+salt, "cesaconn-storage-both-v1")`, so only both passwords together open
+it, and every guessed pair costs a full Argon2 run of its own (without the
+extra Argon2, N guesses of pw1 and M of pw2 would need only N + M runs).
 
 ## What is stored where
 
@@ -49,7 +54,9 @@ The file alone is enough for an offline guess (its salts are in it), at a
 full Argon2 run per guess: that is why new passwords need 12 characters.
 Standard mode: cracking `pw2` also gives `a_key` (it is inside, 18.2).
 Enhanced mode: `a_key` isn't in the file and a guess must get both
-passwords right at once.
+passwords right together, one Argon2 run per guessed pair. An older
+Standard copy of the file still holds the `a_key` of its time: change pw1
+after turning Enhanced on.
 
 ## First setup: creating the vault
 
@@ -90,7 +97,11 @@ flowchart LR
     open -- yes --> same{"already<br/>that mode?"}
     same -- yes --> done["Done, nothing written"]
     same -- no --> auto{"turning on and<br/>automatic login on?"}
-    auto -- yes --> conflict["AutoLoginConflict<br/>(the TUI turns automatic login off first)"]
-    auto -- no --> rewrap["new header (mode byte), KEK for the new mode,<br/>re-wrap the same DEK, re-seal with / without a_key"]
+    auto -- yes --> conflict["AutoLoginConflict<br/>(the TUI always sends automatic login off first)"]
+    auto -- no --> kc{"turning on and<br/>a keychain here?"}
+    kc -- yes --> del{"remove the automatic-login key<br/>(missing is fine)"}
+    del -- failed --> storage["StorageFailed, nothing changed"]
+    del -- ok --> rewrap
+    kc -- no --> rewrap["new header (mode byte), KEK for the new mode,<br/>a NEW DEK wrapped under it, re-seal with / without a_key"]
     rewrap --> write["write atomically, then keep<br/>(saved first, kept second)"]
 ```

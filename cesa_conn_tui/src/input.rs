@@ -247,7 +247,8 @@ pub(super) fn handle_confirm_change_input(app: &mut App, code: KeyCode) {
 /// waits for the next refresh): one password, or both with Enhanced
 /// security; for an outdated vault it says why nothing can be typed.
 /// Closes it when the vault got unlocked some other way (automatic login,
-/// another UI).
+/// another UI), and swaps it (wiping what was typed) when the vault's mode
+/// changed while it was open.
 pub(super) fn ask_unlock(app: &mut App, status: &Status) {
     let unlock_open = matches!(
         app.active_popup,
@@ -266,6 +267,20 @@ pub(super) fn ask_unlock(app: &mut App, status: &Status) {
             app.active_popup = ActivePopup::None;
         }
         return;
+    }
+
+    // an open prompt that no longer fits the vault: closed and wiped, the
+    // right one opens below
+    let fits = match app.active_popup {
+        ActivePopup::Unlock => !status.enhanced && !status.vault_outdated,
+        ActivePopup::UnlockBoth(_) => status.enhanced && !status.vault_outdated,
+        _ => true,
+    };
+    if !fits {
+        clear_input(app);
+        app.join_auth.zeroize();
+        app.active_popup = ActivePopup::None;
+        app.unlock_asked = false;
     }
 
     if app.unlock_asked || app.active_popup != ActivePopup::None {
@@ -354,11 +369,19 @@ pub(super) fn auto_login_on(app: &App) -> bool {
     matches!(&app.daemon, DaemonState::Up(status) if status.auto_login)
 }
 
+/// Whether there is a keychain for automatic login here at all.
+fn keychain_here(app: &App) -> bool {
+    matches!(&app.daemon, DaemonState::Up(status) if !status.keychain_unavailable)
+}
+
 /// Why the daemon would refuse to change Enhanced security right now
 /// (shown in the popup, where the user is looking), if it would.
 pub(super) fn enhanced_blocker(app: &App) -> Option<&'static str> {
     match &app.daemon {
         DaemonState::Up(status) if status.locked => Some("Unlock the saved keys first."),
+        DaemonState::Up(status) if !status.saved && status.auth_key_set && status.data_key_set => {
+            Some("The keys couldn't be saved: see the daemon log.")
+        }
         DaemonState::Up(status) if !status.saved => {
             Some("Set both passwords first: nothing is saved yet.")
         }
@@ -368,14 +391,17 @@ pub(super) fn enhanced_blocker(app: &App) -> Option<&'static str> {
 }
 
 /// y: turn Enhanced security on (automatic login off first, the two
-/// can't both be on) or off, unless the daemon would refuse (the popup
-/// says why and stays open); anything that cancels: nothing changes.
+/// can't both be on: always sent where there is a keychain, since a change
+/// sent a moment ago may not be in the status yet) or off, unless the
+/// daemon would refuse (the popup says why and stays open); anything that
+/// cancels: nothing changes.
 pub(super) fn handle_confirm_enhanced_input(app: &mut App, code: KeyCode, on: bool) {
     match code {
         KeyCode::Char('y') | KeyCode::Char('Y') if enhanced_blocker(app).is_some() => {}
         KeyCode::Char('y') | KeyCode::Char('Y') => {
-            if on && auto_login_on(app) {
-                // sent in order by the one link worker
+            if on && keychain_here(app) {
+                // sent in order by the one link worker, so it also wins over
+                // a "turn automatic login on" still on its way
                 app.outbox.push(Command::SetAutoLogin(false));
             }
             app.outbox.push(Command::SetEnhanced(on));
