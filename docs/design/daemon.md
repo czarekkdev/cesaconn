@@ -142,7 +142,7 @@ These are Czarek's decisions. Every design and every PR must keep them.
 | Attacker who knows `pw1`, paired by a user who accepted the code | everything a paired device gets | plaintext data without `pw2` (see the offline-guess caveat in 18) |
 | Other local user | connect to sockets, read world-readable files | the IPC (uid gate), the vault (0700 dir, 0600 file), the keychain item |
 | Same-user local process | everything the user can do | **only stopped on macOS signed builds** (code-requirement gate); otherwise out of scope, see 3.3 |
-| Thief of the disk / backups | the vault file (its salts are in it) | contents without `pw2`; each offline guess costs a full Argon2 run (64 MiB), so a 12+ character pw2 is the defence. Standard mode: cracking pw2 also gives `a_key`. Enhanced mode: only a guess of **both** passwords together opens it, each guessed pair costing a full Argon2 run of its own (6.7), and `a_key` is never in the file (18.2). An older copy of the file (from before Enhanced was turned on) still holds the old `a_key`: change pw1 after turning Enhanced on (6.7) |
+| Thief of the disk / backups | the vault file (its salts are in it) | contents without `pw2`; each offline guess costs a full Argon2 run (64 MiB), so a 12+ character pw2 is the defence. Standard mode: cracking pw2 also gives `a_key`. Enhanced mode: only a guess of **both** passwords together opens it, each guessed pair costing a full Argon2 run of its own (6.7), and `a_key` is never in the file (18.2). An older Standard copy of the file still holds `a_key`: with it and pw2 the current Enhanced vault opens too, until pw1 is changed after turning Enhanced on (6.7) |
 | Quantum attacker recording traffic today ("harvest now") | break X25519 / Ed25519 later | session keys and data (protected by ML-KEM-1024 in the PSK); **not** the SPAKE2 password-guess resistance, see 18 |
 
 ### 3.3 Out of scope
@@ -488,11 +488,15 @@ changes. Without a keychain backend there is nothing to remove.
 
 Older copies of the vault file (a backup, a disk image) are not touched by
 the switch. A Standard-mode copy still holds `a_key`, so with it and `pw2`
-someone gets `a_key` and the old DEK. The new DEK means that old DEK
-doesn't open anything saved after the switch, but the old `a_key` is still
-the auth key until pw1 changes. **After turning Enhanced on, change the
-auth password (on every device of the group) if older copies of the vault
-may exist.** The TUI's confirm popup says so.
+someone gets `a_key` and `d_key`. **Those two keys also open the current
+Enhanced vault** (its KEK is made from exactly them), so until pw1 changes,
+a Standard backup plus pw2 is as good as both passwords. The new DEK only
+means the old copy's DEK alone opens nothing saved later; it does not close
+this. Changing the auth password does: a new `a_key` gives a new KEK, and
+the backup's `a_key` opens nothing and authenticates nothing. **After
+turning Enhanced on, change the auth password (on every device of the
+group) if older copies of the vault may exist.** The TUI's confirm popup
+says so.
 
 The TUI asks first in both directions: on says what it gives, off says
 that the data password alone then unlocks the device again and can add a
@@ -820,8 +824,9 @@ with details only in the daemon log.
   mode raises this to guessing both passwords together, a full Argon2 run
   per guessed pair (6.7).
 - Turning Enhanced on doesn't reach older copies of the file: a Standard
-  copy and `pw2` still give the `a_key` of that time (the DEK is new, so it
-  opens nothing saved later). Changing pw1 afterwards closes this (6.7).
+  copy and `pw2` still give that `a_key` and `d_key`, and those open the
+  Enhanced vault too, until pw1 changes (the new DEK doesn't prevent it).
+  Changing pw1 afterwards closes this (6.7).
 - Standard mode: cracking `pw2` from the vault also yields `a_key` (it is
   inside), so at rest the two passwords are not independent: see section
   18. Enhanced mode closes this (for older copies of the file only once pw1
@@ -1936,9 +1941,9 @@ Stated plainly so nobody relies on a property that isn't there.
    enough, its salts are in it) also yields `a_key`. Enhanced security
    (6.7) closes this: `a_key` isn't stored and the vault opens only with
    both passwords, guessed together. It is off by default (his decision),
-   so a device is in Standard mode until the user turns it on. Older
-   Standard copies of the file still hold the `a_key` of their time until
-   pw1 is changed (6.7).
+   so a device is in Standard mode until the user turns it on. An older
+   Standard copy of the file plus pw2 still gives both keys, which open the
+   Enhanced vault too, until pw1 is changed (6.7).
 3. **Two-key independence and offline guesses on the wire.** A device that
    knows `pw1`, was paired by a user who accepted the code, and has `d_salt`
    (a joining device gets it, 11.5) receives `d_key`-layer

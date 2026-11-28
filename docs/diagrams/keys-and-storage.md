@@ -55,8 +55,8 @@ full Argon2 run per guess: that is why new passwords need 12 characters.
 Standard mode: cracking `pw2` also gives `a_key` (it is inside, 18.2).
 Enhanced mode: `a_key` isn't in the file and a guess must get both
 passwords right together, one Argon2 run per guessed pair. An older
-Standard copy of the file still holds the `a_key` of its time: change pw1
-after turning Enhanced on.
+Standard copy of the file still holds `a_key`, and with pw2 it opens the
+Enhanced vault too: change pw1 after turning Enhanced on.
 
 ## First setup: creating the vault
 
