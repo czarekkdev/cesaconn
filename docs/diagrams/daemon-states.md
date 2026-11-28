@@ -7,7 +7,7 @@ change checks that again.
 ```mermaid
 stateDiagram-v2
     [*] --> Fresh: no vault file
-    [*] --> Locked: vault file found
+    [*] --> Locked: vault file found (its header gives the mode, or shows an older version)
     Fresh --> Joining: JoinGroup / JoinGroupAt (pw1, pw2)
     Joining --> Fresh: cancel, 5 min, 5 attempts used up, before a commit started (passwords wiped)
     Joining --> Open: paired, both salts received, vault created with Sync on (a cancel or the 5 min after the commit started don't stop it)
@@ -16,9 +16,9 @@ stateDiagram-v2
     Partial --> Open: second key set, vault created
     Partial --> RamOnly: second key set, no storage or the save failed
     RamOnly --> Open: next successful key change creates the vault
-    Locked --> Open: Unlock(pw2) or automatic login
-    Locked --> Locked: wrong pw2 (delay after 5 failures)
-    Open --> Open: SetAuth / SetData (re-seal) / SetAutoLogin / SetClipboard
+    Locked --> Open: Unlock(pw2), UnlockBoth(pw1, pw2) in Enhanced mode, or automatic login (Standard only)
+    Locked --> Locked: wrong password (delay after 5 failures)
+    Open --> Open: SetAuth / SetData (re-seal) / SetAutoLogin / SetEnhanced / SetClipboard
     Open --> Fresh: ResetDevice
     Locked --> Fresh: ResetDevice
     Open --> [*]: Ctrl-C (RAM wiped)
@@ -36,14 +36,18 @@ flowchart LR
     check -- no --> off["networking off:<br/>token cancelled, connections end,<br/>Add device window closes,<br/>waiting pairings rejected"]
 ```
 
-## Unlock delay
+## Unlock
 
 ```mermaid
 flowchart TB
-    u["Unlock(pw2)"] --> wait{"inside the<br/>delay?"}
-    wait -- yes --> delayed["UnlockDelayed at once<br/>(no keychain, no Argon2, not counted)"]
-    wait -- no --> derive["d_key = Argon2id(pw2, d_salt)<br/>KEK = HKDF(d_key, storage salt)"]
+    u["Unlock(pw2) / UnlockBoth(pw1, pw2)"] --> old{"outdated<br/>vault?"}
+    old -- yes --> outdated["VaultOutdated at once<br/>(no Argon2, not counted; only a reset helps)"]
+    old -- no --> wait{"inside the<br/>delay?"}
+    wait -- yes --> delayed["UnlockDelayed at once<br/>(no file read, no Argon2, not counted)"]
+    wait -- no --> mode{"request fits the<br/>header's mode?"}
+    mode -- no --> wrongreq["Unlock on Enhanced: NeedsBothPasswords<br/>UnlockBoth on Standard: BadRequest<br/>(no Argon2, not counted)"]
+    mode -- yes --> derive["d_key = Argon2id(pw2, d_salt)<br/>Enhanced: also a_key = Argon2id(pw1, a_salt)<br/>Standard: KEK = HKDF(d_key, storage salt)<br/>Enhanced: KEK = HKDF(Argon2id(d_key || a_key))"]
     derive --> open{"DEK unwraps?"}
     open -- yes --> ok["Open: counter and delay reset"]
-    open -- no --> wrong["WrongPassword, failures + 1<br/>after 5: next not before 1 s,<br/>doubling up to 60 s"]
+    open -- no --> wrong["WrongPassword, failures + 1 (one per attempt,<br/>never says which password)<br/>after 5: next not before 1 s,<br/>doubling up to 60 s"]
 ```

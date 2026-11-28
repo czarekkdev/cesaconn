@@ -26,21 +26,41 @@ pub(super) fn handle_link_event(app: &mut App, event: LinkEvent) {
                 });
             }
             if status.locked && !was_locked {
-                app.push_log(
-                    "[ WARN] Saved keys are locked: enter the data password (Esc: later, Settings > Data key)",
-                );
+                app.push_log(if status.vault_outdated {
+                    "[ERROR] The saved keys are from an older CesaConn version and can't be opened: reset this device (Settings > Reset this device), then join your group again"
+                } else if status.enhanced {
+                    "[ WARN] Saved keys are locked: enter both passwords (Enhanced security; Esc: later, Settings > Data key)"
+                } else {
+                    "[ WARN] Saved keys are locked: enter the data password (Esc: later, Settings > Data key)"
+                });
             }
 
             set_key_flags(app, status.auth_key_set, status.data_key_set);
             if status.locked {
+                let kind = if status.vault_outdated {
+                    SettingKind::Outdated
+                } else {
+                    SettingKind::Locked
+                };
                 for label in [AUTH_KEY_LABEL, DATA_KEY_LABEL] {
                     if let Some(s) = app.setting_mut(label) {
-                        s.kind = SettingKind::Locked;
+                        s.kind = kind.clone();
                     }
                 }
             }
             if let Some(s) = app.setting_mut(AUTO_LOGIN_LABEL) {
-                s.kind = SettingKind::Bool(status.auto_login);
+                s.kind = if status.keychain_unavailable {
+                    SettingKind::Unavailable
+                } else if status.enhanced && !status.auto_login {
+                    SettingKind::ExcludedByEnhanced
+                } else {
+                    // on (even with Enhanced, a leftover the daemon couldn't
+                    // remove): shown as it is, so it can be turned off
+                    SettingKind::Bool(status.auto_login)
+                };
+            }
+            if let Some(s) = app.setting_mut(ENHANCED_LABEL) {
+                s.kind = SettingKind::Recommended(status.enhanced);
             }
             if let Some(s) = app.setting_mut(SYNC_LABEL) {
                 s.kind = SettingKind::Bool(status.sync_enabled);
@@ -56,6 +76,7 @@ pub(super) fn handle_link_event(app: &mut App, event: LinkEvent) {
             app.peers = peers;
             app.clamp_peer_selection();
             show_pairing(app, pairing);
+            close_stale_key_editor(app);
             ask_unlock(app, &status);
             app.daemon = DaemonState::Up(status);
         }
@@ -101,15 +122,37 @@ pub(super) fn handle_link_event(app: &mut App, event: LinkEvent) {
             app.request_refresh();
         }
         LinkEvent::Unlocked(result) => {
+            app.unlock_error = match &result {
+                Err(IpcErrors::Daemon(DaemonError::WrongPassword)) if is_enhanced(app) => {
+                    Some("Wrong password (auth or data).")
+                }
+                Err(IpcErrors::Daemon(DaemonError::WrongPassword)) => Some("Wrong data password."),
+                Err(IpcErrors::Daemon(DaemonError::NeedsBothPasswords)) => {
+                    Some("Enhanced security is on: both passwords.")
+                }
+                _ => None,
+            };
             match result {
                 Ok(()) => app.push_log("[ INFO] Saved keys unlocked"),
                 Err(IpcErrors::Daemon(DaemonError::WrongPassword)) => {
-                    app.push_log("[ERROR] Wrong data password");
+                    app.push_log(if is_enhanced(app) {
+                        "[ERROR] Wrong password: the auth or the data password is wrong (which one isn't shown)"
+                    } else {
+                        "[ERROR] Wrong data password"
+                    });
                     // ask again (the next refresh, unless a wait starts)
                     app.unlock_asked = false;
                 }
+                Err(IpcErrors::Daemon(DaemonError::NeedsBothPasswords)) => {
+                    // Enhanced security was turned on elsewhere: ask for both
+                    app.push_log("[ WARN] Enhanced security is on: enter both passwords");
+                    app.unlock_asked = false;
+                }
+                Err(IpcErrors::Daemon(DaemonError::VaultOutdated)) => app.push_log(
+                    "[ERROR] The saved keys are from an older version: reset this device, then join again",
+                ),
                 Err(IpcErrors::Daemon(DaemonError::UnlockDelayed)) => app.push_log(
-                    "[ WARN] Too many wrong data passwords: wait (see the status bar), then try again",
+                    "[ WARN] Too many wrong passwords: wait (see the status bar), then try again",
                 ),
                 Err(e) => app.push_log(format!("[ERROR] Unlocking failed: {e}")),
             }
@@ -123,8 +166,34 @@ pub(super) fn handle_link_event(app: &mut App, event: LinkEvent) {
                 (false, Ok(())) => {
                     app.push_log("[ INFO] Automatic login off: data key removed from the keychain")
                 }
+                (_, Err(IpcErrors::Daemon(DaemonError::AutoLoginConflict))) => app.push_log(
+                    "[ WARN] Automatic login can't be on with Enhanced security: turn Enhanced security off first",
+                ),
                 (_, Err(e)) => {
                     app.push_log(format!("[ERROR] Changing automatic login failed: {e}"))
+                }
+            }
+            app.request_refresh();
+        }
+        LinkEvent::EnhancedSet { on, result } => {
+            match (on, result) {
+                (true, Ok(())) => app.push_log(
+                    "[ INFO] Enhanced security on: both passwords at every start, the auth key is no longer stored",
+                ),
+                (false, Ok(())) => app.push_log(
+                    "[ WARN] Enhanced security off: the data password alone unlocks again",
+                ),
+                (_, Err(IpcErrors::Daemon(DaemonError::NotSaved))) => app.push_log(
+                    "[ WARN] Enhanced security needs saved keys: set both passwords first",
+                ),
+                (_, Err(IpcErrors::Daemon(DaemonError::Locked))) => {
+                    app.push_log("[ WARN] Saved keys are locked: unlock first")
+                }
+                (_, Err(IpcErrors::Daemon(DaemonError::AutoLoginConflict))) => app.push_log(
+                    "[ WARN] Turn automatic login off first: it can't be on with Enhanced security",
+                ),
+                (_, Err(e)) => {
+                    app.push_log(format!("[ERROR] Changing Enhanced security failed: {e}"))
                 }
             }
             app.request_refresh();
@@ -183,7 +252,7 @@ pub(super) fn handle_link_event(app: &mut App, event: LinkEvent) {
                     "[ WARN] This device has keys already: only a fresh device joins a group",
                 ),
                 Err(IpcErrors::Daemon(DaemonError::NotSaved)) => app.push_log(
-                    "[ WARN] Joining needs saved keys, and this platform has no keychain backend yet",
+                    "[ WARN] Joining needs saved keys, and this device can't save them (see the daemon log)",
                 ),
                 Err(e) => app.push_log(format!("[ERROR] Joining failed: {e}")),
             }

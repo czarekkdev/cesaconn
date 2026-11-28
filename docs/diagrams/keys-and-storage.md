@@ -1,7 +1,9 @@
 # Keys and storage
 
-daemon.md 4, 6.3-6.5 and 8. Two passwords, two independent keys; the salts
-belong to the group (section 11).
+daemon.md 4, 6.3-6.7 and 8. Two passwords, two independent keys; the salts
+belong to the group (section 11) and sit in the vault's header in plain.
+The vault needs nothing from the OS; the keychain only holds `d_key` for
+the opt-in automatic login.
 
 ```mermaid
 flowchart LR
@@ -13,12 +15,22 @@ flowchart LR
     d_salt["d_salt<br/>(group, sent only after auth)"] --> d_argon
     d_argon --> d_key["d_key<br/>data layer + vault"]
 
-    d_key --> hkdf["HKDF"]
+    d_key --> hkdf["HKDF-BLAKE2s"]
+    d_key -. "Enhanced mode only" .-> both_argon["Argon2id 64 MiB<br/>over d_key || a_key"]
+    a_key -. "Enhanced mode only" .-> both_argon
+    both_argon -. "ikm instead of d_key" .-> hkdf
     s_salt["storage salt<br/>(this device)"] --> hkdf
+    s_salt --> both_argon
     hkdf --> kek["KEK"]
     kek -- "AES-256-GCM wraps" --> dek["DEK (random)"]
     dek -- "AES-256-GCM seals" --> contents["vault contents"]
 ```
+
+Standard mode: `KEK = HKDF(d_key, storage salt, "cesaconn-storage-v1")`.
+Enhanced mode: `KEK = HKDF(Argon2id(d_key || a_key, storage salt), storage
+salt, "cesaconn-storage-both-v1")`, so only both passwords together open
+it, and every guessed pair costs a full Argon2 run of its own (without the
+extra Argon2, N guesses of pw1 and M of pw2 would need only N + M runs).
 
 ## What is stored where
 
@@ -27,20 +39,24 @@ flowchart TB
     subgraph ram["daemon RAM (Zeroizing)"]
         r1["a_key, d_key, a_salt, d_salt,<br/>DEK, identity seed, peers"]
     end
-    subgraph kc["OS keychain (device only, never synced)"]
-        k1["salts: d_salt (32) || storage salt (32)"]
-        k2["data-key: d_key (32)<br/>only with automatic login"]
+    subgraph kc["OS keychain (macOS, device only, never synced)"]
+        k2["data-key: d_key (32)<br/>only with automatic login,<br/>never in Enhanced mode"]
     end
     subgraph file["vault.bin (0600, private dir)"]
-        f0["header: CESAVLT\0 || 0x02"]
+        f0["header (plain, authenticated):<br/>CESAVLT\0 || 0x03 || mode ||<br/>a_salt || d_salt || storage salt"]
         f1["wrap nonce || AES-GCM(KEK, DEK)"]
         f2["data nonce || AES-GCM(DEK, padded contents)"]
-        f2 --> c["contents (TLV, fixed order):<br/>a_key, a_salt, config (Sync, clipboard,<br/>last addresses), identity seed, peers"]
+        f2 --> c["contents (TLV, fixed order):<br/>a_key (Standard mode only), config<br/>(Sync, clipboard, last addresses),<br/>identity seed, peers"]
     end
 ```
 
-Cracking `pw2` needs the vault file **and** the keychain salts; it then also
-gives `a_key` (18). That is why new passwords need 12 characters.
+The file alone is enough for an offline guess (its salts are in it), at a
+full Argon2 run per guess: that is why new passwords need 12 characters.
+Standard mode: cracking `pw2` also gives `a_key` (it is inside, 18.2).
+Enhanced mode: `a_key` isn't in the file and a guess must get both
+passwords right together, one Argon2 run per guessed pair. An older
+Standard copy of the file still holds `a_key`, and with pw2 it opens the
+Enhanced vault too: change pw1 after turning Enhanced on.
 
 ## First setup: creating the vault
 
@@ -48,15 +64,13 @@ gives `a_key` (18). That is why new passwords need 12 characters.
 sequenceDiagram
     participant UI
     participant D as Daemon
-    participant KC as Keychain
     participant F as vault.bin
     UI->>D: SetAuthPassword(pw1)
     Note over D: a_salt made (first use), a_key = Argon2(pw1, a_salt)
     UI->>D: SetDataPassword(pw2)
     Note over D: d_salt made, d_key = Argon2(pw2, d_salt)
-    Note over D: both keys, no vault: create_vault()<br/>storage salt, DEK, identity seed, KEK, seal
-    D->>KC: write d_salt || storage salt
-    D->>F: write atomically (temp file, fsync, rename)
+    Note over D: both keys, no vault: create_vault() in Standard mode<br/>storage salt, DEK, identity seed, KEK, seal
+    D->>F: write atomically (temp file, fsync, rename): one file, salts in its header
     Note over D: only now keep the open vault in RAM<br/>any failure: keys stay RAM only, nothing half-written
 ```
 
@@ -65,11 +79,29 @@ sequenceDiagram
 ```mermaid
 flowchart LR
     new["new password<br/>(UI asked 'are you sure?')"] --> kind{"which?"}
-    kind -- pw1 --> a["a_key from the same a_salt<br/>re-seal the vault"]
-    kind -- pw2 --> d["d_key from the same d_salt<br/>re-wrap DEK, re-seal;<br/>auto-login: replace data-key"]
+    kind -- pw1 --> a["a_key from the same a_salt<br/>Standard: re-seal with the new a_key<br/>Enhanced: new KEK, so a new DEK, re-seal"]
+    kind -- pw2 --> d["d_key from the same d_salt<br/>new KEK, so a new DEK, re-seal;<br/>auto-login: replace data-key"]
     a --> saved["saved first, kept second"]
     d --> saved
     saved --> net{"networking running<br/>(Sync on)?"}
     net -- yes --> hello["hello to every paired device with a<br/>known address that isn't paused: those<br/>with the old password show<br/>'incorrect password' (13.1)"]
     net -- no --> later["no hello now: shown when<br/>the devices next connect"]
+```
+
+## Enhanced security on / off
+
+```mermaid
+flowchart LR
+    req["SetEnhanced(on)"] --> open{"vault open<br/>and unlocked?"}
+    open -- no --> refused["Locked / NotSaved"]
+    open -- yes --> same{"already<br/>that mode?"}
+    same -- yes --> done["Done, nothing written"]
+    same -- no --> auto{"turning on and<br/>automatic login on?"}
+    auto -- yes --> conflict["AutoLoginConflict<br/>(the TUI always sends automatic login off first)"]
+    auto -- no --> kc{"turning on and<br/>a keychain here?"}
+    kc -- yes --> del{"remove the automatic-login key<br/>(missing is fine)"}
+    del -- failed --> storage["StorageFailed, nothing changed"]
+    del -- ok --> rewrap
+    kc -- no --> rewrap["new header (mode byte), KEK for the new mode,<br/>a NEW DEK wrapped under it, re-seal with / without a_key"]
+    rewrap --> write["write atomically, then keep<br/>(saved first, kept second)"]
 ```

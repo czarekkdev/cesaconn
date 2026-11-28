@@ -28,7 +28,7 @@ Diagrams of everything below: [`docs/diagrams/`](../diagrams/README.md).
 5. Process architecture
 6. Lifecycle and state machine
 7. Local IPC (UI <-> daemon)
-8. Storage: keychain and vault
+8. Storage: the vault (and the keychain for automatic login)
 9. Network layer: discovery, listener, limits
 10. `auth_snow`: the handshake
 11. Groups and salt sync
@@ -53,7 +53,8 @@ to it over a private local socket.
 The daemon **does**:
 - derive `a_key` and `d_key` from the passwords (Argon2id) and keep them;
 - own every salt, the device identity and the trusted-peer list;
-- save its state in the encrypted vault and the OS keychain;
+- save its state in the encrypted vault (the OS keychain only holds `d_key`
+  for the opt-in automatic login);
 - answer UI requests (status, set password, unlock, automatic login, list
   peers, Sync, "Add device", pairing answers, joining a group);
 - run discovery, accept and open connections, authenticate peers with
@@ -85,18 +86,23 @@ Logging: `tracing`, default `cesa_conn=debug` in debug builds and
 These are Czarek's decisions. Every design and every PR must keep them.
 
 1. **Secrets live in exactly three places**: daemon memory (zeroized), the OS
-   keychain, or an encrypted file. That covers keys, salts and anything
-   derived from them.
+   keychain, or an encrypted file. That covers keys and anything derived
+   from them. The salts are public parameters, not secrets: since
+   2026-11-26 (his decision) they sit in the vault file's header in plain,
+   so the vault doesn't depend on the OS (8.3); the keychain only keeps
+   `d_key` for the opt-in automatic login.
 2. **The UI holds nothing key-related.** A typed password exists in the UI
    only transiently, in a zeroizing buffer, is handed to the daemon and wiped
    at once. Salts are never shown or kept in the UI.
 3. **The daemon owns `a_key` / `d_key`.** No IPC command ever exports key
    bytes. The UI gets status and public peer info only.
 4. **Passwords are used exactly as typed.** Never trimmed, never normalised.
-5. **Nothing is stored unencrypted**, configs included.
+5. **Nothing secret is stored unencrypted**, configs included. The only
+   plaintext on disk is format metadata, the unlock mode and the salts (8.3).
 6. **Two independent passwords.** `pw1 -> Argon2id(a_salt) -> a_key` is for
    authentication only; `pw2 -> Argon2id(d_salt) -> d_key` is for data only.
-   (Section 18 lists exactly where this independence stops.)
+   (Section 18 lists exactly where this independence stops; Enhanced
+   security, 6.7, keeps it at rest too.)
 7. **Argon2id is pinned**: v0x13, m = 64 MiB, t = 3, p = 1, 32-byte output.
    The parameters are part of the protocol; changing them changes every key.
 8. **SPAKE2 is the only trust decision for the password.** Nothing on the
@@ -134,9 +140,9 @@ These are Czarek's decisions. Every design and every PR must keep them.
 | Active network attacker (MITM, no password) | drop, inject, replay, redirect, flood | anything above; at most a failed connection (DoS) and one online guess per connection, rate limited |
 | Attacker who knows `pw1` only | complete SPAKE2 and Noise | trust without the user confirming the pairing code; any synced data (needs `d_key`) |
 | Attacker who knows `pw1`, paired by a user who accepted the code | everything a paired device gets | plaintext data without `pw2` (see the offline-guess caveat in 18) |
-| Other local user | connect to sockets, read world-readable files | the IPC (uid gate), the vault (0700 dir, 0600 file), keychain items |
+| Other local user | connect to sockets, read world-readable files | the IPC (uid gate), the vault (0700 dir, 0600 file), the keychain item |
 | Same-user local process | everything the user can do | **only stopped on macOS signed builds** (code-requirement gate); otherwise out of scope, see 3.3 |
-| Thief of the disk / backups | the vault file | contents without `pw2`; on top of that the keychain salts are needed for even an offline guess |
+| Thief of the disk / backups | the vault file (its salts are in it) | contents without `pw2`; each offline guess costs a full Argon2 run (64 MiB), so a 12+ character pw2 is the defence. Standard mode: cracking pw2 also gives `a_key`. Enhanced mode: only a guess of **both** passwords together opens it, each guessed pair costing a full Argon2 run of its own (6.7), and `a_key` is never in the file (18.2). An older Standard copy of the file still holds `a_key`: with it and pw2 the current Enhanced vault opens too, until pw1 is changed after turning Enhanced on (6.7) |
 | Quantum attacker recording traffic today ("harvest now") | break X25519 / Ed25519 later | session keys and data (protected by ML-KEM-1024 in the PSK); **not** the SPAKE2 password-guess resistance, see 18 |
 
 ### 3.3 Out of scope
@@ -158,13 +164,13 @@ Every secret, how it is made, where it lives and for how long.
 |---|---|---|---|
 | `pw1`, `pw2` | the user | UI input buffer, then the IPC frame buffers and `PasswordUpdate` on both ends (all `Zeroizing`) | UI: until sent; daemon: until Argon2 finishes; then wiped |
 | clipboard text (not a key, but often a password) | the user / a paired device | the OS clipboard; daemon RAM (`Zeroizing`) while it is read, sent or applied | daemon: one send or apply, then wiped |
-| `a_salt` (32 B) | OS RNG, daemon, first `SetAuthPassword` | daemon RAM; vault | for good |
-| `d_salt` (32 B) | OS RNG, daemon, first `SetDataPassword` | daemon RAM; keychain item `salts` | for good |
-| storage salt (32 B) | OS RNG, at vault creation | keychain item `salts` | for good |
-| `a_key` (32 B) | `Argon2id(pw1, a_salt)` | daemon RAM (`AuthKey`); vault | until pw1 changes |
-| `d_key` (32 B) | `Argon2id(pw2, d_salt)` | daemon RAM (`DataKey`) only; keychain item `data-key` only with automatic login | until the daemon stops / pw2 changes |
-| KEK (32 B) | `HKDF-BLAKE2s(ikm = d_key, salt = storage salt, info = "cesaconn-storage-v1")` | computed on demand, wiped | one operation |
-| DEK (32 B) | OS RNG, at vault creation | daemon RAM while open; on disk only wrapped by the KEK | for good (re-wrapped on pw2 change) |
+| `a_salt` (32 B, public) | OS RNG, daemon, first `SetAuthPassword` | daemon RAM; vault header (plain) | for good |
+| `d_salt` (32 B, public) | OS RNG, daemon, first `SetDataPassword` | daemon RAM; vault header (plain) | for good |
+| storage salt (32 B, public) | OS RNG, at vault creation | vault header (plain) | for good |
+| `a_key` (32 B) | `Argon2id(pw1, a_salt)` | daemon RAM (`AuthKey`); vault (Standard mode only) | until pw1 changes |
+| `d_key` (32 B) | `Argon2id(pw2, d_salt)` | daemon RAM (`DataKey`) only; keychain item `data-key` only with automatic login (Standard mode only) | until the daemon stops / pw2 changes |
+| KEK (32 B) | Standard: `HKDF-BLAKE2s(ikm = d_key, salt = storage salt, info = "cesaconn-storage-v1")`; Enhanced: `HKDF-BLAKE2s(ikm = d_key \|\| a_key, salt = storage salt, info = "cesaconn-storage-both-v1")` | computed on demand, wiped | one operation |
+| DEK (32 B) | OS RNG, at vault creation | daemon RAM while open; on disk only wrapped by the KEK | until the KEK changes: a new one on every mode switch and every password change that changes the KEK |
 | identity seed (64 B) | OS RNG, at vault creation: `X25519 private (32) \|\| ML-DSA-87 seed (32)` | daemon RAM; vault | for good: same seed = same device |
 | trusted peers | pairing | daemon RAM; vault | until removed |
 | SPAKE2 key `key1` | SPAKE2 | handshake task | one handshake |
@@ -175,8 +181,9 @@ Every secret, how it is made, where it lives and for how long.
 
 Types: keys are newtypes (`AuthKey`, `DataKey`) over `Zeroizing<[u8; 32]>`,
 with no `Debug` and no `Copy`, readable only through `expose()`, so `a_key`
-can't be passed where `d_key` is expected. `Salts`, `VaultContents` and
-`PasswordUpdate` have no `Debug` / `Clone`. Buffers holding secrets are sized
+can't be passed where `d_key` is expected. The vault `Header` (mode and
+salts, wiped on drop like every salt), `VaultContents` and `PasswordUpdate`
+have no `Debug`; `VaultContents` and `PasswordUpdate` no `Clone` either. Buffers holding secrets are sized
 up front so they never reallocate (a reallocation would leave an unwiped copy).
 
 ---
@@ -235,8 +242,10 @@ pub struct Daemon {
 struct KeySlots {
     a_key, d_key: Option<AuthKey / DataKey>,
     a_salt, d_salt: Option<Zeroizing<[u8; 32]>>,
-    vault: Option<OpenVault>,   // DEK, wrapped DEK, storage salt, config, identity seed
+    vault: Option<OpenVault>,   // DEK, wrapped DEK, header (mode, salts), config, identity seed
     locked: bool,               // a saved vault exists but isn't open
+    locked_enhanced: bool,      // while locked: its header says Enhanced mode
+    outdated: bool,             // the saved vault is of an older version
     auto_login: bool,           // d_key is in the keychain
     unlock_failures: u32,
 }
@@ -279,11 +288,12 @@ stateDiagram-v2
     Joining --> Open: paired, both salts received, vault created with Sync on
     Fresh --> Partial: SetAuth or SetData
     Partial --> Open: second key set, vault created
-    Partial --> RamOnly: second key set, but no storage or the keychain / file write failed
+    Partial --> RamOnly: second key set, but no storage or the file write failed
     RamOnly --> Open: next successful key change creates the vault
-    Locked --> Open: Unlock(pw2) or automatic login
-    Locked --> Locked: wrong pw2 (delay after 5 failures)
-    Open --> Open: SetAuth / SetData (re-seal) / SetAutoLogin
+    Locked --> Open: Unlock(pw2), UnlockBoth(pw1, pw2) (Enhanced) or automatic login
+    Locked --> Locked: wrong password (delay after 5 failures)
+    Locked --> Fresh: ResetDevice (also the only way out of an outdated vault)
+    Open --> Open: SetAuth / SetData (re-seal) / SetAutoLogin / SetEnhanced
     Open --> [*]: Ctrl-C (RAM wiped)
     Locked --> [*]: Ctrl-C
 ```
@@ -291,7 +301,8 @@ stateDiagram-v2
 `Status` shows it: `auth_key_set`, `data_key_set`, `locked`, `saved`,
 `auto_login`, `sync_enabled`, `network_running`, `adding_device`,
 `joining`, `trusted_peers`, `unlock_wait_secs`, `pending_pairings`,
-`clipboard_enabled`, `clipboard_unavailable`.
+`clipboard_enabled`, `clipboard_unavailable`, `enhanced` (known while
+locked, from the vault header), `vault_outdated`, `keychain_unavailable`.
 
 Setting both passwords on a fresh device creates a new group (the daemon
 makes both salts); `JoinGroup` joins an existing one (section 11).
@@ -299,22 +310,33 @@ makes both salts); `JoinGroup` joins an existing one (section 11).
 Networking runs exactly while the vault is open, both keys are set and the
 Sync switch is on (section 13); every state change re-checks it.
 
-Without storage (Linux and others today, or no safe data directory) the
-daemon is RAM only: keys are gone after a restart, `Unlock` and
-`SetAutoLogin` answer `NotSaved`, and it logs a warning.
+Without storage (no safe data directory) the daemon is RAM only: keys are
+gone after a restart, `Unlock` and `SetAutoLogin` answer `NotSaved`, and it
+logs a warning. The vault needs nothing from the OS, so every unix platform
+has storage; only automatic login needs a keychain backend (macOS today;
+elsewhere `keychain_unavailable` is set and `SetAutoLogin` answers
+`StorageFailed`).
 
 ### 6.2 Start **[built]**
 
 1. Build the IPC client policy from the build-time code requirement; refuse
    to start if it doesn't parse.
 2. Find and check the socket path, bind it (7.2).
-3. Pick storage (`platform_storage()`: macOS only, vault in the private data
-   dir, keychain = `OsKeychain`).
+3. Pick storage (`platform_storage()`: the vault in the private data dir on
+   every platform, keychain = `OsKeychain`, which is supported on macOS only).
 4. `start()`: no vault file -> Fresh. A vault file (even an unreadable one) ->
-   Locked. Then, if the keychain has a `data-key` item, try automatic login:
+   Locked; its header (read without any key) says the mode, so `Status`
+   tells the UI which passwords to ask for. A vault of an older version
+   (the salts were in the keychain) -> Locked and `vault_outdated`: every
+   unlock answers `VaultOutdated`, only a reset helps (no migration, his
+   decision: the app is still in testing). Then, in Standard mode only, if
+   the keychain has a `data-key` item, try automatic login:
    - wrong size: stay locked, warn;
    - it no longer opens the vault: delete it from the keychain, stay locked;
    - success: Open.
+   In Enhanced mode a `data-key` item is a leftover: it is deleted unused
+   (if the keychain refuses, it stays unused and `Status` shows automatic
+   login on, so the user sees it and can turn it off after unlocking).
 5. Serve IPC until Ctrl-C.
 
 ### 6.3 First setup **[built]**
@@ -322,30 +344,44 @@ daemon is RAM only: keys are gone after a restart, `Unlock` and
 1. `SetAuthPassword(pw1)` / `SetDataPassword(pw2)`, in any order. Each is
    refused below 12 characters (`MIN_NEW_PASSWORD_LEN`, counted in Unicode
    characters, bytes if not UTF-8). The salt is made on first use and kept.
-2. When both keys exist and no vault does, `create_vault()`:
-   1. new storage salt, DEK, identity seed;
+2. When both keys exist and no vault does, `create_vault()` (always in
+   Standard mode; Enhanced is a switch afterwards, 6.7):
+   1. new storage salt, DEK, identity seed; the header holds the mode and
+      the three salts;
    2. `KEK = HKDF(d_key, storage salt)`, wrap the DEK, seal the contents;
-   3. write `d_salt || storage salt` to the keychain;
-   4. write the vault file atomically;
-   5. only then keep the open vault in RAM.
+   3. write the vault file atomically (one file holds everything);
+   4. only then keep the open vault in RAM.
    Any failure: keys stay in RAM only (`saved = false`), nothing half-written;
    the next key change tries again.
 
 ### 6.4 Unlock **[built]**
 
-`Unlock(pw2)` (only while Locked; otherwise `BadRequest` if open, `NotSaved`
-if there is no vault):
-1. inside the unlock delay: refused at once with `UnlockDelayed`, before any
-   keychain access or Argon2, and not counted as another guess;
-2. read the salts from the keychain (missing or unreadable: `StorageFailed`);
-3. `d_key = Argon2id(pw2, d_salt)`, `KEK = HKDF(...)`, open the vault;
+`Unlock(pw2)` in Standard mode, `UnlockBoth(pw1, pw2)` in Enhanced mode
+(only while Locked; otherwise `BadRequest` if open, `NotSaved` if there is
+no vault):
+1. an outdated vault: `VaultOutdated` at once; inside the unlock delay:
+   refused at once with `UnlockDelayed`; both before any file access or
+   Argon2, and not counted as another guess;
+2. read the vault's header (mode and salts). The wrong request for the
+   mode is refused before any Argon2 and not counted: `Unlock` on an
+   Enhanced vault is `NeedsBothPasswords`, `UnlockBoth` on a Standard one
+   `BadRequest`;
+3. `d_key = Argon2id(pw2, d_salt)` (Enhanced: also `a_key = Argon2id(pw1,
+   a_salt)`, both derived before anything is tried), `KEK = HKDF(...)`
+   (Enhanced: over a third Argon2 of both keys, 8.3), open the vault. The
+   keys are derived from the header of the file read in step 2 and that
+   same copy is opened, so a vault replaced on disk meanwhile can't turn a
+   right password into a counted wrong one;
 4. wrong password = the DEK wrap fails its GCM tag -> `WrongPassword`, the
    counter goes up and the next attempt is refused for `unlock_delay(failures)`:
    the first 5 attempts run back to back, after the 5th wrong password it is
-   1 s, doubling to 60 s. A damaged file is `StorageFailed`, never
-   `WrongPassword`;
-5. success: load `a_key`, `a_salt`, identity, config, peers; counter and
-   delay reset.
+   1 s, doubling to 60 s. In Enhanced mode one attempt is one count (and
+   costs three Argon2 runs), and the answer doesn't say which of the two
+   passwords was wrong: the KEK mixes both. A damaged file is
+   `StorageFailed`, never `WrongPassword`;
+5. success: load `a_key` (Standard: from the vault; Enhanced: the derived
+   one, which just opened it), the salts from the header, identity, config,
+   peers; counter and delay reset.
 
 The delay is a "not before" time, not a sleep: a sleep held the change slot
 and outlasted the 10 s IPC deadline from the 10th attempt on, so the UI got a
@@ -355,9 +391,13 @@ the password field until the wait is over.
 
 The TUI asks for the data password by itself as soon as it sees a locked
 daemon (a restart without automatic login), on any tab: an "Unlock" prompt,
-masked, sent exactly as typed. Once per locked spell: Esc leaves it to
-Settings > Data key, a wrong password or a daemon that comes back locked
-asks again. It waits while the daemon refuses unlocks, never covers another
+masked, sent exactly as typed; with Enhanced security a two-step prompt
+(auth password, Enter, data password, Enter; the first one kept only in a
+pre-sized zeroizing buffer, both wiped when sent or on Esc). Once per
+locked spell: Esc leaves it to Settings > Data key (or Auth key), a wrong
+password or a daemon that comes back locked asks again, with the reason in
+red in the prompt. An outdated vault gets a notice instead (what happened,
+reset and join again) and no password field. It waits while the daemon refuses unlocks, never covers another
 popup (it opens on the next refresh), and closes, wiped, when the vault was
 unlocked some other way. The guessing rate is the same as
 with the sleep: one Argon2 attempt per delay.
@@ -373,11 +413,19 @@ signed ones (7.2), so the reset gives nobody in scope anything.
 
 The UI asks "are you sure?" before sending a new password for a key that is
 already set. The old password is **not** required (his decision).
-- New `pw1`: derive with the existing `a_salt`, re-seal the vault with the new `a_key`.
-- New `pw2`: derive with the existing `d_salt`, re-wrap the DEK under the new
-  KEK, re-seal; with automatic login, replace the keychain `data-key`. If the
+- New `pw1`: derive with the existing `a_salt`, re-seal the vault with the
+  new `a_key` (Enhanced mode: the KEK uses `a_key`, so it changes, see
+  below).
+- New `pw2`: derive with the existing `d_salt`; the KEK changes (see
+  below); with automatic login, replace the keychain `data-key`. If the
   keychain refuses, the old item is deleted and automatic login turns off
   (a stale key must not stay behind).
+- Whenever the KEK changes (pw2 in either mode, pw1 in Enhanced mode) a
+  **new DEK** is made, wrapped under the new KEK and used for the new
+  file. Whoever opened an older copy of the file with the old passwords
+  knows the old DEK, and it must not decrypt what is saved after the
+  change. The new DEK and wrap replace the ones in RAM only after the new
+  file is in place; a failed save keeps the old ones.
 
 Until group rotation exists (section 14), a local password change once peers
 exist breaks pairing with the devices that still have the old password.
@@ -396,7 +444,76 @@ Opt-in, after this warning: *"Your data key will be stored in the OS keychain.
 Its security then depends on your operating system and account: anyone who can
 unlock your user session can use it. We can't vouch for that."* On: `d_key`
 goes into the keychain item `data-key`. Off: the item is deleted. Needs an
-open, saved vault (`Locked` / `NotSaved` otherwise).
+open, saved vault (`Locked` / `NotSaved` otherwise), a keychain backend
+(`StorageFailed` without one; the TUI shows the switch as not supported),
+and Standard mode: with Enhanced security on, turning it on is
+`AutoLoginConflict` (the TUI shows it as "off (not with Enhanced)").
+
+The keychain is the only place a key can sit with no password typed: it is
+used for automatic login and for nothing else (his decision, 2026-11-26).
+The vault itself never depends on it.
+
+### 6.7 Enhanced security **[built]**
+
+Diagrams: [`docs/diagrams/keys-and-storage.md`](../diagrams/keys-and-storage.md) (on / off), [`docs/diagrams/daemon-states.md`](../diagrams/daemon-states.md) (unlock).
+
+A switch, off by default and shown as recommended in the TUI (his
+decision: Standard by default, Enhanced offered as recommended).
+
+- **Standard** (default): the vault is opened with `pw2` alone; `a_key` is
+  stored inside it.
+- **Enhanced**: both passwords at every daemon start. `a_key` is never
+  stored: it is derived from `pw1` at unlock and lives in RAM only, like
+  `d_key`. The KEK is `HKDF(Argon2id(d_key || a_key, storage salt),
+  storage salt, "cesaconn-storage-both-v1")`, so the vault opens only with
+  both. The file holds no separate check value for either key. The extra Argon2 is
+  what makes the cost multiply: without it an attacker with N candidates
+  for pw1 and M for pw2 would run Argon2 only N + M times and test the
+  N x M pairs with a cheap HKDF and a GCM tag. With it every pair costs a
+  full Argon2 run (64 MiB) of its own. An unlock costs three Argon2 runs
+  (pw1, pw2, the pair); so does a password change in Enhanced mode (one
+  for the new password, one for the new pair). Learning `pw2` alone no
+  longer gives the auth key directly, but it does not keep pw1 safe
+  either: whoever knows pw2 and has the file can still test pw1 guesses
+  offline, at two Argon2 runs per guess (pw1, then the pair) followed by
+  HKDF and a GCM tag check. The extra cost makes each guess expensive; it
+  doesn't prevent the test, so pw1 needs to be strong on its own (18.2).
+
+`SetEnhanced(on)` needs an open, saved vault (`Locked` / `NotSaved`
+otherwise). It makes a **new DEK**, wraps it under the new mode's KEK and
+re-seals the whole file with the new header (with or without `a_key`),
+saved first and kept second, so the file on disk is always in exactly one
+mode. Setting the mode it already has does nothing. Turning it on while
+automatic login is on is `AutoLoginConflict`: Enhanced keeps no key
+anywhere, and the two can't both be on. The TUI always sends "automatic
+login off" first when the user confirms (where there is a keychain), so
+it also wins over a "turn automatic login on" sent a moment ago and not in
+the status yet. Turning it on also removes the automatic-login key from
+the keychain before saving, even when the daemon thinks there is none (a
+keychain read refused at start leaves `auto_login` off while a key may
+still be there); removing a missing key is not an error, and if the
+removal fails the switch is refused with `StorageFailed` and nothing
+changes. Without a keychain backend there is nothing to remove.
+
+Older copies of the vault file (a backup, a disk image) are not touched by
+the switch. A Standard-mode copy still holds `a_key`, so with it and `pw2`
+someone gets `a_key` and `d_key`. **Those two keys also open the current
+Enhanced vault** (its KEK is made from exactly them), so until pw1 changes,
+a Standard backup plus pw2 is as good as both passwords. The new DEK only
+means the old copy's DEK alone opens nothing saved later; it does not close
+this. Changing the auth password does: a new `a_key` gives a new KEK, and
+the backup's `a_key` opens nothing and authenticates nothing. **After
+turning Enhanced on, change the auth password (on every device of the
+group) if older copies of the vault may exist.** The TUI's confirm popup
+says so.
+
+The TUI asks first in both directions: on says what it gives, off says
+that the data password alone then unlocks the device again and can add a
+device to the group. While the daemon would refuse (not saved, locked,
+unreachable) the popup says why in red and `y` does nothing.
+
+A joined device starts in Standard mode like a new one; Enhanced is per
+device (the mode is not part of the group).
 
 ---
 
@@ -460,7 +577,7 @@ Frames that carry a request are read into `Zeroizing` buffers (a request may
 hold a password). Compile-time asserts keep the largest request and the
 largest `ListPeers` answer under `MAX_FRAME_LEN`.
 
-### 7.4 Wire format, version 9 **[built]**
+### 7.4 Wire format, version 10 **[built]**
 
 ```
 frame    = length (u32 LE, 1..=MAX_FRAME_LEN) || body
@@ -475,7 +592,7 @@ response = 0x00 || payload        (success)
 | `0x04` | ListPeers | none | `count (u16 LE) \|\| count * (fingerprint (8) \|\| state (1) \|\| name len (1) \|\| name)` |
 | `0x05` | SetAuthPassword | `password` | empty |
 | `0x06` | SetDataPassword | `password` | empty |
-| `0x07` | Unlock | `password` (the data password) | empty |
+| `0x07` | Unlock | `password` (the data password; Standard mode) | empty |
 | `0x08` | SetAutoLogin | exactly `0x00` or `0x01` | empty |
 | `0x09` | SetSync | exactly `0x00` or `0x01` | empty |
 | `0x0A` | AddDevice | none | empty (the window runs in the background) |
@@ -489,6 +606,8 @@ response = 0x00 || payload        (success)
 | `0x12` | SetClipboard | exactly `0x00` or `0x01` | empty (12.1) |
 | `0x13` | AddDeviceAt | `address` | empty (13.2) |
 | `0x14` | JoinGroupAt | `address \|\| JoinGroup's payload` | empty (13.2) |
+| `0x15` | UnlockBoth | JoinGroup's payload (`auth len \|\| pw1 \|\| pw2`) | empty (6.4, Enhanced mode) |
+| `0x16` | SetEnhanced | exactly `0x00` or `0x01` | empty (6.7) |
 | `0x02`, `0x03` | retired (v1 sent `salt \|\| password`) | refused, so a mismatched UI and daemon fail loudly | |
 
 `address` = `0x04 (1) || IPv4 (4)`, exact length. Refused (`BadRequest`):
@@ -501,9 +620,12 @@ Status flags: bit 0 auth key set, 1 data key set, 2 network running, 3 vault
 locked, 4 keys saved, 5 automatic login, 6 Sync switched on, 7 "Add device"
 window open. Flags2: bit 0 joining a group, bit 1 the open "Add device" window found a
 device of another group (13), bit 2 clipboard sync switched on, bit 3 this
-platform has no clipboard support (12.7), every other bit must be 0 (so an
-older UI refuses a newer status loudly).
-Unlock wait: seconds until `Unlock` is accepted again (0 = now). Pending
+platform has no clipboard support (12.7), bit 4 the saved vault is in
+Enhanced mode (6.7; known while locked), bit 5 the saved vault is of an
+older version (6.2), bit 6 this platform has no keychain backend (no
+automatic login, 6.6), bit 7 must be 0 (so an older UI refuses a newer
+status loudly).
+Unlock wait: seconds until an unlock is accepted again (0 = now). Pending
 pairings: how many wait for the user; the UI asks `PendingPairing` only
 then. Versions 2 to 4 had shorter status answers; they are `Malformed`, so a
 mismatched UI and daemon fail loudly.
@@ -534,7 +656,9 @@ that id and code: answered already, timed out, or a different pairing),
 (ForgetPeer: no paired device has that fingerprint), `0x0F`
 ClipboardUnavailable (SetClipboard on on a platform without clipboard
 support), `0x10` OwnAddress (AddDeviceAt / JoinGroupAt with an address of
-this machine).
+this machine), `0x11` NeedsBothPasswords (`Unlock` on an Enhanced vault),
+`0x12` AutoLoginConflict (automatic login and Enhanced security can't both
+be on), `0x13` VaultOutdated (unlocking a vault of an older version).
 
 `ResetDevice` carries fixed confirm bytes so that nothing sent by mistake
 (a wrong kind byte, a UI bug) decodes as a reset; the user's confirmation
@@ -543,6 +667,11 @@ an error code. Version 8 adds `SetClipboard`, two status bits, an error
 code and the state byte in `ListPeers`: a version 7 UI fails on the peer
 list loudly (`Malformed`), as intended. Version 9 only adds two requests
 and an error code: a version 8 daemon answers them with `BadRequest`.
+Version 10 adds `UnlockBoth`, `SetEnhanced`, three error codes and three
+status bits: a version 9 UI refuses the status of a daemon with an
+Enhanced or outdated vault or no keychain (`Malformed`), and a version 9
+daemon answers the new requests with `BadRequest`. `WrongPassword`'s text
+is now "wrong password" (in Enhanced mode it can be either one).
 
 An answer names the id **and the code** the user saw. Ids start at 0 again
 when the daemon restarts, so an id alone could land on a newer pairing that
@@ -578,7 +707,7 @@ clipboard switch (12) are built.
 
 ---
 
-## 8. Storage: keychain and vault
+## 8. Storage: the vault (and the keychain for automatic login)
 
 Diagrams: [`docs/diagrams/keys-and-storage.md`](../diagrams/keys-and-storage.md).
 
@@ -586,42 +715,69 @@ Diagrams: [`docs/diagrams/keys-and-storage.md`](../diagrams/keys-and-storage.md)
 
 | What | Where |
 |---|---|
-| `d_key` | daemon RAM only; with automatic login also the keychain |
-| `d_salt` + storage salt | the OS keychain (device-only, never synced) |
-| `a_key`, `a_salt`, identity seed, trusted peers, config | the vault file, encrypted |
+| `d_key` | daemon RAM only; with automatic login also the keychain (Standard mode only) |
+| `a_salt`, `d_salt`, storage salt, the unlock mode | the vault file's header, in plain (public parameters, authenticated) |
+| `a_key` | Standard mode: the vault file, encrypted; Enhanced mode: daemon RAM only |
+| identity seed, trusted peers, config | the vault file, encrypted |
+
+Until 2026-11-26 `d_salt` and the storage salt were in the keychain. His
+decision: the vault must not rely on the OS for anything (it works the same
+on every platform, and losing keychain items can't lock him out of a vault
+any more); the keychain stays only for automatic login.
 
 ### 8.2 Keychain **[built on macOS]**
 
-Service `dev.czarekk.cesaconn`, two generic-password items:
-- `salts`: `d_salt (32) || storage salt (32)`;
-- `data-key`: `d_key (32)`, automatic login only.
+Service `dev.czarekk.cesaconn`, one generic-password item:
+- `data-key`: `d_key (32)`, automatic login only (Standard mode only).
 
 macOS: the login keychain with synchronisation off (never iCloud). The
 data-protection keychain with `WhenUnlockedThisDeviceOnly` needs the
 entitlement that comes with release signing **[open]**. Values come back in
 `Zeroizing`; the copy inside the Security framework (`CFData`) is released by
 the OS and can't be wiped from here. Behind the `SecretStore` trait, so tests
-use memory.
+use memory; `supported()` says whether the platform has a backend at all
+(macOS only today; Linux Secret Service needs a dependency decision,
+**[open]**).
 
-### 8.3 Vault file format, version 2 **[built]**
+Builds before vault version 3 also wrote an item `salts`. It is not read or
+deleted any more; remove it by hand once:
+`security delete-generic-password -s dev.czarekk.cesaconn -a salts`.
+
+### 8.3 Vault file format, version 3 **[built]**
 
 Path: macOS `~/Library/Application Support/cesaconn/vault.bin`, elsewhere
 `$XDG_DATA_HOME/cesaconn/vault.bin` or `~/.local/share/cesaconn/vault.bin`
 (directory `0700`, checked like the IPC directory).
 
 ```
-MAGIC "CESAVLT\0" (8) || VERSION 0x02 (1)               header
+MAGIC "CESAVLT\0" (8) || VERSION 0x03 (1) || mode (1) ||
+  a_salt (32) || d_salt (32) || storage salt (32)          header (106 bytes)
 wrap nonce (12) || AES-256-GCM(KEK, DEK) (32 + 16)       AAD = header || "cesaconn-vault-dek"
 data nonce (12) || AES-256-GCM(DEK, plaintext) (n*4096 + 16)  AAD = header || "cesaconn-vault-data"
 ```
 
+- mode: `0x00` Standard (KEK = `HKDF-BLAKE2s(ikm = d_key, salt = storage
+  salt, info = "cesaconn-storage-v1")`), `0x01` Enhanced (KEK =
+  `HKDF-BLAKE2s(ikm = Argon2id(d_key || a_key, storage salt), salt =
+  storage salt, info = "cesaconn-storage-both-v1")`, with the protocol's
+  Argon2 parameters, so a guessed pair costs a full Argon2 run, 6.7);
+  anything else is `Malformed`.
+- The header is readable without any key (`read_header`): the daemon needs
+  the mode and the salts before it can derive anything. It is
+  authenticated: it is the AAD of both layers, and the wrapped DEK is bound
+  to it, so a changed salt or mode byte fails the unwrap. That can only
+  make the vault fail to open (counted as a wrong password), never open it
+  differently; whoever can change the file can delete it anyway.
 - `plaintext = contents len (u32 LE) || contents || zeros`, padded to whole
   4096-byte blocks, so the size doesn't reveal how many peers or how much
   config there is. Unpadding is strict: every padding byte must be zero.
 - `contents` is TLV, `tag (1) || len (u32 LE) || value`, every tag exactly
   once and in this order, nothing after:
-  `0x01 a_key (32)`, `0x02 a_salt (32)`, `0x03 config (<= 64 KiB)`,
-  `0x04 identity seed (64)`, `0x05 peers (<= 1 MiB)`.
+  `0x01 a_key (32)` (Standard mode only; refused in Enhanced mode),
+  `0x03 config (<= 64 KiB)`, `0x04 identity seed (64)`,
+  `0x05 peers (<= 1 MiB)`. (`0x02` held `a_salt` in version 2; it is in the
+  header now.) Sealing contents that don't fit the mode is refused
+  (`WrongMode`), so a bug can't write `a_key` into an Enhanced vault.
 - config, version 2: `version 0x02 (1) || flags (1) || addresses`, flag
   bit 0 = Sync, bit 1 = clipboard sync; every other bit must be 0.
   `addresses` are the paired devices' last addresses (13.1):
@@ -638,33 +794,60 @@ data nonce (12) || AES-256-GCM(DEK, plaintext) (n*4096 + 16)  AAD = header || "c
 - Every seal uses a fresh random 96-bit nonce under the same DEK (and every
   wrap one under the KEK). A device seals once per change (a password, a new
   peer), far below the ~2^32 encryptions where random GCM nonces get risky.
-- The only plaintext on disk is the format metadata: magic, version, nonces,
-  ciphertexts. No salt, key, config value or content length.
-- Version 1 files are refused (`Malformed`).
+- The only plaintext on disk is the header (format metadata, the mode, the
+  three salts), nonces and ciphertexts. No key, config value or content
+  length.
+- Versions 1 and 2 are `Outdated` (the daemon reports `vault_outdated`, 6.2,
+  and the UI says to reset). Every other version (0, 4 and up) is
+  `UnknownVersion`: the daemon stays locked, logs that it doesn't know the
+  version (made by a newer build?) and never says "outdated" or deletes
+  anything; unlocking it is `StorageFailed`. There is no migration (his
+  decision: the app is in testing, he resets his devices).
 
 Reading: the directory is re-checked; the file must be a regular file of ours
 with no group/other bits and at most 4 MiB, checked before reading and bounded
 while reading. Writing: a new `0600` temp file with a random name in the same
 directory (`create_new`), written, fsynced, renamed over the old file, then
-the directory is fsynced; a failed write removes the temp file.
+the directory is fsynced; a failed write removes the temp file. An error
+before the rename means the old file is still the vault and nothing
+changed. Once the rename is done the new file is the vault: a failed
+directory fsync after it only logs a warning (a power cut might still undo
+the change) and counts as saved, so the daemon's keys, header and wrap in
+RAM always follow what is on disk (a mode switch reported as failed while
+its file was in place would have left RAM in the old mode, and the next
+save would have written that back). Deleting the file (a reset) works the
+same way.
 
 Errors: a failed DEK unwrap is `WrongKey` (the only place a wrong password
 shows); a DEK that unwraps but contents that don't decrypt or parse is
 `Corrupt`. The daemon maps `WrongKey` to `WrongPassword` and everything else
-to `StorageFailed`, with details only in the daemon log.
+to `StorageFailed` (`Outdated` to `VaultOutdated` before it gets that far),
+with details only in the daemon log.
 
 ### 8.4 Known costs **[accepted]**
 
-- Anyone holding the vault file **and** the keychain salts can try data
-  passwords offline at Argon2 speed (64 MiB per guess). Hence the 12-character
-  minimum; a strength hint in the UI is **[planned]**.
-- Cracking `pw2` from the vault also yields `a_key` (it is inside), so at rest
-  the two passwords are not independent: see section 18.
+- Anyone holding the vault file can try data passwords offline at Argon2
+  speed (64 MiB per guess): the salts are in the file now, the keychain is
+  no longer a second thing to steal (his decision, 2026-11-26). Hence the
+  12-character minimum; a strength hint in the UI is **[planned]**. Enhanced
+  mode raises this to guessing both passwords together, a full Argon2 run
+  per guessed pair (6.7).
+- Turning Enhanced on doesn't reach older copies of the file: a Standard
+  copy and `pw2` still give that `a_key` and `d_key`, and those open the
+  Enhanced vault too, until pw1 changes (the new DEK doesn't prevent it).
+  Changing pw1 afterwards closes this (6.7).
+- Standard mode: cracking `pw2` from the vault also yields `a_key` (it is
+  inside), so at rest the two passwords are not independent: see section
+  18. Enhanced mode closes this (for older copies of the file only once pw1
+  is changed, 6.7).
+- The salts identify the group: whoever has the file can tell which group
+  it belongs to (`a_salt` is the group identifier, 11.4). It gives no
+  offline test of pw1.
 - Linux has no keychain backend yet (Secret Service needs a dependency
-  decision), so Linux is RAM only and says so. Headless Linux has no Secret
-  Service at all.
-- A forgotten data password means the vault can't be opened. Reset comes with
-  section 14.
+  decision), so Linux has no automatic login; the vault works there like on
+  macOS.
+- A forgotten data password (Enhanced: either password) means the vault
+  can't be opened: reset and join again (14.2).
 
 ---
 
@@ -1093,8 +1276,8 @@ needed: this is the same thing.)
 Joining (every other device, the UI's "Add device" on a fresh device):
 1. `JoinGroup` with pw1 and pw2. Only on a **fresh** device (no keys, no
    salts, no vault, not locked; `AlreadyInGroup` otherwise) with storage
-   (`NotSaved` on RAM-only platforms: a joined device must survive a
-   restart). One join at a time (`JoinRunning`). A new identity seed is made
+   (`NotSaved` without storage, i.e. no safe data directory: a joined
+   device must survive a restart). One join at a time (`JoinRunning`). A new identity seed is made
    for the join;
 2. the daemon can't derive anything yet, so both passwords move into the
    join's task in `Zeroizing` buffers: the **join slot**. It ends after
@@ -1180,9 +1363,10 @@ caveat).
 
 ### 11.6 Storage effects
 
-The salts are stored as before: `a_salt` in the vault, `d_salt` in the
-keychain. A device that loses its vault or keychain, or a RAM-only daemon
-after a restart, re-joins through another member (reset, 14.2).
+A joined device keeps the group's salts like a new one: all three salts in
+its vault's header (8.3), in Standard mode. A device that loses its vault,
+or a RAM-only daemon after a restart, re-joins through another member
+(reset, 14.2).
 If every device is gone, the group is gone and a new one is created.
 
 ### 11.7 IPC additions
@@ -1357,8 +1541,9 @@ Diagrams: [`docs/diagrams/add-device.md`](../diagrams/add-device.md).
 
 **Sync switch.** "Sync" in the UI, **off by default**, saved in the vault
 config (`SetSync`; saved first, kept second). It needs an open, saved vault:
-`Locked` / `NotSaved` otherwise, so RAM-only platforms (Linux today) have no
-networking yet. Networking runs exactly while the vault is open, both keys
+`Locked` / `NotSaved` otherwise, so a RAM-only daemon (no safe data
+directory) has no networking. Linux saves its vault since the salts moved
+into it (8.1), so networking runs there too (no clipboard module yet). Networking runs exactly while the vault is open, both keys
 are set and Sync is on; every state change (and automatic login at start)
 re-checks that. Starting it builds `DeviceKeypairs::from_seed(identity)` and
 one `NetworkerContext` (a copy of the keys, the daemon's trusted-peer list,
@@ -1573,8 +1758,8 @@ the log.
 `ResetDevice` (TUI: Settings > "Reset this device", type `RESET`, Enter)
 wipes this device back to fresh: it leaves its group, the other devices keep
 their keys and their trust in it (forget it there). It also is the way out of
-a forgotten data password or lost keychain salts (the vault can't be opened
-anyway), so it works while locked, and it asks for no password: the same
+a forgotten password and of a vault of an older version (the vault can't be
+opened anyway), so it works while locked, and it asks for no password: the same
 user can delete the files by hand, a reset reveals nothing and the IPC gates
 (7.2) decide who may ask.
 
@@ -1582,13 +1767,14 @@ Order, under the change slot:
 1. the reset counter goes up, a running join is cancelled, networking stops
    (invite window, salt port, prompts);
 2. the vault file is deleted (directory fsynced). This is the decisive step:
-   without a vault the daemon starts fresh and ignores keychain items. If it
+   without a vault the daemon starts fresh and ignores the keychain. If it
    fails, nothing else changed (`StorageFailed`, networking follows the
    unchanged state again);
 3. memory: the key slots are dropped (zeroized), the trusted-peer list is
    **replaced by a new one**, prompts cleared;
-4. the keychain items `salts` and `data-key` are deleted. A failure leaves a
-   fresh device and returns `StorageFailed`; a second reset removes them.
+4. the keychain item `data-key` is deleted (a platform without a keychain
+   has nothing to delete). A failure leaves a fresh device and returns
+   `StorageFailed`; a second reset removes it.
 
 Nothing from before comes back: a handshake of the old network that
 finishes late pairs into the old, dropped list (the daemon and the next
@@ -1601,8 +1787,8 @@ it started with and refuses after a reset.
 
 | Platform | IPC | Storage | Notes |
 |---|---|---|---|
-| macOS | Unix socket, uid + code-signature gates | login keychain + vault | data-protection keychain and signature gates need release signing; clipboard sync through `NSPasteboard` (12.7) |
-| Linux | Unix socket in `$XDG_RUNTIME_DIR`, uid gate (no OS code signing) | RAM only | Secret Service backend needs a dependency decision **[open]**; no clipboard module yet (and no networking without storage) |
+| macOS | Unix socket, uid + code-signature gates | vault; login keychain for automatic login only | data-protection keychain and signature gates need release signing; clipboard sync through `NSPasteboard` (12.7) |
+| Linux | Unix socket in `$XDG_RUNTIME_DIR`, uid gate (no OS code signing) | vault (no automatic login) | Secret Service backend for automatic login needs a dependency decision **[open]**; no clipboard module yet |
 | Windows | not supported: the daemon logs an error and exits | none | named pipe with a user-only DACL is possible, but the peer and owner checks need unsafe Win32 calls; options: an audited unsafe module, a wrapper crate, or defer **[open]** |
 
 ---
@@ -1617,7 +1803,8 @@ it started with and refuses after a reset.
 - A wrong password and a damaged vault are different errors on purpose, so a
   damaged file never looks like a typo.
 - Warnings that must be loud: IPC signature check disabled, RAM-only storage,
-  keychain refused, automatic login turned off.
+  keychain refused, automatic login turned off, Enhanced security turned
+  off, a vault of an older version, a leftover automatic-login key removed.
 
 ---
 
@@ -1625,7 +1812,15 @@ it started with and refuses after a reset.
 
 Tests (`cargo test --workspace --all-features`):
 - daemon: setup, restart, unlock, wrong password, automatic login, password
-  changes, keychain failure, damaged vault, unlock delay and counter, unlocks
+  changes, a keychain failure and a platform without a keychain (the vault
+  saves and unlocks anyway, only automatic login fails), the salts in the
+  header and nothing secret on disk, Enhanced security (on and off, a
+  restart needing both passwords, one password alone refused without a
+  count, a wrong auth or data password or the two swapped each counted,
+  password changes in Enhanced mode, the conflict with automatic login both
+  ways, a leftover automatic-login key removed unused), an outdated vault
+  (every unlock refused without a count, reset as the way out), damaged
+  vault, unlock delay and counter, unlocks
   inside the delay refused at once (also the 60 s delay over a real socket,
   within the IPC deadline), minimum
   length in characters, identity and peers surviving restarts, RAM-only mode,
@@ -1677,8 +1872,26 @@ Tests (`cargo test --workspace --all-features`):
 - IPC: framing bounds, strict decoding, decoders on random input, peer gates
   and code requirements over real sockets, socket permissions, stale and
   foreign socket files;
-- vault: format, padding, tampering, sizes, atomic writes, deletion,
-  directory checks.
+- vault: format, the header readable without a key, only versions 1 and 2
+  `Outdated` (0, newer and truncated ones `UnknownVersion`), both modes (the
+  Enhanced KEK needs both keys, either one alone or the Standard KEK fails,
+  it runs Argon2 over the pair and isn't a plain HKDF of the two keys,
+  `a_key` never in an Enhanced file), a failed directory fsync after the
+  rename counts as saved, contents
+  that don't fit the mode refused both ways, the wrap bound to the header,
+  padding, tampering (every byte, the salts and the mode included), sizes,
+  atomic writes, deletion, directory checks;
+- TUI: the Enhanced switch (recommended while off, asks both ways, shows
+  only the daemon's value, turns automatic login off first, says in the
+  popup why the daemon would refuse), automatic login shown as excluded or
+  unsupported, the two-step unlock prompt (exact passwords, wiped, never
+  logged, Esc wipes both, the red reason after a wrong password), the
+  outdated-vault notice, every new popup whole at 60, 80 and 120 columns;
+  an open unlock prompt swapped (and wiped) when the vault's mode changes,
+  automatic login off sent first even when the status still says off
+  (and not at all without a keychain), keys that couldn't be saved told
+  apart from passwords not set yet, a 200-character password on one line
+  in the unlock prompts (help visible, cursor inside the popup).
 
 Every new protection gets a test that fails without it.
 
@@ -1691,7 +1904,10 @@ connections, or open UDP 3636 and TCP 3232 / 3233):
 3. both show the same 8 emoji with names: `y` on both. B ends up with saved
    keys, Sync on and A as a paired device;
 4. restart B's daemon and unlock: A and B reconnect without a prompt;
-5. Settings > Clipboard sync on both. Copy text on A: it is on B's
+5. Settings > Enhanced security on B (`y`). Restart B's daemon: the TUI
+   asks for the auth password, then the data password; a wrong one is
+   refused (in red), both right unlock it and A and B still reconnect.
+   Then Settings > Clipboard sync on both. Copy text on A: it is on B's
    clipboard within a second, and the other way round. Copy a password from
    a password manager (concealed): it stays on A;
 6. on B only, change the auth password: both Devices tabs show the other as
@@ -1729,9 +1945,17 @@ Stated plainly so nobody relies on a property that isn't there.
    handshake today and can later solve discrete logs could test `pw1` guesses
    offline against that recording. A strong pw1 is the only defence until a
    post-quantum PAKE is adopted. **[open]**
-2. **Two-key independence stops at rest.** The vault holds `a_key` and is
-   opened with `pw2`: cracking pw2 offline (needs the file *and* the keychain
-   salts) also yields `a_key`.
+2. **Standard mode: two-key independence stops at rest.** The vault holds
+   `a_key` and is opened with `pw2`: cracking pw2 offline (the file alone is
+   enough, its salts are in it) also yields `a_key`. Enhanced security
+   (6.7) narrows this: `a_key` isn't stored and the vault opens only with
+   both passwords. Someone who already knows pw2 can still test pw1
+   guesses offline against the file (two Argon2 runs, HKDF and a GCM tag
+   check per guess), so it raises the cost of finding pw1 but doesn't
+   make it impossible. It is off by default (his decision),
+   so a device is in Standard mode until the user turns it on. An older
+   Standard copy of the file plus pw2 still gives both keys, which open the
+   Enhanced vault too, until pw1 is changed (6.7).
 3. **Two-key independence and offline guesses on the wire.** A device that
    knows `pw1`, was paired by a user who accepted the code, and has `d_salt`
    (a joining device gets it, 11.5) receives `d_key`-layer
@@ -1834,6 +2058,11 @@ Stated plainly so nobody relies on a property that isn't there.
 Decided:
 - Storage (section 8): vault + keychain, envelope encryption, `d_key` RAM only,
   opt-in automatic login with the warning text.
+- (2026-11-26) The vault doesn't rely on the OS: all three salts in its
+  header, the keychain only for opt-in automatic login (8.1). Enhanced
+  security: both passwords at every start, `a_key` never stored; off by
+  default and offered as recommended (6.7). No migration of older vaults:
+  they are reported and reset (6.2).
 - Salt query privacy: the invite window, 2 min.
 - Join defaults: `JOIN_WINDOW` 5 min, `JOIN_MAX_ATTEMPTS` 5.
 - Networking off by default; a persisted "Sync" switch.
@@ -1864,6 +2093,38 @@ Decided:
 - (2026-11-13) Section 18 lists only real weaknesses: the unlock counter
   reset moved to 6.4 and the transcript note to 10.4 (neither is a
   weakness); the items after them were renumbered.
+
+Proposed in the own-vault-salts / Enhanced security PR, for his review:
+- Enhanced mode makes the KEK from both keys instead of storing a check
+  value of `a_key` (what was discussed first). pw1 stays testable offline
+  for someone who knows pw2: each guess costs two Argon2 runs (pw1, then
+  the pair) followed by HKDF and a GCM tag check, so guesses are expensive
+  but the test isn't prevented. The cost of the design: a wrong unlock
+  can't say which of the two passwords was wrong (6.4);
+- after CodeRabbit's review (his decision): the Enhanced KEK runs one more
+  Argon2 over both keys (`HKDF(Argon2id(d_key || a_key))`), because a plain
+  `HKDF(d_key || a_key)` let an attacker test N x M guessed pairs with only
+  N + M Argon2 runs. Unlock now costs three Argon2 runs (6.7);
+- every mode switch makes a new DEK, and turning Enhanced on removes a
+  possible automatic-login key first (refused if that fails); older copies
+  of the file are documented, with "change pw1 afterwards" as the way to
+  close them (6.7);
+- `a_salt` moves into the header too (not only `d_salt` and the storage
+  salt): Enhanced mode needs it before the vault is open, and it is public
+  anyway (a joining device fetches it, 11.4). One header layout for both
+  modes;
+- the unlock mode is per device, in the header, and a joined device starts
+  in Standard mode (6.7);
+- two new requests (`UnlockBoth`, `SetEnhanced`) instead of a second
+  password field in `Unlock`; the wrong request for the mode is refused
+  before any Argon2 and isn't counted as a guess (6.4);
+- turning Enhanced on with automatic login on is refused by the daemon
+  (`AutoLoginConflict`), and the TUI turns automatic login off first after
+  saying so in the popup (6.7);
+- Linux now saves its vault (it was RAM only for lack of a keychain); only
+  automatic login waits for a Linux keychain backend (15);
+- the old keychain item `salts` is left alone (not read, not deleted); a
+  one-line command removes it (8.2).
 
 Proposed in the connect-by-address PR, for his review:
 - `a` on Devices for a typed IP address, as two new requests (IPC 9)
@@ -1933,7 +2194,7 @@ Open:
 Built (in `main`): the crypto primitives; `auth_snow` with SPAKE2, hybrid KEX,
 Noise, ML-DSA, pairing protocol, chunking and the `d_key` layer; discovery;
 the TCP networker with limits and the guess limiter; the IPC with both gates;
-the daemon with Argon2, the vault, the keychain, unlock, automatic login, a
+the daemon with Argon2, the vault, unlock, automatic login (keychain), a
 persistent identity and persistent trusted peers; the Sync switch, "Add
 device" and the pairing prompt with the emoji code (section 13).
 
@@ -1949,4 +2210,5 @@ Next, one stacked PR each, every failure path tested:
 Built since: forgetting a device and resetting this device (14.1, 14.2,
 IPC version 7); clipboard sync v1 on macOS and the "incorrect password"
 state per paired device with the hello (12, 13.1, IPC version 8, vault
-config version 2).
+config version 2); the vault with its salts in its own header (version 3)
+and Enhanced security (6.7, 8.3, IPC version 10).

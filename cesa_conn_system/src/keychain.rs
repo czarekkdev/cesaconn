@@ -1,15 +1,15 @@
-//! OS keychain access for the daemon's few keychain items.
+//! OS keychain access for the daemon's one keychain item.
 //!
-//! Only two items exist, both owned by the daemon:
-//! * [`Item::Salts`]: `d_salt (32) || storage salt (32)`. Without them the
-//!   encrypted vault can't be opened even with the right password.
-//! * [`Item::DataKey`]: `d_key (32)`, only with automatic login enabled.
+//! The vault doesn't need the keychain (its salts are in its own header).
+//! The only item is [`Item::DataKey`]: `d_key (32)`, kept only while the
+//! user has opted in to automatic login, after a warning that its security
+//! then rests on the OS.
 //!
 //! macOS: the login keychain, never iCloud-synchronised. The stricter data
 //! protection keychain (`WhenUnlockedThisDeviceOnly`) needs the entitlement that
 //! comes with release signing; switching to it is part of release signing.
 //! Other platforms: not supported yet ([`KeychainErrors::Unsupported`]), so
-//! the daemon stays RAM-only there and says so.
+//! there is no automatic login there (the vault works the same).
 //!
 //! Values come back in `Zeroizing` buffers. The copy inside the Security
 //! framework (a `CFData`) is released by the OS and can't be wiped from here.
@@ -23,8 +23,6 @@ pub const SERVICE: &str = "dev.czarekk.cesaconn";
 /// The items the daemon keeps in the keychain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Item {
-    /// `d_salt || storage salt` (64 bytes).
-    Salts,
     /// `d_key` (32 bytes), automatic login only.
     DataKey,
 }
@@ -33,7 +31,6 @@ impl Item {
     /// Keychain account name of the item.
     pub fn account(self) -> &'static str {
         match self {
-            Item::Salts => "salts",
             Item::DataKey => "data-key",
         }
     }
@@ -59,6 +56,9 @@ impl fmt::Display for KeychainErrors {
 
 /// Where the daemon keeps keychain items. A trait so tests can use memory.
 pub trait SecretStore: Send + Sync {
+    /// Whether this store can keep anything on this platform at all (a
+    /// switch that needs it is shown as unavailable otherwise).
+    fn supported(&self) -> bool;
     /// The item's value, or `None` if it doesn't exist.
     fn get(&self, item: Item) -> Result<Option<Zeroizing<Vec<u8>>>, KeychainErrors>;
     /// Creates or replaces the item.
@@ -115,6 +115,10 @@ mod macos {
 
 #[cfg(target_os = "macos")]
 impl SecretStore for OsKeychain {
+    fn supported(&self) -> bool {
+        true
+    }
+
     fn get(&self, item: Item) -> Result<Option<Zeroizing<Vec<u8>>>, KeychainErrors> {
         macos::get(item)
     }
@@ -131,6 +135,10 @@ impl SecretStore for OsKeychain {
 /// No supported keychain here yet: every operation fails, nothing is stored.
 #[cfg(not(target_os = "macos"))]
 impl SecretStore for OsKeychain {
+    fn supported(&self) -> bool {
+        false
+    }
+
     fn get(&self, _item: Item) -> Result<Option<Zeroizing<Vec<u8>>>, KeychainErrors> {
         Err(KeychainErrors::Unsupported)
     }
@@ -148,10 +156,11 @@ impl SecretStore for OsKeychain {
 mod tests {
     use super::*;
 
-    /// Test that item names are distinct (one item can't overwrite the other)
+    /// Test that the item keeps the account name it always had, so a key
+    /// saved by an earlier build is still found (and removed by a reset)
     #[test]
-    fn test_item_accounts_distinct() {
-        assert_ne!(Item::Salts.account(), Item::DataKey.account());
+    fn test_item_account_name() {
+        assert_eq!(Item::DataKey.account(), "data-key");
     }
 
     /// Test the real macOS keychain: set, get, replace, delete, delete again.
@@ -181,12 +190,13 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn test_unsupported_platform_fails() {
+        assert!(!OsKeychain.supported());
         assert_eq!(
-            OsKeychain.get(Item::Salts),
+            OsKeychain.get(Item::DataKey),
             Err(KeychainErrors::Unsupported)
         );
         assert_eq!(
-            OsKeychain.set(Item::Salts, &[0; 64]),
+            OsKeychain.set(Item::DataKey, &[0; 32]),
             Err(KeychainErrors::Unsupported)
         );
     }

@@ -1,22 +1,41 @@
 //! The encrypted vault: everything the daemon keeps across restarts.
-//! Nothing is stored unencrypted, configs included.
+//! Nothing secret is stored unencrypted, configs included; the only
+//! plaintext is format metadata and the three salts.
+//!
+//! The vault doesn't rely on the OS: its salts live in its own header, so
+//! it works the same on every platform. The OS keychain is used only for
+//! the opt-in automatic login (`d_key`, see the daemon).
 //!
 //! Envelope encryption:
-//! * `KEK = HKDF-BLAKE2s(ikm = d_key, salt = storage salt, info = KEK_LABEL)`.
-//!   The KEK never uses `d_key` directly, and it is useless on the network.
-//! * A random DEK encrypts the payload. The KEK only wraps the DEK, so changing
-//!   the data password re-wraps 32 bytes.
-//! * The salts (`d_salt`, storage salt) live in the OS keychain, never here.
+//! * Standard mode: `KEK = HKDF-BLAKE2s(ikm = d_key, salt = storage salt,
+//!   info = KEK_LABEL)`; the vault holds `a_key`, so the data password
+//!   alone opens it.
+//! * Enhanced mode: `KEK = HKDF-BLAKE2s(ikm = Argon2id(d_key || a_key,
+//!   storage salt), salt = storage salt, info = KEK_BOTH_LABEL)`; `a_key`
+//!   is never stored, so both passwords are needed at every start. The
+//!   extra Argon2 makes every pairing of a guessed auth password with a
+//!   guessed data password cost a full Argon2 run: without it an attacker
+//!   would derive each candidate key once and test the pairings with a
+//!   cheap HKDF (N + M Argon2 runs for N x M pairs instead of N x M).
+//! * The KEK never uses a key directly, and it is useless on the network.
+//! * A random DEK encrypts the payload. The KEK only wraps the DEK, so a
+//!   password or mode change re-wraps 32 bytes.
 //!
 //! File layout, all AES-256-GCM:
 //! ```text
-//! MAGIC (8) || VERSION (1)                        header, AAD of both layers
-//! wrap nonce (12) || wrapped DEK (32 + 16)        AAD = header || WRAP_LABEL
-//! data nonce (12) || ciphertext (n * PAD_BLOCK + 16)  AAD = header || DATA_LABEL
+//! MAGIC (8) || VERSION (1) || mode (1) ||
+//!   a_salt (32) || d_salt (32) || storage salt (32)   header, AAD of both layers
+//! wrap nonce (12) || wrapped DEK (32 + 16)             AAD = header || WRAP_LABEL
+//! data nonce (12) || ciphertext (n * PAD_BLOCK + 16)   AAD = header || DATA_LABEL
 //! ```
+//! The salts aren't secret (`a_salt` is even sent to joining devices), but
+//! with them in the file, anyone holding the file can guess passwords
+//! offline: each guess costs a full Argon2 run, each guessed pair in
+//! Enhanced mode (daemon.md 8.3).
+//!
 //! The plaintext of the data layer is `contents len (u32 LE) || contents ||
 //! zeros`, padded to whole [`PAD_BLOCK`]s, so the file size doesn't tell how
-//! much is inside. The only plaintext on disk is format metadata.
+//! much is inside.
 
 use core::fmt;
 use std::io::{Read, Write};
@@ -24,11 +43,13 @@ use std::path::{Path, PathBuf};
 
 use blake2::Blake2s256;
 use hkdf::SimpleHkdf;
+use tracing::warn;
 use zeroize::Zeroizing;
 
 use cesa_conn_crypto::{
     aes::{decrypt_with_aad, encrypt_with_aad},
     crand::random_array,
+    pswd_manager::derive_key,
 };
 use cesa_conn_system::ipc::check_private_dir;
 
@@ -37,10 +58,13 @@ use crate::auth_snow::{AuthKey, DataKey, IDENTITY_SEED_LEN};
 /* format constants */
 /// File magic.
 const MAGIC: &[u8; 8] = b"CESAVLT\0";
-/// Format version.
-const VERSION: u8 = 2;
-/// -> magic (8) + version (1)
-const HEADER_LEN: usize = 9;
+/// Format version (3: salts and the unlock mode in the header).
+const VERSION: u8 = 3;
+/// Versions of earlier builds (salts in the keychain): reported as
+/// outdated, so the user is told to reset. Any other version is unknown.
+const OUTDATED_VERSIONS: [u8; 2] = [1, 2];
+/// -> magic (8) + version (1) + mode (1) + three salts (3 * 32)
+const HEADER_LEN: usize = 8 + 1 + 1 + 3 * 32;
 /// AES-GCM nonce (12) and tag (16)
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
@@ -55,14 +79,21 @@ pub const MAX_VAULT_LEN: u64 = 4 * 1024 * 1024;
 /// Smallest valid file: header, wrap, data nonce, one block + tag.
 const MIN_VAULT_LEN: usize = HEADER_LEN + WRAP_LEN + NONCE_LEN + PAD_BLOCK + TAG_LEN;
 
+/* unlock modes (header byte 9) */
+/// Standard: the data password opens the vault, `a_key` is inside.
+const MODE_STANDARD: u8 = 0x00;
+/// Enhanced: both passwords open the vault, `a_key` is never stored.
+const MODE_ENHANCED: u8 = 0x01;
+
 /* domain separation */
 const KEK_LABEL: &[u8] = b"cesaconn-storage-v1";
+const KEK_BOTH_LABEL: &[u8] = b"cesaconn-storage-both-v1";
 const WRAP_LABEL: &[u8] = b"cesaconn-vault-dek";
 const DATA_LABEL: &[u8] = b"cesaconn-vault-data";
 
 /* contents (TLV inside the data layer): tag (1) || len (u32 LE) || value */
+/// Standard mode only.
 const TAG_A_KEY: u8 = 0x01;
-const TAG_A_SALT: u8 = 0x02;
 const TAG_CONFIG: u8 = 0x03;
 const TAG_IDENTITY: u8 = 0x04;
 const TAG_PEERS: u8 = 0x05;
@@ -77,12 +108,21 @@ const FILE_NAME: &str = "vault.bin";
 /// All errors of the vault.
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum VaultErrors {
-    /// The file is not a vault of this version, or its layout is wrong.
+    /// The file is not a vault, or its layout is wrong.
     Malformed,
-    /// The DEK didn't unwrap: wrong data password (or a swapped header).
+    /// The file is a vault of an older format version (1 or 2): this
+    /// version can't open it (reset the device and join again).
+    Outdated,
+    /// The file is a vault of a version this build doesn't know (a newer
+    /// build, or damage): left alone, never reported as outdated.
+    UnknownVersion,
+    /// The DEK didn't unwrap: wrong password(s) (or a swapped header).
     WrongKey,
     /// The DEK unwrapped but the contents didn't decrypt or parse: damaged.
     Corrupt,
+    /// The contents don't fit the header's unlock mode (`a_key` stored in
+    /// Enhanced mode, or missing in Standard mode).
+    WrongMode,
     /// The file is larger than [`MAX_VAULT_LEN`] or the contents too large.
     TooLarge,
     /// Random bytes, HKDF or encryption failed.
@@ -96,9 +136,12 @@ pub enum VaultErrors {
 impl fmt::Display for VaultErrors {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            VaultErrors::Malformed => write!(f, "not a vault file of this version"),
-            VaultErrors::WrongKey => write!(f, "wrong data password"),
+            VaultErrors::Malformed => write!(f, "not a vault file"),
+            VaultErrors::Outdated => write!(f, "vault of an older version"),
+            VaultErrors::UnknownVersion => write!(f, "vault of an unknown version"),
+            VaultErrors::WrongKey => write!(f, "wrong password"),
             VaultErrors::Corrupt => write!(f, "vault contents are damaged"),
+            VaultErrors::WrongMode => write!(f, "vault contents don't fit its unlock mode"),
             VaultErrors::TooLarge => write!(f, "vault is too large"),
             VaultErrors::Crypto => write!(f, "vault cryptography failed"),
             VaultErrors::Io => write!(f, "failed to read or write the vault"),
@@ -107,54 +150,167 @@ impl fmt::Display for VaultErrors {
     }
 }
 
-/// The two keychain salts. No `Debug`/`Clone`; wiped on drop.
-pub struct Salts {
+/// How the vault is opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// The data password opens it; `a_key` is stored inside.
+    Standard,
+    /// Both passwords open it; `a_key` is never stored.
+    Enhanced,
+}
+
+impl Mode {
+    fn byte(self) -> u8 {
+        match self {
+            Mode::Standard => MODE_STANDARD,
+            Mode::Enhanced => MODE_ENHANCED,
+        }
+    }
+
+    fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            MODE_STANDARD => Some(Mode::Standard),
+            MODE_ENHANCED => Some(Mode::Enhanced),
+            _ => None,
+        }
+    }
+}
+
+/// The plaintext header: the unlock mode and the three salts. Not secret,
+/// but authenticated (it is the AAD of both layers). No `Debug`; wiped on
+/// drop like every salt in the daemon.
+pub struct Header {
+    pub mode: Mode,
+    /// Argon2 salt of the auth password.
+    pub a_salt: Zeroizing<[u8; 32]>,
     /// Argon2 salt of the data password.
     pub d_salt: Zeroizing<[u8; 32]>,
-    /// HKDF salt of the KEK.
+    /// HKDF salt of the KEK (this device's own, never shared).
     pub storage_salt: Zeroizing<[u8; 32]>,
 }
 
-impl Salts {
-    /// `d_salt || storage salt`, as stored in the keychain.
-    pub fn to_bytes(&self) -> Zeroizing<[u8; 64]> {
-        let mut out = Zeroizing::new([0u8; 64]);
-        let (d, s) = out.split_at_mut(32);
-        d.copy_from_slice(self.d_salt.as_slice());
-        s.copy_from_slice(self.storage_salt.as_slice());
+impl Header {
+    /// The header bytes as written.
+    fn to_bytes(&self) -> [u8; HEADER_LEN] {
+        let mut out = [0u8; HEADER_LEN];
+        let (magic, rest) = out.split_at_mut(MAGIC.len());
+        magic.copy_from_slice(MAGIC);
+        let (meta, salts) = rest.split_at_mut(2);
+        meta.copy_from_slice(&[VERSION, self.mode.byte()]);
+        let (chunks, _) = salts.as_chunks_mut::<32>();
+        for (chunk, salt) in chunks
+            .iter_mut()
+            .zip([&self.a_salt, &self.d_salt, &self.storage_salt])
+        {
+            chunk.copy_from_slice(salt.as_slice());
+        }
         out
     }
 
-    /// Parses exactly 64 bytes.
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        let (d, s) = bytes.split_first_chunk::<32>()?;
-        let s: &[u8; 32] = s.try_into().ok()?;
+    /// Parses the header at the start of `file`. A vault of an earlier
+    /// build's version is [`VaultErrors::Outdated`]; any other version is
+    /// `UnknownVersion`.
+    fn parse(file: &[u8]) -> Result<Self, VaultErrors> {
+        let (magic, rest) = file
+            .split_first_chunk::<8>()
+            .ok_or(VaultErrors::Malformed)?;
+        if magic != MAGIC {
+            return Err(VaultErrors::Malformed);
+        }
+        let (&version, rest) = rest.split_first().ok_or(VaultErrors::Malformed)?;
+        if OUTDATED_VERSIONS.contains(&version) {
+            return Err(VaultErrors::Outdated);
+        }
+        if version != VERSION {
+            return Err(VaultErrors::UnknownVersion);
+        }
+        let (&mode, rest) = rest.split_first().ok_or(VaultErrors::Malformed)?;
+        let mode = Mode::from_byte(mode).ok_or(VaultErrors::Malformed)?;
+        let (a_salt, rest) = rest
+            .split_first_chunk::<32>()
+            .ok_or(VaultErrors::Malformed)?;
+        let (d_salt, rest) = rest
+            .split_first_chunk::<32>()
+            .ok_or(VaultErrors::Malformed)?;
+        let (storage_salt, _) = rest
+            .split_first_chunk::<32>()
+            .ok_or(VaultErrors::Malformed)?;
 
-        Some(Self {
-            d_salt: Zeroizing::new(*d),
-            storage_salt: Zeroizing::new(*s),
+        Ok(Self {
+            mode,
+            a_salt: Zeroizing::new(*a_salt),
+            d_salt: Zeroizing::new(*d_salt),
+            storage_salt: Zeroizing::new(*storage_salt),
         })
+    }
+
+    /// A copy with the same salts in `mode`.
+    pub fn with_mode(&self, mode: Mode) -> Self {
+        Self {
+            mode,
+            a_salt: self.a_salt.clone(),
+            d_salt: self.d_salt.clone(),
+            storage_salt: self.storage_salt.clone(),
+        }
     }
 }
 
-/// `KEK = HKDF-BLAKE2s(ikm = d_key, salt = storage salt, info = KEK_LABEL)`.
+/// The header of a vault file, read without any key: what the daemon needs
+/// before unlocking (the mode, so the UI asks for the right passwords, and
+/// the salts to derive the keys with).
+pub fn read_header(file: &[u8]) -> Result<Header, VaultErrors> {
+    if u64::try_from(file.len()).map_or(true, |l| l > MAX_VAULT_LEN) {
+        return Err(VaultErrors::TooLarge);
+    }
+    let header = Header::parse(file)?;
+    if file.len() < MIN_VAULT_LEN {
+        return Err(VaultErrors::Malformed);
+    }
+    Ok(header)
+}
+
+/// The KEK for `header`'s mode: `a_key` must be given exactly in Enhanced
+/// mode (`HKDF(Argon2id(d_key || a_key))`), and not in Standard mode
+/// (`HKDF(d_key)`). Enhanced mode runs Argon2: call it off the async
+/// workers.
 pub fn derive_kek(
+    header: &Header,
     d_key: &DataKey,
-    storage_salt: &[u8; 32],
+    a_key: Option<&AuthKey>,
 ) -> Result<Zeroizing<[u8; 32]>, VaultErrors> {
     let mut kek = Zeroizing::new([0u8; 32]);
+    let salt = Some(header.storage_salt.as_slice());
 
-    SimpleHkdf::<Blake2s256>::new(Some(storage_salt.as_slice()), d_key.expose().as_slice())
-        .expand(KEK_LABEL, kek.as_mut_slice())
-        .map_err(|_| VaultErrors::Crypto)?;
+    match (header.mode, a_key) {
+        (Mode::Standard, None) => {
+            SimpleHkdf::<Blake2s256>::new(salt, d_key.expose().as_slice())
+                .expand(KEK_LABEL, kek.as_mut_slice())
+                .map_err(|_| VaultErrors::Crypto)?;
+        }
+        (Mode::Enhanced, Some(a_key)) => {
+            // both keys in one zeroizing buffer, data key first
+            let mut ikm = Zeroizing::new([0u8; 64]);
+            let (d, a) = ikm.split_at_mut(32);
+            d.copy_from_slice(d_key.expose().as_slice());
+            a.copy_from_slice(a_key.expose().as_slice());
+            // one more Argon2 over both keys: a guessed pair costs a full run
+            let both = derive_key(ikm.as_slice(), &header.storage_salt)
+                .map_err(|_| VaultErrors::Crypto)?;
+            drop(ikm);
+            SimpleHkdf::<Blake2s256>::new(salt, both.as_slice())
+                .expand(KEK_BOTH_LABEL, kek.as_mut_slice())
+                .map_err(|_| VaultErrors::Crypto)?;
+        }
+        _ => return Err(VaultErrors::WrongMode),
+    }
 
     Ok(kek)
 }
 
 /// Everything the vault holds. No `Debug`/`Clone`; wiped on drop.
 pub struct VaultContents {
-    pub a_key: AuthKey,
-    pub a_salt: Zeroizing<[u8; 32]>,
+    /// `Some` in Standard mode, `None` in Enhanced mode (never stored).
+    pub a_key: Option<AuthKey>,
     /// Daemon settings (opaque here); empty until there are settings.
     pub config: Zeroizing<Vec<u8>>,
     /// This device's identity seed (X25519 private key || ML-DSA seed).
@@ -170,19 +326,21 @@ impl VaultContents {
             return Err(VaultErrors::TooLarge);
         }
 
-        // five entries of tag (1) + len (4), the values
-        let len = (5 * 5 + 32 + 32 + IDENTITY_SEED_LEN)
+        // up to four entries of tag (1) + len (4), the values
+        let len = (4 * 5 + 32 + IDENTITY_SEED_LEN)
             .saturating_add(self.config.len())
             .saturating_add(self.peers.len());
         let mut out = Zeroizing::new(Vec::with_capacity(len));
 
-        for (tag, value) in [
-            (TAG_A_KEY, self.a_key.expose().as_slice()),
-            (TAG_A_SALT, self.a_salt.as_slice()),
+        let a_key = self
+            .a_key
+            .as_ref()
+            .map(|k| (TAG_A_KEY, k.expose().as_slice()));
+        for (tag, value) in a_key.into_iter().chain([
             (TAG_CONFIG, self.config.as_slice()),
             (TAG_IDENTITY, self.identity.as_slice()),
             (TAG_PEERS, self.peers.as_slice()),
-        ] {
+        ]) {
             let value_len = u32::try_from(value.len()).map_err(|_| VaultErrors::TooLarge)?;
             out.push(tag);
             out.extend_from_slice(&value_len.to_le_bytes());
@@ -192,10 +350,16 @@ impl VaultContents {
         Ok(out)
     }
 
-    /// Strict TLV decoding: every tag exactly once, in order, nothing else.
-    fn decode(bytes: &[u8]) -> Option<Self> {
-        let (a_key, rest) = take_entry(bytes, TAG_A_KEY)?;
-        let (a_salt, rest) = take_entry(rest, TAG_A_SALT)?;
+    /// Strict TLV decoding for `mode`: `a_key` first exactly in Standard
+    /// mode, then every other tag exactly once, in order, nothing else.
+    fn decode(bytes: &[u8], mode: Mode) -> Option<Self> {
+        let (a_key, rest) = match mode {
+            Mode::Standard => {
+                let (a_key, rest) = take_entry(bytes, TAG_A_KEY)?;
+                (Some(AuthKey::from_bytes(a_key.try_into().ok()?)), rest)
+            }
+            Mode::Enhanced => (None, bytes),
+        };
         let (config, rest) = take_entry(rest, TAG_CONFIG)?;
         let (identity, rest) = take_entry(rest, TAG_IDENTITY)?;
         let (peers, rest) = take_entry(rest, TAG_PEERS)?;
@@ -210,8 +374,7 @@ impl VaultContents {
         identity_seed.copy_from_slice(identity);
 
         Some(Self {
-            a_key: AuthKey::from_bytes(a_key.try_into().ok()?),
-            a_salt: Zeroizing::new(a_salt.try_into().ok()?),
+            a_key,
             config: Zeroizing::new(config.to_vec()),
             identity: identity_seed,
             peers: Zeroizing::new(peers.to_vec()),
@@ -236,17 +399,10 @@ fn take_entry(bytes: &[u8], tag: u8) -> Option<(&[u8], &[u8])> {
     Some(rest.split_at(len))
 }
 
-/// The wrapped DEK (public: a nonce and a ciphertext).
+/// The wrapped DEK (public: a nonce and a ciphertext). It is bound to the
+/// header it was made for (mode and salts are its AAD).
 #[derive(Clone)]
 pub struct WrappedDek([u8; WRAP_LEN]);
-
-fn header() -> [u8; HEADER_LEN] {
-    let mut header = [0u8; HEADER_LEN];
-    let (magic, version) = header.split_at_mut(MAGIC.len());
-    magic.copy_from_slice(MAGIC);
-    version.fill(VERSION);
-    header
-}
 
 /// AAD of one layer: header (as written / as read) || label.
 fn aad(header: &[u8; HEADER_LEN], label: &[u8]) -> Vec<u8> {
@@ -258,10 +414,14 @@ pub fn generate_dek() -> Result<Zeroizing<[u8; 32]>, VaultErrors> {
     random_array::<32>().map_err(|_| VaultErrors::Crypto)
 }
 
-/// Wraps the DEK with the KEK.
-pub fn wrap_dek(kek: &[u8; 32], dek: &[u8; 32]) -> Result<WrappedDek, VaultErrors> {
-    let (ciphertext, nonce) =
-        encrypt_with_aad(kek, dek, &aad(&header(), WRAP_LABEL)).map_err(|_| VaultErrors::Crypto)?;
+/// Wraps the DEK with the KEK, for a file with `header`.
+pub fn wrap_dek(
+    header: &Header,
+    kek: &[u8; 32],
+    dek: &[u8; 32],
+) -> Result<WrappedDek, VaultErrors> {
+    let (ciphertext, nonce) = encrypt_with_aad(kek, dek, &aad(&header.to_bytes(), WRAP_LABEL))
+        .map_err(|_| VaultErrors::Crypto)?;
 
     let mut out = [0u8; WRAP_LEN];
     let (n, c) = out.split_at_mut(NONCE_LEN);
@@ -274,12 +434,20 @@ pub fn wrap_dek(kek: &[u8; 32], dek: &[u8; 32]) -> Result<WrappedDek, VaultError
     Ok(WrappedDek(out))
 }
 
-/// Builds the whole vault file: header, `wrapped`, contents encrypted with `dek`.
+/// Builds the whole vault file: `header`, `wrapped` (made for that header),
+/// contents encrypted with `dek`. The contents must fit the mode.
 pub fn seal(
+    header: &Header,
     wrapped: &WrappedDek,
     dek: &[u8; 32],
     contents: &VaultContents,
 ) -> Result<Vec<u8>, VaultErrors> {
+    // a_key is stored exactly in Standard mode
+    match (header.mode, &contents.a_key) {
+        (Mode::Standard, Some(_)) | (Mode::Enhanced, None) => {}
+        (Mode::Standard, None) | (Mode::Enhanced, Some(_)) => return Err(VaultErrors::WrongMode),
+    }
+
     let encoded = contents.encode()?;
     let encoded_len = u32::try_from(encoded.len()).map_err(|_| VaultErrors::TooLarge)?;
 
@@ -293,7 +461,8 @@ pub fn seal(
     plaintext.extend_from_slice(&encoded);
     plaintext.resize(padded_len, 0);
 
-    let (ciphertext, nonce) = encrypt_with_aad(dek, &plaintext, &aad(&header(), DATA_LABEL))
+    let head = header.to_bytes();
+    let (ciphertext, nonce) = encrypt_with_aad(dek, &plaintext, &aad(&head, DATA_LABEL))
         .map_err(|_| VaultErrors::Crypto)?;
 
     let total = (HEADER_LEN + WRAP_LEN + NONCE_LEN).saturating_add(ciphertext.len());
@@ -302,7 +471,7 @@ pub fn seal(
     }
 
     let mut file = Vec::with_capacity(total);
-    file.extend_from_slice(&header());
+    file.extend_from_slice(&head);
     file.extend_from_slice(&wrapped.0);
     file.extend_from_slice(&nonce);
     file.extend_from_slice(&ciphertext);
@@ -323,30 +492,22 @@ fn unpad(plaintext: &[u8]) -> Option<&[u8]> {
     padding.iter().all(|&b| b == 0).then_some(contents)
 }
 
-/// What [`open`] returns: the wrapped DEK (to re-seal without re-wrapping),
-/// the DEK and the contents.
+/// What [`open`] returns: the header, the wrapped DEK (to re-seal without
+/// re-wrapping), the DEK and the contents.
 pub struct Opened {
+    pub header: Header,
     pub wrapped: WrappedDek,
     pub dek: Zeroizing<[u8; 32]>,
     pub contents: VaultContents,
 }
 
-/// Opens a vault file with the KEK.
+/// Opens a vault file with the KEK (derived from this file's header).
 pub fn open(kek: &[u8; 32], file: &[u8]) -> Result<Opened, VaultErrors> {
-    if u64::try_from(file.len()).map_or(true, |l| l > MAX_VAULT_LEN) {
-        return Err(VaultErrors::TooLarge);
-    }
-    if file.len() < MIN_VAULT_LEN {
-        return Err(VaultErrors::Malformed);
-    }
+    let header = read_header(file)?;
 
     let (head, rest) = file
         .split_first_chunk::<HEADER_LEN>()
         .ok_or(VaultErrors::Malformed)?;
-    if *head != header() {
-        return Err(VaultErrors::Malformed);
-    }
-
     let (wrap, rest) = rest
         .split_first_chunk::<WRAP_LEN>()
         .ok_or(VaultErrors::Malformed)?;
@@ -382,9 +543,10 @@ pub fn open(kek: &[u8; 32], file: &[u8]) -> Result<Opened, VaultErrors> {
         .map_err(|_| VaultErrors::Corrupt)?;
 
     let encoded = unpad(&plaintext).ok_or(VaultErrors::Corrupt)?;
-    let contents = VaultContents::decode(encoded).ok_or(VaultErrors::Corrupt)?;
+    let contents = VaultContents::decode(encoded, header.mode).ok_or(VaultErrors::Corrupt)?;
 
     Ok(Opened {
+        header,
         wrapped: WrappedDek(*wrap),
         dek,
         contents,
@@ -411,9 +573,15 @@ pub fn data_dir() -> Result<PathBuf, VaultErrors> {
 }
 
 /// Creates `dir` with `0700` if missing (parents as needed) and checks it is
-/// private: a directory someone else made or opened up is refused.
+/// private: a directory someone else made or opened up is refused. Every
+/// directory created here has its parent fsynced, so a vault written into
+/// it right after can't vanish with its directory in a power cut; a failed
+/// sync is an error (nothing is stored yet). An existing `dir` is only
+/// checked.
 pub fn prepare_dir(dir: &Path) -> Result<PathBuf, VaultErrors> {
     use std::os::unix::fs::DirBuilderExt;
+
+    let missing = missing_dirs(dir);
 
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent).map_err(|_| VaultErrors::Io)?;
@@ -427,7 +595,30 @@ pub fn prepare_dir(dir: &Path) -> Result<PathBuf, VaultErrors> {
 
     check_private_dir(dir).map_err(|_| VaultErrors::InsecureDirectory)?;
 
+    for created in missing {
+        let parent = created.parent().ok_or(VaultErrors::Io)?;
+        sync_dir(parent)?;
+    }
+
     Ok(dir.to_path_buf())
+}
+
+/// The directories of `dir` (itself included) that don't exist yet,
+/// outermost first: the ones `prepare_dir` creates and must make durable.
+fn missing_dirs(dir: &Path) -> Vec<&Path> {
+    let mut list: Vec<&Path> = dir
+        .ancestors()
+        .take_while(|d| !d.as_os_str().is_empty() && !d.exists())
+        .collect();
+    list.reverse();
+    list
+}
+
+/// fsyncs a directory, so the entries created in it are on disk.
+fn sync_dir(dir: &Path) -> Result<(), VaultErrors> {
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|_| VaultErrors::Io)
 }
 
 /// The vault file path inside `dir`.
@@ -476,6 +667,9 @@ pub fn read_file(path: &Path) -> Result<Option<Vec<u8>>, VaultErrors> {
 
 /// Writes the vault atomically: a new `0600` temp file in the same private
 /// directory, fsynced, renamed over the old one, then the directory fsynced.
+/// An error means the old file is still in place. Once the rename is done
+/// the new file IS the vault, so a failed directory fsync only logs (see
+/// [`after_replace`]): the caller must not keep its old state.
 pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), VaultErrors> {
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -495,18 +689,27 @@ pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), VaultErrors> {
             .map_err(|_| VaultErrors::Io)?;
         file.write_all(bytes).map_err(|_| VaultErrors::Io)?;
         file.sync_all().map_err(|_| VaultErrors::Io)?;
-        std::fs::rename(&tmp, path).map_err(|_| VaultErrors::Io)?;
-        std::fs::File::open(dir)
-            .and_then(|d| d.sync_all())
-            .map_err(|_| VaultErrors::Io)
+        std::fs::rename(&tmp, path).map_err(|_| VaultErrors::Io)
     })();
 
     if result.is_err() {
         // best effort: never leave a half-written temp file behind
         let _ = std::fs::remove_file(&tmp);
+        return result;
     }
 
-    result
+    after_replace(std::fs::File::open(dir).and_then(|d| d.sync_all()))
+}
+
+/// The outcome of a write or delete once the file was already replaced
+/// (or removed): a failed directory fsync means only that a power cut
+/// might still undo the change. Not an error: the change is on disk and
+/// the daemon's state must follow it.
+fn after_replace(dir_sync: std::io::Result<()>) -> Result<(), VaultErrors> {
+    if dir_sync.is_err() {
+        warn!("vault changed, but syncing its directory failed: a power cut might undo the change");
+    }
+    Ok(())
 }
 
 /// Deletes the vault file (a device reset); a missing file is not an error.
@@ -521,19 +724,25 @@ pub fn delete_file(path: &Path) -> Result<(), VaultErrors> {
         Err(_) => return Err(VaultErrors::Io),
     }
 
-    std::fs::File::open(dir)
-        .and_then(|d| d.sync_all())
-        .map_err(|_| VaultErrors::Io)
+    after_replace(std::fs::File::open(dir).and_then(|d| d.sync_all()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn header(mode: Mode) -> Header {
+        Header {
+            mode,
+            a_salt: Zeroizing::new([0x5A; 32]),
+            d_salt: Zeroizing::new([0x5D; 32]),
+            storage_salt: Zeroizing::new([0x55; 32]),
+        }
+    }
+
     fn contents(config: &[u8]) -> VaultContents {
         VaultContents {
-            a_key: AuthKey::from_bytes(&[0xA1; 32]),
-            a_salt: Zeroizing::new([0xA5; 32]),
+            a_key: Some(AuthKey::from_bytes(&[0xA1; 32])),
             config: Zeroizing::new(config.to_vec()),
             identity: Zeroizing::new([0x1D; IDENTITY_SEED_LEN]),
             peers: Zeroizing::new(b"peer list".to_vec()),
@@ -541,9 +750,10 @@ mod tests {
     }
 
     fn sealed(kek: &[u8; 32], config: &[u8]) -> Vec<u8> {
+        let header = header(Mode::Standard);
         let dek = generate_dek().unwrap();
-        let wrapped = wrap_dek(kek, &dek).unwrap();
-        seal(&wrapped, &dek, &contents(config)).unwrap()
+        let wrapped = wrap_dek(&header, kek, &dek).unwrap();
+        seal(&header, &wrapped, &dek, &contents(config)).unwrap()
     }
 
     fn test_dir(name: &str) -> PathBuf {
@@ -559,33 +769,159 @@ mod tests {
         let kek = [3u8; 32];
         let opened = open(&kek, &sealed(&kek, b"cfg")).unwrap();
 
-        assert_eq!(**opened.contents.a_key.expose(), [0xA1; 32]);
-        assert_eq!(*opened.contents.a_salt, [0xA5; 32]);
+        assert_eq!(**opened.contents.a_key.unwrap().expose(), [0xA1; 32]);
         assert_eq!(opened.contents.config.as_slice(), b"cfg");
         assert_eq!(*opened.contents.identity, [0x1D; IDENTITY_SEED_LEN]);
         assert_eq!(opened.contents.peers.as_slice(), b"peer list");
+        assert_eq!(opened.header.mode, Mode::Standard);
+        assert_eq!(*opened.header.a_salt, [0x5A; 32]);
+        assert_eq!(*opened.header.d_salt, [0x5D; 32]);
+        assert_eq!(*opened.header.storage_salt, [0x55; 32]);
     }
 
-    /// Test that a vault of the previous version (no identity) is refused as
-    /// "not a vault of this version", not misread
+    /// Test that the header (mode and salts) reads back without any key,
+    /// and that the salts sit in the file as documented
     #[test]
-    fn test_old_version_refused() {
+    fn test_header_readable_without_key() {
+        let file = sealed(&[3u8; 32], b"");
+        let read = read_header(&file).unwrap();
+
+        assert_eq!(read.mode, Mode::Standard);
+        assert_eq!(*read.a_salt, [0x5A; 32]);
+        assert_eq!(*read.d_salt, [0x5D; 32]);
+        assert_eq!(*read.storage_salt, [0x55; 32]);
+        assert_eq!(
+            file.get(..HEADER_LEN).unwrap(),
+            header(Mode::Standard).to_bytes()
+        );
+    }
+
+    /// Test that only vaults of the earlier versions 1 and 2 (salts in the
+    /// keychain) are reported as outdated: any other version is unknown
+    /// (never "reset this device"), another magic malformed
+    #[test]
+    fn test_other_versions() {
+        let kek = [3u8; 32];
+        for old in [1u8, 2] {
+            let mut file = sealed(&kek, b"");
+            file[8] = old;
+            assert_eq!(read_header(&file).err(), Some(VaultErrors::Outdated));
+            assert_eq!(open(&kek, &file).err(), Some(VaultErrors::Outdated));
+        }
+
+        for other in [0u8, VERSION + 1, u8::MAX] {
+            let mut file = sealed(&kek, b"");
+            file[8] = other;
+            assert_eq!(read_header(&file).err(), Some(VaultErrors::UnknownVersion));
+            assert_eq!(open(&kek, &file).err(), Some(VaultErrors::UnknownVersion));
+        }
+        // a truncated file of an unknown version isn't "outdated" either
+        let short = [MAGIC.as_slice(), &[0u8]].concat();
+        assert_eq!(read_header(&short).err(), Some(VaultErrors::UnknownVersion));
+
+        let mut not_ours = sealed(&kek, b"");
+        not_ours[0] ^= 1;
+        assert_eq!(read_header(&not_ours).err(), Some(VaultErrors::Malformed));
+
+        // an unknown mode byte
+        let mut mode = sealed(&kek, b"");
+        mode[9] = 2;
+        assert_eq!(read_header(&mode).err(), Some(VaultErrors::Malformed));
+    }
+
+    /// Test Enhanced mode: a_key isn't in the file, the KEK needs both keys,
+    /// and either key alone (or the Standard KEK) doesn't open it
+    #[test]
+    fn test_enhanced_mode() {
+        let header = header(Mode::Enhanced);
+        let a_key = AuthKey::from_bytes(&[0xA1; 32]);
+        let d_key = DataKey::from_bytes(&[0xD1; 32]);
+        let kek = derive_kek(&header, &d_key, Some(&a_key)).unwrap();
+
+        let dek = generate_dek().unwrap();
+        let wrapped = wrap_dek(&header, &kek, &dek).unwrap();
+        let mut stored = contents(b"cfg");
+        stored.a_key = None;
+        let file = seal(&header, &wrapped, &dek, &stored).unwrap();
+
+        assert!(!file.windows(32).any(|w| w == [0xA1; 32]));
+        assert_eq!(read_header(&file).unwrap().mode, Mode::Enhanced);
+
+        let opened = open(&kek, &file).unwrap();
+        assert!(opened.contents.a_key.is_none());
+        assert_eq!(opened.contents.config.as_slice(), b"cfg");
+
+        // a wrong auth key or a wrong data key: wrong key
+        let other_a = AuthKey::from_bytes(&[0xA2; 32]);
+        let other_d = DataKey::from_bytes(&[0xD2; 32]);
+        for kek in [
+            derive_kek(&header, &d_key, Some(&other_a)).unwrap(),
+            derive_kek(&header, &other_d, Some(&a_key)).unwrap(),
+            // the Standard KEK of the same data key
+            derive_kek(&header.with_mode(Mode::Standard), &d_key, None).unwrap(),
+        ] {
+            assert_eq!(open(&kek, &file).err(), Some(VaultErrors::WrongKey));
+        }
+    }
+
+    /// Test that the KEK can't be derived for the wrong mode, and that
+    /// contents that don't fit the mode are never sealed or opened
+    #[test]
+    fn test_mode_mismatch_refused() {
+        let a_key = AuthKey::from_bytes(&[0xA1; 32]);
+        let d_key = DataKey::from_bytes(&[0xD1; 32]);
+        assert_eq!(
+            derive_kek(&header(Mode::Standard), &d_key, Some(&a_key)).err(),
+            Some(VaultErrors::WrongMode)
+        );
+        assert_eq!(
+            derive_kek(&header(Mode::Enhanced), &d_key, None).err(),
+            Some(VaultErrors::WrongMode)
+        );
+
+        let dek = generate_dek().unwrap();
+        let enhanced = header(Mode::Enhanced);
+        let wrapped = wrap_dek(&enhanced, &[1; 32], &dek).unwrap();
+        // a_key in Enhanced mode
+        assert_eq!(
+            seal(&enhanced, &wrapped, &dek, &contents(b"")).err(),
+            Some(VaultErrors::WrongMode)
+        );
+        // no a_key in Standard mode
+        let standard = header(Mode::Standard);
+        let mut no_key = contents(b"");
+        no_key.a_key = None;
+        assert_eq!(
+            seal(&standard, &wrapped, &dek, &no_key).err(),
+            Some(VaultErrors::WrongMode)
+        );
+
+        // a Standard file whose mode byte says Enhanced: the AAD fails
         let kek = [3u8; 32];
         let mut file = sealed(&kek, b"");
-        file[HEADER_LEN - 1] = 1;
-        assert_eq!(open(&kek, &file).err(), Some(VaultErrors::Malformed));
+        file[9] = MODE_ENHANCED;
+        assert_eq!(open(&kek, &file).err(), Some(VaultErrors::WrongKey));
     }
 
-    /// Test that decoding is strict about the new entries: wrong identity
-    /// length, missing or reordered entries, trailing bytes
+    /// Test that decoding is strict about the entries: wrong identity
+    /// length, missing or reordered entries, trailing bytes, a_key for the
+    /// wrong mode
     #[test]
     fn test_decode_strict_entries() {
         let good = contents(b"c").encode().unwrap();
-        assert!(VaultContents::decode(&good).is_some());
+        assert!(VaultContents::decode(&good, Mode::Standard).is_some());
+        // Enhanced mode doesn't take an a_key entry
+        assert!(VaultContents::decode(&good, Mode::Enhanced).is_none());
+
+        let mut without_key = contents(b"c");
+        without_key.a_key = None;
+        let enhanced = without_key.encode().unwrap();
+        assert!(VaultContents::decode(&enhanced, Mode::Enhanced).is_some());
+        assert!(VaultContents::decode(&enhanced, Mode::Standard).is_none());
 
         let mut trailing = good.to_vec();
         trailing.push(0);
-        assert!(VaultContents::decode(&trailing).is_none());
+        assert!(VaultContents::decode(&trailing, Mode::Standard).is_none());
 
         // identity one byte short (entry length and value both shortened)
         let mut short = contents(b"c");
@@ -597,7 +933,7 @@ mod tests {
             .unwrap();
         bytes[id_at + 1] = 63;
         bytes.remove(id_at + 5);
-        assert!(VaultContents::decode(&bytes).is_none());
+        assert!(VaultContents::decode(&bytes, Mode::Standard).is_none());
 
         // identity one byte long
         let mut bytes = short.encode().unwrap().to_vec();
@@ -607,11 +943,11 @@ mod tests {
             .unwrap();
         bytes[id_at + 1] = 65;
         bytes.insert(id_at + 5, 0);
-        assert!(VaultContents::decode(&bytes).is_none());
+        assert!(VaultContents::decode(&bytes, Mode::Standard).is_none());
 
         // peers entry missing
         let cut = good.windows(1).rposition(|w| w == [TAG_PEERS]).unwrap();
-        assert!(VaultContents::decode(&good[..cut]).is_none());
+        assert!(VaultContents::decode(&good[..cut], Mode::Standard).is_none());
     }
 
     /// Test that a wrong KEK (wrong data password) is reported as such
@@ -621,7 +957,8 @@ mod tests {
         assert_eq!(open(&[4u8; 32], &file).err(), Some(VaultErrors::WrongKey));
     }
 
-    /// Test that flipping any single byte anywhere in the file is caught
+    /// Test that flipping any single byte anywhere in the file is caught,
+    /// the salts and the mode in the header included
     #[test]
     fn test_every_byte_is_authenticated() {
         let kek = [3u8; 32];
@@ -645,6 +982,10 @@ mod tests {
             Some(VaultErrors::Malformed)
         );
         assert_eq!(open(&kek, &[]).err(), Some(VaultErrors::Malformed));
+        assert_eq!(
+            read_header(&file[..HEADER_LEN]).err(),
+            Some(VaultErrors::Malformed)
+        );
         let mut longer = file.clone();
         longer.push(0);
         assert!(open(&kek, &longer).is_err());
@@ -659,7 +1000,8 @@ mod tests {
         assert_eq!(sealed(&kek, b"").len(), sealed(&kek, &[7u8; 2000]).len());
     }
 
-    /// Test that no secret appears in the file in plaintext
+    /// Test that no secret appears in the file in plaintext (the salts in
+    /// the header are public by design)
     #[test]
     fn test_no_plaintext_secrets_on_disk() {
         let kek = [3u8; 32];
@@ -667,7 +1009,6 @@ mod tests {
 
         for secret in [
             [0xA1u8; 32].as_slice(),
-            &[0xA5u8; 32],
             &[0x1D; IDENTITY_SEED_LEN],
             b"listen_port",
             b"peer list",
@@ -677,16 +1018,17 @@ mod tests {
     }
 
     /// Test that the DEK re-wrapped under a new KEK opens the same contents
-    /// (data password change re-wraps 32 bytes only)
+    /// (a password or mode change re-wraps 32 bytes only)
     #[test]
     fn test_rewrap() {
+        let header = header(Mode::Standard);
         let dek = generate_dek().unwrap();
-        let old = wrap_dek(&[1u8; 32], &dek).unwrap();
-        let file = seal(&old, &dek, &contents(b"c")).unwrap();
+        let old = wrap_dek(&header, &[1u8; 32], &dek).unwrap();
+        let file = seal(&header, &old, &dek, &contents(b"c")).unwrap();
         let opened = open(&[1u8; 32], &file).unwrap();
 
-        let new = wrap_dek(&[2u8; 32], &opened.dek).unwrap();
-        let file = seal(&new, &opened.dek, &opened.contents).unwrap();
+        let new = wrap_dek(&opened.header, &[2u8; 32], &opened.dek).unwrap();
+        let file = seal(&opened.header, &new, &opened.dek, &opened.contents).unwrap();
 
         assert!(open(&[1u8; 32], &file).is_err());
         assert_eq!(
@@ -695,34 +1037,91 @@ mod tests {
         );
     }
 
-    /// Test that the KEK depends on both d_key and the storage salt, and isn't d_key
+    /// Test that a DEK wrapped for one header doesn't open under another
+    /// (other mode or other salts): the wrap is bound to the header
     #[test]
-    fn test_kek_derivation() {
-        let d_key = DataKey::from_bytes(&[9; 32]);
-        let kek = derive_kek(&d_key, &[1; 32]).unwrap();
+    fn test_wrap_bound_to_header() {
+        let kek = [3u8; 32];
+        let dek = generate_dek().unwrap();
+        let wrapped = wrap_dek(&header(Mode::Standard), &kek, &dek).unwrap();
 
-        assert_ne!(*kek, [9; 32]);
-        assert_ne!(*kek, *derive_kek(&d_key, &[2; 32]).unwrap());
-        assert_ne!(
-            *kek,
-            *derive_kek(&DataKey::from_bytes(&[8; 32]), &[1; 32]).unwrap()
-        );
-        assert_eq!(*kek, *derive_kek(&d_key, &[1; 32]).unwrap());
+        let mut other_salt = header(Mode::Standard);
+        other_salt.d_salt = Zeroizing::new([0x77; 32]);
+        let file = seal(&other_salt, &wrapped, &dek, &contents(b"")).unwrap();
+        assert_eq!(open(&kek, &file).err(), Some(VaultErrors::WrongKey));
     }
 
-    /// Test that the keychain salt blob round-trips and only 64 bytes parse
+    /// Test that the KEK depends on d_key, the storage salt and the mode,
+    /// isn't d_key, and in Enhanced mode depends on a_key too
     #[test]
-    fn test_salts_bytes() {
-        let salts = Salts {
-            d_salt: random_array::<32>().unwrap(),
-            storage_salt: random_array::<32>().unwrap(),
-        };
-        let back = Salts::from_bytes(salts.to_bytes().as_slice()).unwrap();
+    fn test_kek_derivation() {
+        let standard = header(Mode::Standard);
+        let d_key = DataKey::from_bytes(&[9; 32]);
+        let kek = derive_kek(&standard, &d_key, None).unwrap();
 
-        assert_eq!(*back.d_salt, *salts.d_salt);
-        assert_eq!(*back.storage_salt, *salts.storage_salt);
-        assert!(Salts::from_bytes(&[0; 63]).is_none());
-        assert!(Salts::from_bytes(&[0; 65]).is_none());
+        assert_ne!(*kek, [9; 32]);
+        let mut other_salt = header(Mode::Standard);
+        other_salt.storage_salt = Zeroizing::new([2; 32]);
+        assert_ne!(*kek, *derive_kek(&other_salt, &d_key, None).unwrap());
+        assert_ne!(
+            *kek,
+            *derive_kek(&standard, &DataKey::from_bytes(&[8; 32]), None).unwrap()
+        );
+        assert_eq!(*kek, *derive_kek(&standard, &d_key, None).unwrap());
+
+        let enhanced = header(Mode::Enhanced);
+        let a_key = AuthKey::from_bytes(&[7; 32]);
+        let both = derive_kek(&enhanced, &d_key, Some(&a_key)).unwrap();
+        assert_ne!(*both, *kek);
+        assert_ne!(
+            *both,
+            *derive_kek(&enhanced, &d_key, Some(&AuthKey::from_bytes(&[6; 32]))).unwrap()
+        );
+        // the two keys aren't interchangeable
+        assert_ne!(
+            *both,
+            *derive_kek(
+                &enhanced,
+                &DataKey::from_bytes(&[7; 32]),
+                Some(&AuthKey::from_bytes(&[9; 32]))
+            )
+            .unwrap()
+        );
+    }
+
+    /// Test that the Enhanced KEK runs Argon2 over both keys before HKDF, so
+    /// a guessed pair can't be tested with a cheap HKDF of two keys derived
+    /// once each (the reference is built by hand from the documented steps)
+    #[test]
+    fn test_enhanced_kek_runs_argon2() {
+        let enhanced = header(Mode::Enhanced);
+        let d_key = DataKey::from_bytes(&[9; 32]);
+        let a_key = AuthKey::from_bytes(&[7; 32]);
+        let kek = derive_kek(&enhanced, &d_key, Some(&a_key)).unwrap();
+
+        let ikm = [[9u8; 32], [7u8; 32]].concat();
+        let salt = Some(enhanced.storage_salt.as_slice());
+        let mut cheap = [0u8; 32];
+        SimpleHkdf::<Blake2s256>::new(salt, &ikm)
+            .expand(KEK_BOTH_LABEL, &mut cheap)
+            .unwrap();
+        assert_ne!(*kek, cheap, "the pair must not be testable with HKDF alone");
+
+        let both = derive_key(&ikm, &enhanced.storage_salt).unwrap();
+        let mut expected = [0u8; 32];
+        SimpleHkdf::<Blake2s256>::new(salt, both.as_slice())
+            .expand(KEK_BOTH_LABEL, &mut expected)
+            .unwrap();
+        assert_eq!(*kek, expected);
+    }
+
+    /// Test that a failed directory fsync after the file was replaced isn't
+    /// reported as a failed save (the new file is the vault already)
+    #[test]
+    fn test_after_replace_is_saved() {
+        assert_eq!(after_replace(Ok(())), Ok(()));
+        let failed = std::io::Error::other("fsync failed");
+        assert_eq!(after_replace(Err(failed)), Ok(()));
     }
 
     /// Test that unpadding is strict: length must fit, padding must be zeros
@@ -737,13 +1136,15 @@ mod tests {
         assert_eq!(unpad(&[1, 0, 0]), None);
     }
 
-    /// Test that a different version byte is refused even if the explicit
-    /// header check were missing: the AAD is the header as read
+    /// Test that a changed header is refused even if the explicit header
+    /// checks were missing: the AAD is the header as read
     #[test]
     fn test_header_bound_by_aad() {
         let kek = [3u8; 32];
         let mut file = sealed(&kek, b"");
-        file[HEADER_LEN - 1] = VERSION.wrapping_add(1);
+        // a salt byte: the header still parses
+        file[HEADER_LEN - 1] ^= 1;
+        assert!(read_header(&file).is_ok());
 
         let (head, rest) = file.split_first_chunk::<HEADER_LEN>().unwrap();
         let (wrap, _) = rest.split_first_chunk::<WRAP_LEN>().unwrap();
@@ -754,17 +1155,24 @@ mod tests {
     /// Test that oversized config is refused instead of written
     #[test]
     fn test_config_limit() {
+        let header = header(Mode::Standard);
         let dek = generate_dek().unwrap();
-        let wrapped = wrap_dek(&[1; 32], &dek).unwrap();
+        let wrapped = wrap_dek(&header, &[1; 32], &dek).unwrap();
         assert_eq!(
-            seal(&wrapped, &dek, &contents(&vec![0; MAX_CONFIG_LEN + 1])).err(),
+            seal(
+                &header,
+                &wrapped,
+                &dek,
+                &contents(&vec![0; MAX_CONFIG_LEN + 1])
+            )
+            .err(),
             Some(VaultErrors::TooLarge)
         );
 
         let mut many_peers = contents(b"");
         many_peers.peers = Zeroizing::new(vec![0; MAX_PEERS_LEN + 1]);
         assert_eq!(
-            seal(&wrapped, &dek, &many_peers).err(),
+            seal(&header, &wrapped, &dek, &many_peers).err(),
             Some(VaultErrors::TooLarge)
         );
     }
@@ -832,5 +1240,30 @@ mod tests {
         );
 
         std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    /// Test that every directory prepare_dir creates is found (so its
+    /// parent gets fsynced), outermost first, and that an existing
+    /// directory needs nothing created and is only checked
+    #[test]
+    fn test_prepare_dir_creates_and_syncs_ancestors() {
+        let base = std::env::temp_dir().join(format!("cesa-vault-mkdirs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let dir = base.join("a").join("b").join("data");
+        assert_eq!(
+            missing_dirs(&dir),
+            [base.join("a"), base.join("a/b"), dir.clone()]
+                .iter()
+                .map(PathBuf::as_path)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(prepare_dir(&dir).unwrap(), dir);
+        assert!(missing_dirs(&dir).is_empty());
+        // already there: nothing to create, still fine
+        assert_eq!(prepare_dir(&dir).unwrap(), dir);
+
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

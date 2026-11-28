@@ -42,8 +42,12 @@ pub enum Command {
     },
     /// Open the saved vault with the data password.
     Unlock(PasswordUpdate),
+    /// Open the saved vault with both passwords (Enhanced security).
+    UnlockBoth(JoinPasswords),
     /// Turn automatic login on (d_key into the OS keychain) or off.
     SetAutoLogin(bool),
+    /// Turn Enhanced security on (both passwords at every start) or off.
+    SetEnhanced(bool),
     /// Turn networking on or off (saved by the daemon).
     SetSync(bool),
     /// Turn clipboard sync on or off (saved by the daemon).
@@ -86,10 +90,15 @@ pub enum LinkEvent {
         kind: KeyKind,
         result: Result<(), IpcErrors>,
     },
-    /// Answer to [`Command::Unlock`].
+    /// Answer to [`Command::Unlock`] and [`Command::UnlockBoth`].
     Unlocked(Result<(), IpcErrors>),
     /// Answer to [`Command::SetAutoLogin`].
     AutoLoginSet {
+        on: bool,
+        result: Result<(), IpcErrors>,
+    },
+    /// Answer to [`Command::SetEnhanced`].
+    EnhancedSet {
         on: bool,
         result: Result<(), IpcErrors>,
     },
@@ -202,6 +211,14 @@ async fn run_command(socket: Option<&PathBuf>, command: Command) -> LinkEvent {
         Command::Unlock(update) => {
             LinkEvent::Unlocked(send_done(socket, Request::Unlock(update)).await)
         }
+        // both passwords move into the request, wiped when it is dropped
+        Command::UnlockBoth(passwords) => {
+            LinkEvent::Unlocked(send_done(socket, Request::UnlockBoth(passwords)).await)
+        }
+        Command::SetEnhanced(on) => LinkEvent::EnhancedSet {
+            on,
+            result: send_done(socket, Request::SetEnhanced(on)).await,
+        },
         Command::SetAutoLogin(on) => LinkEvent::AutoLoginSet {
             on,
             result: send_done(socket, Request::SetAutoLogin(on)).await,
@@ -359,7 +376,7 @@ mod tests {
             rt.block_on(async move {
                 let listener = UnixListener::bind(&server_path).unwrap();
 
-                for _ in 0..17 {
+                for _ in 0..19 {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     let body = ipc::read_frame(&mut stream).await.unwrap();
 
@@ -383,7 +400,9 @@ mod tests {
                         | Request::ForgetPeer(_)
                         | Request::ResetDevice
                         | Request::AddDeviceAt(_)
-                        | Request::JoinGroupAt(..) => {
+                        | Request::JoinGroupAt(..)
+                        | Request::UnlockBoth(_)
+                        | Request::SetEnhanced(_) => {
                             seen_tx.send(body.to_vec()).unwrap();
                             Response::Done.encode()
                         }
@@ -442,6 +461,34 @@ mod tests {
             panic!("expected an unlock request");
         };
         assert_eq!(sent.password.as_slice(), b"data password!");
+
+        // Enhanced security: both passwords arrive intact, the switch as such
+        assert!(link.send(Command::UnlockBoth(JoinPasswords {
+            auth: PasswordUpdate {
+                password: Zeroizing::new(b" auth pw".to_vec()),
+            },
+            data: PasswordUpdate {
+                password: Zeroizing::new(b"data pw ".to_vec()),
+            },
+        })));
+        assert_eq!(wait_for_event(&link), LinkEvent::Unlocked(Ok(())));
+        let Some(Request::UnlockBoth(sent)) = Request::decode(&seen_rx.recv().unwrap()) else {
+            panic!("not an UnlockBoth");
+        };
+        assert_eq!(sent.auth.password.as_slice(), b" auth pw");
+        assert_eq!(sent.data.password.as_slice(), b"data pw ");
+        assert!(link.send(Command::SetEnhanced(true)));
+        assert_eq!(
+            wait_for_event(&link),
+            LinkEvent::EnhancedSet {
+                on: true,
+                result: Ok(())
+            }
+        );
+        assert!(matches!(
+            Request::decode(&seen_rx.recv().unwrap()),
+            Some(Request::SetEnhanced(true))
+        ));
 
         assert!(link.send(Command::SetAutoLogin(true)));
         assert_eq!(

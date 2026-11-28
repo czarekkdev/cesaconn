@@ -44,6 +44,7 @@ use daemon_link::{Command, DaemonLink, KeyKind, LinkEvent};
 const AUTH_KEY_LABEL: &str = "Auth key";
 const DATA_KEY_LABEL: &str = "Data key";
 const AUTO_LOGIN_LABEL: &str = "Automatic login";
+const ENHANCED_LABEL: &str = "Enhanced security";
 const SYNC_LABEL: &str = "Sync";
 const CLIPBOARD_LABEL: &str = "Clipboard sync";
 const RESET_LABEL: &str = "Reset this device";
@@ -68,8 +69,14 @@ pub enum SettingKind {
     /// A secret saved in the locked vault: editing it unlocks instead.
     Locked,
     Bool(bool),
+    /// A switch we recommend turning on (shown as such while off).
+    Recommended(bool),
     /// A switch this platform doesn't support yet.
     Unavailable,
+    /// Off, and can't be turned on while Enhanced security is on.
+    ExcludedByEnhanced,
+    /// The saved keys are from an older version: only a reset helps.
+    Outdated,
     /// Not a value: Enter starts something (after asking).
     Action,
 }
@@ -90,7 +97,11 @@ impl Setting {
             SettingKind::Locked => ("[locked: Enter to unlock]", Color::Yellow),
             SettingKind::Bool(true) => ("on", Color::Green),
             SettingKind::Bool(false) => ("off", Color::DarkGray),
+            SettingKind::Recommended(true) => ("on", Color::Green),
+            SettingKind::Recommended(false) => ("off (recommended)", Color::Yellow),
             SettingKind::Unavailable => ("[not supported on this platform yet]", Color::DarkGray),
+            SettingKind::ExcludedByEnhanced => ("off (not with Enhanced)", Color::DarkGray),
+            SettingKind::Outdated => ("[older version: reset]", Color::Red),
             SettingKind::Action => ("[Enter: wipe keys, vault, paired devices]", Color::Red),
         }
     }
@@ -137,12 +148,20 @@ enum ActivePopup {
     /// The daemon (re)started locked: the data password, asked for
     /// without a trip to Settings.
     Unlock,
+    /// Like `Unlock` with Enhanced security on: the auth password, then
+    /// the data password.
+    UnlockBoth(JoinStep),
+    /// "Turn Enhanced security on / off?" (y / n), with what it means.
+    ConfirmEnhanced(bool),
+    /// The saved keys are from an older version and can't be opened:
+    /// says so and how to get out (reset, join again).
+    VaultOutdated,
     /// `a` on Devices: the IPv4 address of a device on another network (a
     /// VPN, a routed subnet) that discovery can't reach.
     DeviceAddress,
 }
 
-/// Which password the join popup asks for.
+/// Which password the join (or Enhanced unlock) popup asks for.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum JoinStep {
     Auth,
@@ -177,8 +196,9 @@ pub struct App {
     /// The typed address a join goes through (`a` on a fresh device), kept
     /// while the two passwords are typed. Not a secret.
     join_at: Option<DeviceAddress>,
-    /// The join's auth password while the data password is typed; pre-sized
-    /// like `input_buf` and wiped as soon as the join is sent or cancelled.
+    /// The auth password of a join or an Enhanced unlock while the data
+    /// password is typed; pre-sized like `input_buf` and wiped as soon as
+    /// the request is sent or cancelled.
     join_auth: Zeroizing<Vec<u8>>,
 
     pub should_quit: bool,
@@ -193,6 +213,9 @@ pub struct App {
     /// The unlock prompt was shown for this locked spell (Esc keeps it
     /// closed; a wrong password or a new lock asks again).
     unlock_asked: bool,
+    /// Why the last unlock failed, shown in red in the unlock prompt that
+    /// opens again (a log line alone is easy to miss).
+    unlock_error: Option<&'static str>,
 }
 
 impl Default for App {
@@ -229,6 +252,11 @@ impl App {
                     ),
                 },
                 Setting {
+                    label: ENHANCED_LABEL,
+                    kind: SettingKind::Recommended(false),
+                    warn_message: None,
+                },
+                Setting {
                     label: SYNC_LABEL,
                     kind: SettingKind::Bool(false),
                     warn_message: None,
@@ -260,6 +288,7 @@ impl App {
             outbox: Vec::new(),
             refresh_in_flight: false,
             unlock_asked: false,
+            unlock_error: None,
         }
     }
 
@@ -515,6 +544,7 @@ mod tests {
                 AUTH_KEY_LABEL,
                 DATA_KEY_LABEL,
                 AUTO_LOGIN_LABEL,
+                ENHANCED_LABEL,
                 SYNC_LABEL,
                 CLIPBOARD_LABEL,
                 RESET_LABEL
@@ -951,7 +981,7 @@ mod tests {
         assert!(
             app.logs
                 .iter()
-                .any(|l| l.contains("Too many wrong data passwords"))
+                .any(|l| l.contains("Too many wrong passwords"))
         );
         assert!(matches!(app.outbox.as_slice(), [Command::Refresh]));
     }
@@ -2040,5 +2070,673 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("still use the old"))
         );
+    }
+
+    // ── Enhanced security ─────────────────────────────────────────────────
+
+    fn status_event(status: Status) -> LinkEvent {
+        LinkEvent::Refreshed(Ok((status, Vec::new(), None)))
+    }
+
+    fn unlocked_saved() -> Status {
+        Status {
+            auth_key_set: true,
+            data_key_set: true,
+            saved: true,
+            ..Status::default()
+        }
+    }
+
+    fn locked_enhanced() -> Status {
+        Status {
+            locked: true,
+            saved: true,
+            enhanced: true,
+            ..Status::default()
+        }
+    }
+
+    /// Test that the Enhanced switch is shown as recommended while off,
+    /// asks first (what it means), goes to the daemon, and shows only what
+    /// the daemon reports; on, automatic login can't be turned on
+    #[test]
+    fn test_enhanced_switch_goes_through_daemon() {
+        let mut app = App::new();
+        handle_link_event(&mut app, status_event(unlocked_saved()));
+        select(&mut app, ENHANCED_LABEL);
+        app.active_tab = Tab::Settings;
+        assert!(screen(&mut app).contains("off (recommended)"));
+
+        handle_settings_enter(&mut app);
+        assert_eq!(app.active_popup, ActivePopup::ConfirmEnhanced(true));
+        assert!(screen(&mut app).contains("Turn Enhanced security on?"));
+        handle_confirm_enhanced_input(&mut app, KeyCode::Char('n'), true);
+        assert!(app.outbox.is_empty());
+        assert_eq!(app.active_popup, ActivePopup::None);
+
+        handle_settings_enter(&mut app);
+        handle_confirm_enhanced_input(&mut app, KeyCode::Char('y'), true);
+        // automatic login off first even when the status says it is off
+        assert!(matches!(
+            app.outbox.as_slice(),
+            [Command::SetAutoLogin(false), Command::SetEnhanced(true)]
+        ));
+        // not shown on before the daemon says so
+        assert_eq!(
+            app.setting_mut(ENHANCED_LABEL).unwrap().kind,
+            SettingKind::Recommended(false)
+        );
+        app.outbox.clear();
+
+        handle_link_event(
+            &mut app,
+            status_event(Status {
+                enhanced: true,
+                ..unlocked_saved()
+            }),
+        );
+        assert_eq!(
+            app.setting_mut(ENHANCED_LABEL).unwrap().kind,
+            SettingKind::Recommended(true)
+        );
+        assert_eq!(
+            app.setting_mut(AUTO_LOGIN_LABEL).unwrap().kind,
+            SettingKind::ExcludedByEnhanced
+        );
+
+        // automatic login: refused right here, nothing sent
+        select(&mut app, AUTO_LOGIN_LABEL);
+        handle_settings_enter(&mut app);
+        assert_eq!(app.active_popup, ActivePopup::None);
+        assert!(app.outbox.is_empty());
+        assert!(
+            app.logs
+                .iter()
+                .any(|l| l.contains("Enhanced security off first"))
+        );
+
+        // turning it off asks too, and says what is lost
+        select(&mut app, ENHANCED_LABEL);
+        handle_settings_enter(&mut app);
+        assert_eq!(app.active_popup, ActivePopup::ConfirmEnhanced(false));
+        assert!(screen(&mut app).contains("Turn Enhanced security off?"));
+        handle_confirm_enhanced_input(&mut app, KeyCode::Char('y'), false);
+        assert!(matches!(
+            app.outbox.as_slice(),
+            [Command::SetEnhanced(false)]
+        ));
+    }
+
+    /// Test that turning Enhanced security on with automatic login on says
+    /// so and turns automatic login off first, in that order
+    #[test]
+    fn test_enhanced_turns_auto_login_off_first() {
+        let mut app = App::new();
+        handle_link_event(
+            &mut app,
+            status_event(Status {
+                auto_login: true,
+                ..unlocked_saved()
+            }),
+        );
+        select(&mut app, ENHANCED_LABEL);
+        handle_settings_enter(&mut app);
+        assert!(screen(&mut app).contains("Automatic login is turned off with it"));
+
+        handle_confirm_enhanced_input(&mut app, KeyCode::Char('y'), true);
+        assert!(matches!(
+            app.outbox.as_slice(),
+            [Command::SetAutoLogin(false), Command::SetEnhanced(true)]
+        ));
+    }
+
+    /// Test that without a keychain backend automatic login is shown as
+    /// unavailable and Enter on it sends nothing
+    #[test]
+    fn test_auto_login_unavailable_without_keychain() {
+        let mut app = App::new();
+        handle_link_event(
+            &mut app,
+            status_event(Status {
+                keychain_unavailable: true,
+                ..unlocked_saved()
+            }),
+        );
+        assert_eq!(
+            app.setting_mut(AUTO_LOGIN_LABEL).unwrap().kind,
+            SettingKind::Unavailable
+        );
+        select(&mut app, AUTO_LOGIN_LABEL);
+        handle_settings_enter(&mut app);
+        assert!(app.outbox.is_empty());
+        assert_eq!(app.active_popup, ActivePopup::None);
+        assert!(app.logs.iter().any(|l| l.contains("needs an OS keychain")));
+    }
+
+    /// The passwords of the queued Enhanced unlocks, borrowed.
+    fn unlocks_both(app: &App) -> Vec<(&[u8], &[u8])> {
+        app.outbox
+            .iter()
+            .filter_map(|c| match c {
+                Command::UnlockBoth(p) => {
+                    Some((p.auth.password.as_slice(), p.data.password.as_slice()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Test the Enhanced unlock prompt: opens by itself when locked, asks
+    /// for the auth then the data password, sends both exactly as typed,
+    /// wipes both, never logs them; Esc on the second step wipes the first
+    #[test]
+    fn test_enhanced_unlock_prompt() {
+        let mut app = App::new();
+        handle_link_event(&mut app, status_event(locked_enhanced()));
+        assert_eq!(app.active_popup, ActivePopup::UnlockBoth(JoinStep::Auth));
+        assert!(screen(&mut app).contains("Auth password:"));
+        assert!(app.logs.iter().any(|l| l.contains("enter both passwords")));
+
+        for c in " auth pw ".chars() {
+            press_both(&mut app, KeyCode::Char(c));
+        }
+        press_both(&mut app, KeyCode::Enter);
+        assert_eq!(app.active_popup, ActivePopup::UnlockBoth(JoinStep::Data));
+        assert!(app.input_buf.is_empty());
+        assert!(screen(&mut app).contains("Data password:"));
+        // nothing sent yet
+        assert!(app.outbox.is_empty());
+
+        for c in "data pw".chars() {
+            press_both(&mut app, KeyCode::Char(c));
+        }
+        press_both(&mut app, KeyCode::Enter);
+        assert_eq!(
+            unlocks_both(&app),
+            [(b" auth pw ".as_slice(), b"data pw".as_slice())]
+        );
+        assert!(app.join_auth.is_empty() && app.input_buf.is_empty());
+        assert_eq!(app.active_popup, ActivePopup::None);
+        assert!(
+            !app.logs
+                .iter()
+                .any(|l| l.contains("auth pw") || l.contains("data pw"))
+        );
+        app.outbox.clear();
+
+        // Esc on the second step: both wiped, nothing sent
+        open_unlock_both(&mut app);
+        press_both(&mut app, KeyCode::Char('a'));
+        press_both(&mut app, KeyCode::Enter);
+        press_both(&mut app, KeyCode::Char('b'));
+        press_both(&mut app, KeyCode::Esc);
+        assert!(app.join_auth.is_empty() && app.input_buf.is_empty());
+        assert!(app.outbox.is_empty());
+        assert_eq!(app.active_popup, ActivePopup::None);
+    }
+
+    /// Test that a wrong password in Enhanced mode is shown where the user
+    /// looks: the prompt opens again with the red reason, which goes away
+    /// once unlocked
+    #[test]
+    fn test_enhanced_wrong_password_shown_in_prompt() {
+        let mut app = App::new();
+        handle_link_event(&mut app, status_event(locked_enhanced()));
+        press_both(&mut app, KeyCode::Esc);
+
+        handle_link_event(
+            &mut app,
+            LinkEvent::Unlocked(Err(IpcErrors::Daemon(DaemonError::WrongPassword))),
+        );
+        assert!(
+            app.logs
+                .iter()
+                .any(|l| l.contains("auth or the data password"))
+        );
+        handle_link_event(&mut app, status_event(locked_enhanced()));
+        assert_eq!(app.active_popup, ActivePopup::UnlockBoth(JoinStep::Auth));
+        assert!(screen(&mut app).contains("Wrong password (auth or data)."));
+
+        handle_link_event(
+            &mut app,
+            status_event(Status {
+                enhanced: true,
+                ..unlocked_saved()
+            }),
+        );
+        assert_eq!(app.active_popup, ActivePopup::None);
+        assert_eq!(app.unlock_error, None);
+    }
+
+    /// Test that a daemon that says both passwords are needed (Enhanced
+    /// turned on elsewhere) gets the two-step prompt next time
+    #[test]
+    fn test_needs_both_passwords_asks_again() {
+        let mut app = App::new();
+        handle_link_event(&mut app, up_locked(true, false));
+        handle_unlock_input(&mut app, KeyCode::Esc);
+        handle_link_event(
+            &mut app,
+            LinkEvent::Unlocked(Err(IpcErrors::Daemon(DaemonError::NeedsBothPasswords))),
+        );
+        handle_link_event(&mut app, status_event(locked_enhanced()));
+        assert_eq!(app.active_popup, ActivePopup::UnlockBoth(JoinStep::Auth));
+        assert!(screen(&mut app).contains("both passwords."));
+    }
+
+    /// Test that while locked in Enhanced mode the key fields open the
+    /// two-step prompt (no single-password unlock is ever sent)
+    #[test]
+    fn test_enhanced_locked_field_opens_both() {
+        let mut app = App::new();
+        handle_link_event(&mut app, status_event(locked_enhanced()));
+        press_both(&mut app, KeyCode::Esc);
+
+        for label in [DATA_KEY_LABEL, AUTH_KEY_LABEL] {
+            select(&mut app, label);
+            handle_settings_enter(&mut app);
+            assert_eq!(app.active_popup, ActivePopup::UnlockBoth(JoinStep::Auth));
+            press_both(&mut app, KeyCode::Esc);
+        }
+        assert!(app.outbox.is_empty());
+    }
+
+    /// Test that an outdated vault is explained (popup, fields, status bar)
+    /// and no password can be typed for it
+    #[test]
+    fn test_vault_outdated_shown() {
+        let mut app = App::new();
+        handle_link_event(
+            &mut app,
+            status_event(Status {
+                locked: true,
+                saved: true,
+                vault_outdated: true,
+                ..Status::default()
+            }),
+        );
+        assert_eq!(app.active_popup, ActivePopup::VaultOutdated);
+        let shown = screen(&mut app);
+        assert!(shown.contains("older CesaConn version"));
+        assert!(shown.contains("Reset this device"));
+        assert!(
+            app.logs
+                .iter()
+                .any(|l| l.contains("older CesaConn version"))
+        );
+
+        handle_vault_outdated_input(&mut app, KeyCode::Enter);
+        assert_eq!(app.active_popup, ActivePopup::None);
+        assert_eq!(
+            app.setting_mut(DATA_KEY_LABEL).unwrap().kind,
+            SettingKind::Outdated
+        );
+
+        select(&mut app, DATA_KEY_LABEL);
+        handle_settings_enter(&mut app);
+        assert_eq!(app.active_popup, ActivePopup::VaultOutdated);
+        assert!(screen(&mut app).contains("saved keys of an older version"));
+        assert!(app.outbox.is_empty());
+    }
+
+    /// Test that the Enhanced popup says why the daemon would refuse (not
+    /// saved yet, locked) and y then sends nothing and keeps it open
+    #[test]
+    fn test_enhanced_refusal_shown_in_popup() {
+        for (status, reason) in [
+            (Status::default(), "Set both passwords first"),
+            (locked_enhanced(), "Unlock the saved keys first."),
+        ] {
+            let mut app = App::new();
+            handle_link_event(&mut app, status_event(status));
+            app.active_popup = ActivePopup::ConfirmEnhanced(true);
+            assert!(screen(&mut app).contains(reason), "{reason}");
+
+            handle_confirm_enhanced_input(&mut app, KeyCode::Char('y'), true);
+            assert!(app.outbox.is_empty());
+            assert_eq!(app.active_popup, ActivePopup::ConfirmEnhanced(true));
+        }
+    }
+
+    /// Test that automatic login left on with Enhanced security (a key the
+    /// daemon couldn't remove) is shown as on, so it can be turned off
+    #[test]
+    fn test_auto_login_leftover_shown_on() {
+        let mut app = App::new();
+        handle_link_event(
+            &mut app,
+            status_event(Status {
+                enhanced: true,
+                auto_login: true,
+                ..unlocked_saved()
+            }),
+        );
+        assert_eq!(
+            app.setting_mut(AUTO_LOGIN_LABEL).unwrap().kind,
+            SettingKind::Bool(true)
+        );
+        select(&mut app, AUTO_LOGIN_LABEL);
+        handle_settings_enter(&mut app);
+        assert!(matches!(
+            app.outbox.as_slice(),
+            [Command::SetAutoLogin(false)]
+        ));
+    }
+
+    /// One key to the Enhanced unlock prompt at the step it shows.
+    fn press_both(app: &mut App, code: KeyCode) {
+        let ActivePopup::UnlockBoth(step) = app.active_popup.clone() else {
+            panic!("the Enhanced unlock prompt isn't open");
+        };
+        handle_unlock_both_input(app, code, step);
+    }
+
+    /// Test that the new popups are never cut at the edge: every word is on
+    /// screen, in order, at 60, 80 and 120 columns, and the key help lines
+    /// are whole from 80 up
+    #[test]
+    fn test_enhanced_popups_fit() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let rows_at = |app: &mut App, width: u16| -> Vec<String> {
+            let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
+            terminal.draw(|frame| ui(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol().to_owned())
+                        .collect()
+                })
+                .collect()
+        };
+
+        for (popup, text, keys) in [
+            (
+                ActivePopup::ConfirmEnhanced(true),
+                "Both passwords at every start. The auth key is never saved, so someone who learns your data password still can't add a device to your group.",
+                "y: yes   Esc/n: cancel",
+            ),
+            (
+                ActivePopup::ConfirmEnhanced(false),
+                "The auth key is saved in the vault again: the data password alone then unlocks this device, and can add a device to your group.",
+                "y: yes   Esc/n: cancel",
+            ),
+            (
+                ActivePopup::VaultOutdated,
+                "The saved keys are from an older CesaConn version and can't be opened by this one.",
+                "Enter / Esc: close",
+            ),
+            (
+                ActivePopup::UnlockBoth(JoinStep::Auth),
+                "Enhanced security: both passwords unlock them.",
+                "Enter: next    Esc: later (Settings > Data key)",
+            ),
+        ] {
+            for width in [60u16, 80, 120] {
+                let mut app = App::new();
+                app.active_popup = popup.clone();
+                let rows = rows_at(&mut app, width);
+                let all = rows.join(" ");
+                let words: Vec<&str> = all.split_whitespace().collect();
+                let mut at = 0;
+                for word in text.split_whitespace() {
+                    let found = words.get(at..).and_then(|rest| {
+                        rest.iter()
+                            .position(|w| w.ends_with(word) || w.starts_with(word))
+                    });
+                    assert!(found.is_some(), "{popup:?} at {width}: {word:?} missing");
+                    at += found.unwrap() + 1;
+                }
+                if width >= 80 {
+                    assert!(
+                        rows.iter().any(|row| row.contains(keys)),
+                        "{popup:?} at {width}: key help not whole"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Test that turning Enhanced on wins over a "turn automatic login on"
+    /// that isn't in the status yet (off is always sent first where there
+    /// is a keychain), and that nothing extra is sent without a keychain
+    #[test]
+    fn test_enhanced_wins_over_pending_auto_login() {
+        let mut app = App::new();
+        handle_link_event(&mut app, status_event(unlocked_saved()));
+        select(&mut app, AUTO_LOGIN_LABEL);
+        handle_settings_enter(&mut app);
+        let ActivePopup::SecurityWarning { idx } = app.active_popup.clone() else {
+            panic!("no automatic-login warning");
+        };
+        handle_security_warning_input(&mut app, KeyCode::Char('y'), idx);
+        assert!(matches!(
+            app.outbox.as_slice(),
+            [Command::SetAutoLogin(true)]
+        ));
+
+        // confirmed before the next refresh: the status still says off
+        select(&mut app, ENHANCED_LABEL);
+        handle_settings_enter(&mut app);
+        handle_confirm_enhanced_input(&mut app, KeyCode::Char('y'), true);
+        assert!(matches!(
+            app.outbox.as_slice(),
+            [
+                Command::SetAutoLogin(true),
+                Command::SetAutoLogin(false),
+                Command::SetEnhanced(true)
+            ]
+        ));
+
+        let mut app = App::new();
+        handle_link_event(
+            &mut app,
+            status_event(Status {
+                keychain_unavailable: true,
+                ..unlocked_saved()
+            }),
+        );
+        select(&mut app, ENHANCED_LABEL);
+        handle_settings_enter(&mut app);
+        handle_confirm_enhanced_input(&mut app, KeyCode::Char('y'), true);
+        assert!(matches!(
+            app.outbox.as_slice(),
+            [Command::SetEnhanced(true)]
+        ));
+    }
+
+    /// Test that an open unlock prompt follows the vault's mode: when a
+    /// locked status says the other mode (or an outdated vault), the prompt
+    /// is swapped and everything typed so far is wiped
+    #[test]
+    fn test_unlock_prompt_follows_mode() {
+        let mut app = App::new();
+        handle_link_event(&mut app, status_event(locked_enhanced()));
+        for c in "first auth".chars() {
+            press_both(&mut app, KeyCode::Char(c));
+        }
+        press_both(&mut app, KeyCode::Enter);
+        for c in "half".chars() {
+            press_both(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.active_popup, ActivePopup::UnlockBoth(JoinStep::Data));
+
+        let standard = Status {
+            enhanced: false,
+            ..locked_enhanced()
+        };
+        handle_link_event(&mut app, status_event(standard));
+        assert_eq!(app.active_popup, ActivePopup::Unlock);
+        assert!(app.join_auth.is_empty() && app.input_buf.is_empty());
+
+        for c in "typed".chars() {
+            handle_unlock_input(&mut app, KeyCode::Char(c));
+        }
+        handle_link_event(&mut app, status_event(locked_enhanced()));
+        assert_eq!(app.active_popup, ActivePopup::UnlockBoth(JoinStep::Auth));
+        assert!(app.input_buf.is_empty());
+
+        // the same mode again: left alone, nothing wiped
+        press_both(&mut app, KeyCode::Char('x'));
+        handle_link_event(&mut app, status_event(locked_enhanced()));
+        assert_eq!(app.input_buf.as_str(), "x");
+
+        handle_link_event(
+            &mut app,
+            status_event(Status {
+                vault_outdated: true,
+                ..locked_enhanced()
+            }),
+        );
+        assert_eq!(app.active_popup, ActivePopup::VaultOutdated);
+        assert!(app.input_buf.is_empty());
+    }
+
+    /// Test that the Enhanced popup tells keys that couldn't be saved apart
+    /// from passwords that aren't set yet
+    #[test]
+    fn test_enhanced_blocker_unsaved_keys() {
+        let mut app = App::new();
+        handle_link_event(
+            &mut app,
+            status_event(Status {
+                saved: false,
+                ..unlocked_saved()
+            }),
+        );
+        assert_eq!(
+            enhanced_blocker(&app),
+            Some("The keys couldn't be saved: see the daemon log.")
+        );
+
+        let mut app = App::new();
+        handle_link_event(
+            &mut app,
+            status_event(Status {
+                auth_key_set: true,
+                ..Status::default()
+            }),
+        );
+        assert_eq!(
+            enhanced_blocker(&app),
+            Some("Set both passwords first: nothing is saved yet.")
+        );
+    }
+
+    /// Test that a long password stays on its line in every password popup:
+    /// the key help is still there, the cursor inside the popup, the stars
+    /// end where the cursor is; the whole password is still what is sent
+    #[test]
+    fn test_long_password_stays_in_popup() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let long = "p".repeat(200);
+        for width in [60u16, 80, 120] {
+            for (status, help) in [
+                (locked_enhanced(), "Enter: next"),
+                (
+                    Status {
+                        enhanced: false,
+                        ..locked_enhanced()
+                    },
+                    "Enter: unlock",
+                ),
+            ] {
+                let mut app = App::new();
+                handle_link_event(&mut app, status_event(status));
+                for c in long.chars() {
+                    push_input(&mut app, c);
+                }
+                let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+                terminal.draw(|frame| ui(frame, &mut app)).unwrap();
+
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                assert!(text.contains(help), "{help} cut at width {width}");
+
+                let cursor = terminal.get_cursor_position().unwrap();
+                let buffer = terminal.backend().buffer();
+                let row: String = (0..width).map(|x| buffer[(x, cursor.y)].symbol()).collect();
+                assert!(row.contains("<*"), "no scroll mark at width {width}: {row}");
+                // the cell before the cursor is the last star, the cursor
+                // cell itself is inside the border
+                assert_eq!(buffer[(cursor.x.saturating_sub(1), cursor.y)].symbol(), "*");
+                assert_ne!(buffer[(cursor.x, cursor.y)].symbol(), "║");
+                assert!(row.chars().skip(usize::from(cursor.x)).any(|c| c == '║'));
+                assert_eq!(app.input_buf.chars().count(), 200);
+            }
+        }
+
+        assert_eq!(render::fit_tail("abc", 3), "abc");
+        assert_eq!(render::fit_tail("abcdef", 4), "<def");
+        assert_eq!(render::fit_tail("abcdef", 0), "");
+    }
+
+    /// Test that the "older version" notice follows the status: it stays
+    /// while the vault is outdated, and is replaced by the right unlock
+    /// prompt once a locked status no longer says outdated
+    #[test]
+    fn test_outdated_notice_follows_status() {
+        let outdated = Status {
+            vault_outdated: true,
+            enhanced: false,
+            ..locked_enhanced()
+        };
+        let mut app = App::new();
+        handle_link_event(&mut app, status_event(outdated));
+        assert_eq!(app.active_popup, ActivePopup::VaultOutdated);
+        handle_link_event(&mut app, status_event(outdated));
+        assert_eq!(app.active_popup, ActivePopup::VaultOutdated);
+
+        handle_link_event(
+            &mut app,
+            status_event(Status {
+                enhanced: false,
+                ..locked_enhanced()
+            }),
+        );
+        assert_eq!(app.active_popup, ActivePopup::Unlock);
+    }
+
+    /// Test that the Data key editor masks what is typed even when a
+    /// refresh changed the setting's kind meanwhile, and that a refresh
+    /// saying the vault is outdated closes the editor and wipes the text
+    #[test]
+    fn test_key_editor_masked_and_closed_when_outdated() {
+        let locked = Status {
+            enhanced: false,
+            ..locked_enhanced()
+        };
+        let mut app = App::new();
+        handle_link_event(&mut app, status_event(locked));
+        app.active_popup = ActivePopup::None;
+        select(&mut app, DATA_KEY_LABEL);
+        app.active_popup = ActivePopup::EditSetting;
+        for c in "visiblesecret".chars() {
+            push_input(&mut app, c);
+        }
+
+        // the kind changes under the open editor: still stars
+        app.setting_mut(DATA_KEY_LABEL).unwrap().kind = SettingKind::Outdated;
+        let text = screen(&mut app);
+        assert!(!text.contains("visiblesecret"), "password shown in clear");
+        assert!(text.contains("*************"));
+
+        handle_link_event(
+            &mut app,
+            status_event(Status {
+                vault_outdated: true,
+                enhanced: false,
+                ..locked_enhanced()
+            }),
+        );
+        assert_ne!(app.active_popup, ActivePopup::EditSetting);
+        assert!(app.input_buf.is_empty());
     }
 }
