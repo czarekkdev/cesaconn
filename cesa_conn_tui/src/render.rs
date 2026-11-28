@@ -491,10 +491,13 @@ pub(super) fn render_edit_setting_popup(frame: &mut Frame, area: Rect, app: &App
         return;
     };
 
-    let is_secret = matches!(
-        setting.kind,
-        SettingKind::Secret { .. } | SettingKind::Locked
-    );
+    // masked because it is a password field, whatever the setting's kind
+    // says right now (a refresh can change it while the popup is open)
+    let is_secret = selected_key_kind(app).is_some()
+        || matches!(
+            setting.kind,
+            SettingKind::Secret { .. } | SettingKind::Locked
+        );
     let full_input = if is_secret {
         // one star per character, the byte length would leak more than the length
         "*".repeat(app.input_buf.chars().count())

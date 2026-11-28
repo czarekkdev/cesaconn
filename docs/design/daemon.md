@@ -170,7 +170,7 @@ Every secret, how it is made, where it lives and for how long.
 | `a_key` (32 B) | `Argon2id(pw1, a_salt)` | daemon RAM (`AuthKey`); vault (Standard mode only) | until pw1 changes |
 | `d_key` (32 B) | `Argon2id(pw2, d_salt)` | daemon RAM (`DataKey`) only; keychain item `data-key` only with automatic login (Standard mode only) | until the daemon stops / pw2 changes |
 | KEK (32 B) | Standard: `HKDF-BLAKE2s(ikm = d_key, salt = storage salt, info = "cesaconn-storage-v1")`; Enhanced: `HKDF-BLAKE2s(ikm = d_key \|\| a_key, salt = storage salt, info = "cesaconn-storage-both-v1")` | computed on demand, wiped | one operation |
-| DEK (32 B) | OS RNG, at vault creation | daemon RAM while open; on disk only wrapped by the KEK | for good (re-wrapped on a password or mode change) |
+| DEK (32 B) | OS RNG, at vault creation | daemon RAM while open; on disk only wrapped by the KEK | until the KEK changes: a new one on every mode switch and every password change that changes the KEK |
 | identity seed (64 B) | OS RNG, at vault creation: `X25519 private (32) \|\| ML-DSA-87 seed (32)` | daemon RAM; vault | for good: same seed = same device |
 | trusted peers | pairing | daemon RAM; vault | until removed |
 | SPAKE2 key `key1` | SPAKE2 | handshake task | one handshake |
@@ -414,12 +414,18 @@ signed ones (7.2), so the reset gives nobody in scope anything.
 The UI asks "are you sure?" before sending a new password for a key that is
 already set. The old password is **not** required (his decision).
 - New `pw1`: derive with the existing `a_salt`, re-seal the vault with the
-  new `a_key` (Enhanced mode: the KEK uses `a_key`, so the DEK is re-wrapped
-  too).
-- New `pw2`: derive with the existing `d_salt`, re-wrap the DEK under the new
-  KEK, re-seal; with automatic login, replace the keychain `data-key`. If the
+  new `a_key` (Enhanced mode: the KEK uses `a_key`, so it changes, see
+  below).
+- New `pw2`: derive with the existing `d_salt`; the KEK changes (see
+  below); with automatic login, replace the keychain `data-key`. If the
   keychain refuses, the old item is deleted and automatic login turns off
   (a stale key must not stay behind).
+- Whenever the KEK changes (pw2 in either mode, pw1 in Enhanced mode) a
+  **new DEK** is made, wrapped under the new KEK and used for the new
+  file. Whoever opened an older copy of the file with the old passwords
+  knows the old DEK, and it must not decrypt what is saved after the
+  change. The new DEK and wrap replace the ones in RAM only after the new
+  file is in place; a failed save keeps the old ones.
 
 Until group rotation exists (section 14), a local password change once peers
 exist breaks pairing with the devices that still have the old password.
@@ -460,15 +466,18 @@ decision: Standard by default, Enhanced offered as recommended).
   stored: it is derived from `pw1` at unlock and lives in RAM only, like
   `d_key`. The KEK is `HKDF(Argon2id(d_key || a_key, storage salt),
   storage salt, "cesaconn-storage-both-v1")`, so the vault opens only with
-  both, and there is no check for one of them alone. The extra Argon2 is
+  both. The file holds no separate check value for either key. The extra Argon2 is
   what makes the cost multiply: without it an attacker with N candidates
   for pw1 and M for pw2 would run Argon2 only N + M times and test the
   N x M pairs with a cheap HKDF and a GCM tag. With it every pair costs a
   full Argon2 run (64 MiB) of its own. An unlock costs three Argon2 runs
   (pw1, pw2, the pair); so does a password change in Enhanced mode (one
   for the new password, one for the new pair). Learning `pw2` alone no
-  longer gives the auth key: the two-key independence holds at rest
-  (18.2).
+  longer gives the auth key directly, but it does not keep pw1 safe
+  either: whoever knows pw2 and has the file can still test pw1 guesses
+  offline, at two Argon2 runs per guess (pw1, then the pair) followed by
+  HKDF and a GCM tag check. The extra cost makes each guess expensive; it
+  doesn't prevent the test, so pw1 needs to be strong on its own (18.2).
 
 `SetEnhanced(on)` needs an open, saved vault (`Locked` / `NotSaved`
 otherwise). It makes a **new DEK**, wraps it under the new mode's KEK and
@@ -1939,8 +1948,11 @@ Stated plainly so nobody relies on a property that isn't there.
 2. **Standard mode: two-key independence stops at rest.** The vault holds
    `a_key` and is opened with `pw2`: cracking pw2 offline (the file alone is
    enough, its salts are in it) also yields `a_key`. Enhanced security
-   (6.7) closes this: `a_key` isn't stored and the vault opens only with
-   both passwords, guessed together. It is off by default (his decision),
+   (6.7) narrows this: `a_key` isn't stored and the vault opens only with
+   both passwords. Someone who already knows pw2 can still test pw1
+   guesses offline against the file (two Argon2 runs, HKDF and a GCM tag
+   check per guess), so it raises the cost of finding pw1 but doesn't
+   make it impossible. It is off by default (his decision),
    so a device is in Standard mode until the user turns it on. An older
    Standard copy of the file plus pw2 still gives both keys, which open the
    Enhanced vault too, until pw1 is changed (6.7).
@@ -2084,9 +2096,11 @@ Decided:
 
 Proposed in the own-vault-salts / Enhanced security PR, for his review:
 - Enhanced mode makes the KEK from both keys instead of storing a check
-  value of `a_key` (what was discussed first): no check value means no
-  offline test of pw1 for someone who already cracked pw2. The cost: a
-  wrong unlock can't say which of the two passwords was wrong (6.4);
+  value of `a_key` (what was discussed first). pw1 stays testable offline
+  for someone who knows pw2: each guess costs two Argon2 runs (pw1, then
+  the pair) followed by HKDF and a GCM tag check, so guesses are expensive
+  but the test isn't prevented. The cost of the design: a wrong unlock
+  can't say which of the two passwords was wrong (6.4);
 - after CodeRabbit's review (his decision): the Enhanced KEK runs one more
   Argon2 over both keys (`HKDF(Argon2id(d_key || a_key))`), because a plain
   `HKDF(d_key || a_key)` let an attacker test N x M guessed pairs with only

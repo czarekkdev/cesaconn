@@ -2677,4 +2677,66 @@ mod tests {
         assert_eq!(render::fit_tail("abcdef", 4), "<def");
         assert_eq!(render::fit_tail("abcdef", 0), "");
     }
+
+    /// Test that the "older version" notice follows the status: it stays
+    /// while the vault is outdated, and is replaced by the right unlock
+    /// prompt once a locked status no longer says outdated
+    #[test]
+    fn test_outdated_notice_follows_status() {
+        let outdated = Status {
+            vault_outdated: true,
+            enhanced: false,
+            ..locked_enhanced()
+        };
+        let mut app = App::new();
+        handle_link_event(&mut app, status_event(outdated));
+        assert_eq!(app.active_popup, ActivePopup::VaultOutdated);
+        handle_link_event(&mut app, status_event(outdated));
+        assert_eq!(app.active_popup, ActivePopup::VaultOutdated);
+
+        handle_link_event(
+            &mut app,
+            status_event(Status {
+                enhanced: false,
+                ..locked_enhanced()
+            }),
+        );
+        assert_eq!(app.active_popup, ActivePopup::Unlock);
+    }
+
+    /// Test that the Data key editor masks what is typed even when a
+    /// refresh changed the setting's kind meanwhile, and that a refresh
+    /// saying the vault is outdated closes the editor and wipes the text
+    #[test]
+    fn test_key_editor_masked_and_closed_when_outdated() {
+        let locked = Status {
+            enhanced: false,
+            ..locked_enhanced()
+        };
+        let mut app = App::new();
+        handle_link_event(&mut app, status_event(locked));
+        app.active_popup = ActivePopup::None;
+        select(&mut app, DATA_KEY_LABEL);
+        app.active_popup = ActivePopup::EditSetting;
+        for c in "visiblesecret".chars() {
+            push_input(&mut app, c);
+        }
+
+        // the kind changes under the open editor: still stars
+        app.setting_mut(DATA_KEY_LABEL).unwrap().kind = SettingKind::Outdated;
+        let text = screen(&mut app);
+        assert!(!text.contains("visiblesecret"), "password shown in clear");
+        assert!(text.contains("*************"));
+
+        handle_link_event(
+            &mut app,
+            status_event(Status {
+                vault_outdated: true,
+                enhanced: false,
+                ..locked_enhanced()
+            }),
+        );
+        assert_ne!(app.active_popup, ActivePopup::EditSetting);
+        assert!(app.input_buf.is_empty());
+    }
 }

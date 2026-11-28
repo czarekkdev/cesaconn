@@ -76,6 +76,7 @@ pub(super) fn handle_link_event(app: &mut App, event: LinkEvent) {
             app.peers = peers;
             app.clamp_peer_selection();
             show_pairing(app, pairing);
+            close_stale_key_editor(app);
             ask_unlock(app, &status);
             app.daemon = DaemonState::Up(status);
         }

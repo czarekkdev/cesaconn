@@ -65,9 +65,13 @@ impl Daemon {
     }
 
     /// Re-saves the open vault with a changed key. Standard mode: a new
-    /// `d_key` re-wraps the DEK (and replaces the automatic-login key), a
-    /// new `a_key` re-seals. Enhanced mode: the KEK uses both keys, so
-    /// either change re-wraps.
+    /// `d_key` changes the KEK (and replaces the automatic-login key), a
+    /// new `a_key` only re-seals. Enhanced mode: the KEK uses both keys, so
+    /// either change changes it. Whenever the KEK changes, a fresh DEK is
+    /// made too: whoever opened an older copy of the file with the old
+    /// passwords knows the old DEK, and it must not decrypt what is saved
+    /// from now on. The new DEK and wrap are kept only after the file was
+    /// replaced.
     pub(super) async fn save_changed_key(
         &self,
         kind: KeyKind,
@@ -112,14 +116,16 @@ impl Daemon {
         };
 
         let rewrap = matches!(kind, KeyKind::Data) || header.mode == Mode::Enhanced;
-        let new_wrap = if rewrap {
+        let (dek, new_wrap) = if rewrap {
             let kek = self
                 .kek(&header, &d_key, kek_a_key(&header, &a_key))
                 .await?
                 .map_err(storage_error)?;
-            vault::wrap_dek(&header, &kek, &dek).map_err(storage_error)?
+            let dek = vault::generate_dek().map_err(storage_error)?;
+            let wrapped = vault::wrap_dek(&header, &kek, &dek).map_err(storage_error)?;
+            (dek, wrapped)
         } else {
-            old_wrap
+            (dek, old_wrap)
         };
         let file = vault::seal(&header, &new_wrap, &dek, &contents).map_err(storage_error)?;
         drop(contents);
@@ -133,6 +139,7 @@ impl Daemon {
             let mut keys = self.keys.write().await;
             if let Some(open) = keys.vault.as_mut() {
                 open.wrapped = new_wrap;
+                open.dek = dek;
             }
         }
 
@@ -287,6 +294,15 @@ impl Daemon {
             .map_err(storage_error)?
             .ok_or(DaemonError::NotSaved)?;
         let header = vault::read_header(&file).map_err(storage_error)?;
+
+        // the status reports the mode of this same snapshot, so a UI told
+        // NeedsBothPasswords (or BadRequest) asks with the right prompt next
+        {
+            let mut keys = self.keys.write().await;
+            if keys.locked {
+                keys.locked_enhanced = header.mode == Mode::Enhanced;
+            }
+        }
         Ok((header, file))
     }
 

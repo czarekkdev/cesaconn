@@ -573,9 +573,15 @@ pub fn data_dir() -> Result<PathBuf, VaultErrors> {
 }
 
 /// Creates `dir` with `0700` if missing (parents as needed) and checks it is
-/// private: a directory someone else made or opened up is refused.
+/// private: a directory someone else made or opened up is refused. Every
+/// directory created here has its parent fsynced, so a vault written into
+/// it right after can't vanish with its directory in a power cut; a failed
+/// sync is an error (nothing is stored yet). An existing `dir` is only
+/// checked.
 pub fn prepare_dir(dir: &Path) -> Result<PathBuf, VaultErrors> {
     use std::os::unix::fs::DirBuilderExt;
+
+    let missing = missing_dirs(dir);
 
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent).map_err(|_| VaultErrors::Io)?;
@@ -589,7 +595,30 @@ pub fn prepare_dir(dir: &Path) -> Result<PathBuf, VaultErrors> {
 
     check_private_dir(dir).map_err(|_| VaultErrors::InsecureDirectory)?;
 
+    for created in missing {
+        let parent = created.parent().ok_or(VaultErrors::Io)?;
+        sync_dir(parent)?;
+    }
+
     Ok(dir.to_path_buf())
+}
+
+/// The directories of `dir` (itself included) that don't exist yet,
+/// outermost first: the ones `prepare_dir` creates and must make durable.
+fn missing_dirs(dir: &Path) -> Vec<&Path> {
+    let mut list: Vec<&Path> = dir
+        .ancestors()
+        .take_while(|d| !d.as_os_str().is_empty() && !d.exists())
+        .collect();
+    list.reverse();
+    list
+}
+
+/// fsyncs a directory, so the entries created in it are on disk.
+fn sync_dir(dir: &Path) -> Result<(), VaultErrors> {
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|_| VaultErrors::Io)
 }
 
 /// The vault file path inside `dir`.
@@ -1211,5 +1240,30 @@ mod tests {
         );
 
         std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    /// Test that every directory prepare_dir creates is found (so its
+    /// parent gets fsynced), outermost first, and that an existing
+    /// directory needs nothing created and is only checked
+    #[test]
+    fn test_prepare_dir_creates_and_syncs_ancestors() {
+        let base = std::env::temp_dir().join(format!("cesa-vault-mkdirs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let dir = base.join("a").join("b").join("data");
+        assert_eq!(
+            missing_dirs(&dir),
+            [base.join("a"), base.join("a/b"), dir.clone()]
+                .iter()
+                .map(PathBuf::as_path)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(prepare_dir(&dir).unwrap(), dir);
+        assert!(missing_dirs(&dir).is_empty());
+        // already there: nothing to create, still fine
+        assert_eq!(prepare_dir(&dir).unwrap(), dir);
+
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

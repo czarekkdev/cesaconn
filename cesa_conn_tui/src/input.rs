@@ -274,6 +274,7 @@ pub(super) fn ask_unlock(app: &mut App, status: &Status) {
     let fits = match app.active_popup {
         ActivePopup::Unlock => !status.enhanced && !status.vault_outdated,
         ActivePopup::UnlockBoth(_) => status.enhanced && !status.vault_outdated,
+        ActivePopup::VaultOutdated => status.vault_outdated,
         _ => true,
     };
     if !fits {
@@ -361,6 +362,24 @@ pub(super) fn handle_unlock_both_input(app: &mut App, code: KeyCode, step: JoinS
         }
         KeyCode::Char(c) => push_input(app, c),
         _ => {}
+    }
+}
+
+/// Closes the password editor (wiping what was typed) when the key it edits
+/// can no longer take a password: an outdated vault only takes a reset.
+pub(super) fn close_stale_key_editor(app: &mut App) {
+    let outdated = matches!(
+        app.active_settings()
+            .get(app.settings_selected)
+            .map(|s| &s.kind),
+        Some(SettingKind::Outdated)
+    );
+    if app.active_popup == ActivePopup::EditSetting && outdated {
+        clear_input(app);
+        app.active_popup = ActivePopup::None;
+        app.push_log(
+            "[ WARN] The saved keys are from an older version: the password editor was closed",
+        );
     }
 }
 

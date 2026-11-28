@@ -79,8 +79,8 @@ sequenceDiagram
 ```mermaid
 flowchart LR
     new["new password<br/>(UI asked 'are you sure?')"] --> kind{"which?"}
-    kind -- pw1 --> a["a_key from the same a_salt<br/>Standard: re-seal with the new a_key<br/>Enhanced: re-wrap the DEK (KEK uses a_key), re-seal"]
-    kind -- pw2 --> d["d_key from the same d_salt<br/>re-wrap DEK, re-seal;<br/>auto-login: replace data-key"]
+    kind -- pw1 --> a["a_key from the same a_salt<br/>Standard: re-seal with the new a_key<br/>Enhanced: new KEK, so a new DEK, re-seal"]
+    kind -- pw2 --> d["d_key from the same d_salt<br/>new KEK, so a new DEK, re-seal;<br/>auto-login: replace data-key"]
     a --> saved["saved first, kept second"]
     d --> saved
     saved --> net{"networking running<br/>(Sync on)?"}

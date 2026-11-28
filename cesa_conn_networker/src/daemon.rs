@@ -1695,6 +1695,97 @@ mod tests {
         assert_eq!(key_bytes(&daemon).await, after_data);
     }
 
+    /// Test that every password change that changes the KEK also makes a
+    /// fresh DEK (Enhanced auth, Enhanced data, Standard data), kept only
+    /// together with the new file: the old DEK doesn't decrypt what is
+    /// saved after the change, and the new passwords reopen the vault with
+    /// the new DEK. A Standard auth change keeps the KEK and the DEK
+    #[tokio::test]
+    async fn test_password_change_new_dek() {
+        let dek =
+            async |daemon: &Arc<Daemon>| *daemon.keys.read().await.vault.as_ref().unwrap().dek;
+
+        let storage = TestStorage::new("change-new-dek");
+        let daemon = storage.daemon().await;
+        setup(&daemon).await;
+
+        // Standard: the auth password only re-seals
+        let before = dek(&daemon).await;
+        let new_auth = b"a new auth password";
+        ask(&daemon, Request::SetAuthPassword(update(new_auth)))
+            .await
+            .unwrap();
+        assert_eq!(dek(&daemon).await, before);
+
+        // Standard: the data password changes the KEK
+        let new_data = b"a new data password";
+        ask(&daemon, Request::SetDataPassword(update(new_data)))
+            .await
+            .unwrap();
+        let standard = dek(&daemon).await;
+        assert_ne!(standard, before);
+        drop(daemon);
+        let daemon = storage.daemon().await;
+        ask(&daemon, Request::Unlock(update(new_data)))
+            .await
+            .unwrap();
+        assert_eq!(dek(&daemon).await, standard);
+
+        // Enhanced: the auth password changes the KEK too
+        ask(&daemon, Request::SetEnhanced(true)).await.unwrap();
+        let enhanced = dek(&daemon).await;
+        let newer_auth = b"another auth password";
+        ask(&daemon, Request::SetAuthPassword(update(newer_auth)))
+            .await
+            .unwrap();
+        let after_auth = dek(&daemon).await;
+        assert_ne!(after_auth, enhanced);
+        drop(daemon);
+        let daemon = storage.daemon().await;
+        ask(&daemon, both(newer_auth, new_data)).await.unwrap();
+        assert_eq!(dek(&daemon).await, after_auth);
+
+        // a failed save keeps the old DEK and wrap (nothing on disk changed)
+        let dir = storage.path().parent().unwrap().to_path_buf();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(
+            ask(&daemon, Request::SetDataPassword(update(DATA_PW))).await,
+            Err(DaemonError::StorageFailed)
+        );
+        assert_eq!(dek(&daemon).await, after_auth);
+    }
+
+    /// Test that a locked daemon's reported mode follows the vault file it
+    /// actually reads: a file switched to Enhanced on disk makes the next
+    /// Unlock answer NeedsBothPasswords AND the status say Enhanced, so the
+    /// UI asks with the right prompt (no loop of single-password prompts)
+    #[tokio::test]
+    async fn test_locked_mode_follows_file() {
+        let enhanced = TestStorage::new("locked-mode-enhanced");
+        let daemon = enhanced.daemon().await;
+        setup(&daemon).await;
+        ask(&daemon, Request::SetEnhanced(true)).await.unwrap();
+        drop(daemon);
+
+        let storage = TestStorage::new("locked-mode");
+        let daemon = storage.daemon().await;
+        setup(&daemon).await;
+        drop(daemon);
+        let daemon = storage.daemon().await;
+        assert!(!daemon.status().await.enhanced);
+
+        std::fs::copy(enhanced.path(), storage.path()).unwrap();
+        assert_eq!(
+            ask(&daemon, Request::Unlock(update(DATA_PW))).await,
+            Err(DaemonError::NeedsBothPasswords)
+        );
+        let status = daemon.status().await;
+        assert!(status.locked && status.enhanced);
+    }
+
     /// Test that an automatic-login key left in the keychain doesn't unlock
     /// an Enhanced vault: it is removed, the daemon stays locked
     #[tokio::test]
